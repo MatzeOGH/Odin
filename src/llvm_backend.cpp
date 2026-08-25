@@ -3069,6 +3069,68 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 }
 
 
+// Emit `runtime.hot_reload_symbol_table` — a constant array of
+// {name: string, address: rawptr, is_hot: bool} for every generated procedure
+// and global variable. An in-process hot-reload loader uses it to resolve the
+// symbols referenced by a freshly compiled object against the running process.
+gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbGlobalVariable> const &global_variables) {
+	lbModule *m = &gen->default_module;
+
+	lbValue table_var = lb_find_runtime_value(m, str_lit("hot_reload_symbol_table"));
+	Type *slice_t = type_deref(table_var.type);
+	GB_ASSERT(is_type_slice(slice_t));
+	Type *elem_t = base_type(slice_t)->Slice.elem;
+	LLVMTypeRef elem_llvm = lb_type(m, elem_t);
+	LLVMTypeRef rawptr_llvm = lb_type(m, t_rawptr);
+	LLVMTypeRef bool_llvm = lb_type(m, t_bool);
+
+	auto entries = array_make<LLVMValueRef>(heap_allocator(), 0, 1024);
+	defer (array_free(&entries));
+
+	auto add_entry = [&](String name, LLVMValueRef ptr_value, bool is_hot) {
+		if (name.len == 0 || ptr_value == nullptr) {
+			return;
+		}
+		LLVMValueRef vals[3] = {};
+		vals[0] = lb_find_or_add_entity_string(m, name, false).value;
+		vals[1] = LLVMConstPointerCast(ptr_value, rawptr_llvm);
+		vals[2] = LLVMConstInt(bool_llvm, is_hot ? 1 : 0, false);
+		array_add(&entries, llvm_const_named_struct(m, elem_t, vals, gb_count_of(vals)));
+	};
+
+	// Procedures (single module is forced under -hot-reload, so all live here).
+	for (lbProcedure *p : m->generated_procedures) {
+		bool is_hot = p->entity != nullptr &&
+		              p->entity->kind == Entity_Procedure &&
+		              p->entity->Procedure.is_hot_reload;
+		add_entry(p->name, p->value, is_hot);
+	}
+
+	// Global variables.
+	for (lbGlobalVariable const &gv : global_variables) {
+		if (gv.decl == nullptr) {
+			continue;
+		}
+		Entity *e = gv.decl->entity; // implicit atomic load
+		if (e == nullptr || e->Variable.is_foreign) {
+			continue;
+		}
+		add_entry(lb_get_entity_name(m, e), gv.var.value, false);
+	}
+
+	LLVMValueRef arr = LLVMConstArray(elem_llvm, entries.data, cast(unsigned)entries.count);
+	LLVMValueRef arr_global = LLVMAddGlobal(m->mod, LLVMArrayType(elem_llvm, cast(unsigned)entries.count), "__odin_hot_reload_symbols");
+	LLVMSetInitializer(arr_global, arr);
+	LLVMSetLinkage(arr_global, LLVMInternalLinkage);
+	LLVMSetGlobalConstant(arr_global, true);
+
+	LLVMValueRef data = LLVMConstPointerCast(arr_global, lb_type(m, alloc_type_pointer(elem_t)));
+	LLVMValueRef len = LLVMConstInt(lb_type(m, t_int), entries.count, true);
+	LLVMValueRef slice = llvm_const_slice_internal(m, data, len);
+	LLVMSetInitializer(table_var.value, slice);
+	LLVMSetGlobalConstant(table_var.value, true);
+}
+
 gb_internal bool lb_generate_code(lbGenerator *gen) {
 	TIME_SECTION("LLVM Initializtion");
 
@@ -3602,6 +3664,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	if (gen->objc_names) {
 		TIME_SECTION("Finalize objc names");
 		lb_finalize_objc_names(gen, gen->objc_names);
+	}
+
+	if (build_context.hot_reload) {
+		TIME_SECTION("LLVM Hot Reload Symbol Table");
+		lb_generate_hot_reload_symbol_table(gen, global_variables);
 	}
 
 	if (build_context.ODIN_DEBUG) {

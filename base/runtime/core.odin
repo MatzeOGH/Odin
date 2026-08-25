@@ -283,6 +283,18 @@ Type_Info :: struct {
 // This will be set by the compiler
 type_table: []^Type_Info
 
+Hot_Reload_Symbol :: struct {
+	name:    string,
+	address: rawptr,
+	is_hot:  bool,
+}
+
+// Set by the compiler when building with `-hot-reload`: a table of every emitted
+// procedure and global variable ({name, address, is_hot}). An in-process
+// hot-reload loader uses it to resolve the symbols referenced by a freshly
+// compiled object against the addresses in the already-running process.
+hot_reload_symbol_table: []Hot_Reload_Symbol
+
 args__: []cstring
 
 when ODIN_OS == .Windows {
