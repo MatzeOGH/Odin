@@ -811,6 +811,11 @@ foreign kernel32 {
 		dwSize:     SIZE_T,
 		dwFreeType: DWORD,
 	) -> BOOL ---
+	FlushInstructionCache :: proc(
+		hProcess:      HANDLE,
+		lpBaseAddress: LPCVOID,
+		dwSize:        SIZE_T,
+	) -> BOOL ---
 	VirtualQuery :: proc(
 		lpAddress: LPCVOID,
 		lpBuffer:  PMEMORY_BASIC_INFORMATION,

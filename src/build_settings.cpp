@@ -586,6 +586,7 @@ struct BuildContext {
 
 	bool   use_single_module;
 	bool   use_separate_modules;
+	bool   hot_reload; // emit runtime.hot_reload_symbol_table for in-process hot reload
 	LTOKind lto_kind;
 	bool   module_per_file;
 	bool   cached;

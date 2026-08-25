@@ -248,6 +248,14 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "cold");
 	}
 
+	if (entity->Procedure.is_hot_reload) {
+		// Keep the procedure a discrete, non-inlined function so its machine code can
+		// be replaced at runtime, and give it a patchable prologue.
+		lb_add_attribute_to_proc(m, p->value, "noinline");
+		lb_add_attribute_to_proc_with_string(m, p->value,
+			make_string_c("patchable-function"), make_string_c("prologue-short-redirect"));
+	}
+
 	if (p->is_export) {
 		LLVMSetLinkage(p->value, LLVMDLLExportLinkage);
 		LLVMSetDLLStorageClass(p->value, LLVMDLLExportStorageClass);

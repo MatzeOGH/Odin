@@ -1341,6 +1341,13 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 	if (ac.set_cold) {
 		e->flags |= EntityFlag_Cold;
 	}
+	if (ac.hot_reload) {
+		e->Procedure.is_hot_reload = true;
+		// Hot-reloadable procedures must be exported so the reload object exposes a
+		// stable, unmangled symbol the loader can find and patch. Route through
+		// ac.is_export so the normal export path applies (it is consumed below).
+		ac.is_export = true;
+	}
 	e->Procedure.optimization_mode = cast(ProcedureOptimizationMode)ac.optimization_mode;
 
 	check_objc_methods(ctx, e, ac);
