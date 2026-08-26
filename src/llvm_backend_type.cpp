@@ -95,6 +95,16 @@ gb_internal lbValue lb_type_info(lbProcedure *p, Type *type) {
 	type = default_type(type);
 	lbModule *m = p->module;
 
+	if (build_context.hot_reload) {
+		// Resolve through the running exe's `type_table` by (build-stable) typeid
+		// rather than a build-local index into this object's giant array, so
+		// `type_info_of(T)` / enum reflection in hot code lands on the exe's
+		// Type_Info and matches `any` values built from the same stable typeid.
+		auto args = array_make<lbValue>(permanent_allocator(), 1);
+		args[0] = lb_typeid(m, type);
+		return lb_emit_runtime_call(p, "__type_info_of", args);
+	}
+
 	isize index = lb_type_info_index(m->info, type);
 	GB_ASSERT(index >= 0);
 

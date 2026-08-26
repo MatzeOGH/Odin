@@ -3069,9 +3069,229 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Hot reload: arena for new globals + build-to-build manifest
+//
+// A reload object may introduce globals that did not exist when the exe was
+// built. They cannot live in the object's own data (it is remapped every reload,
+// so state would be lost) and there is no room for them in the exe's fixed data
+// sections. Instead the exe reserves a zero-init arena and reload objects place
+// new globals into it at fixed byte offsets, so their state persists across every
+// reload. The manifest is the compiler's persistent record of each new global's
+// offset, kept between builds.
+// ---------------------------------------------------------------------------
+
+gb_internal u64 lb_hot_reload_parse_u64(String s) {
+	u64 v = 0;
+	for (isize i = 0; i < s.len; i++) {
+		u8 c = s[i];
+		if (c < '0' || c > '9') break;
+		v = v*10 + cast(u64)(c - '0');
+	}
+	return v;
+}
+
+// The reserved storage new globals are placed into. Defined (zero-init) in the
+// base exe build; an external declaration (resolved by the loader to the exe's
+// arena) in a reload object build.
+gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
+	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_global_arena");
+	if (existing != nullptr) {
+		return existing;
+	}
+	i64 size = build_context.hot_reload_arena_size;
+	if (size <= 0) {
+		size = 1;
+	}
+	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
+	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_hot_reload_global_arena");
+	if (build_context.hot_reload_is_reload) {
+		LLVMSetLinkage(arena, LLVMExternalLinkage); // reference the exe's arena
+	} else {
+		LLVMSetInitializer(arena, LLVMConstNull(arena_t));
+		LLVMSetLinkage(arena, LLVMInternalLinkage);
+	}
+	// Over-align the arena so aggregate / f64 / SIMD globals placed at aligned
+	// offsets within it are correctly aligned relative to the (aligned) base.
+	LLVMSetAlignment(arena, 16);
+	return arena;
+}
+
+// A constant pointer of `ptr_type` into the arena at byte `offset`.
+gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
+	LLVMValueRef arena = lb_hot_reload_arena(m);
+	i64 size = build_context.hot_reload_arena_size;
+	if (size <= 0) {
+		size = 1;
+	}
+	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
+	LLVMValueRef indices[2] = {};
+	indices[0] = LLVMConstInt(lb_type(m, t_i32), 0, false);
+	indices[1] = LLVMConstInt(lb_type(m, t_int), offset, false);
+	LLVMValueRef gep = LLVMConstInBoundsGEP2(arena_t, arena, indices, 2);
+	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
+}
+
+// Per-thread reserved storage for thread-locals introduced across a reload. This is
+// a `@thread_local` array in the exe, so every thread (existing and future) gets its
+// own zeroed copy at a fixed offset within its TLS block. New thread-locals are
+// placed at offsets inside it; because access goes through this thread_local symbol,
+// the loader's existing SECREL handler resolves them to the exe's TLS block (the
+// arena is published in the symbol table as a HOT_RELOAD_KIND_TLS accessor). Defined
+// (zero-init) in BOTH base and reload builds: TLS references resolve by SECREL name
+// rewrite, not by symbol address, so the reload object's own (unused) copy is fine.
+gb_internal LLVMValueRef lb_hot_reload_tls_arena(lbModule *m) {
+	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_tls_arena");
+	if (existing != nullptr) {
+		return existing;
+	}
+	i64 size = build_context.hot_reload_tls_arena_size;
+	if (size <= 0) {
+		size = 1;
+	}
+	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
+	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_hot_reload_tls_arena");
+	LLVMSetInitializer(arena, LLVMConstNull(arena_t));
+	LLVMSetLinkage(arena, LLVMInternalLinkage);
+	LLVMSetThreadLocal(arena, true);
+	LLVMSetThreadLocalMode(arena, LLVMGeneralDynamicTLSModel);
+	LLVMSetAlignment(arena, 16);
+	return arena;
+}
+
+// A constant (thread-local) pointer of `ptr_type` into the TLS arena at byte `offset`.
+gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
+	LLVMValueRef arena = lb_hot_reload_tls_arena(m);
+	i64 size = build_context.hot_reload_tls_arena_size;
+	if (size <= 0) {
+		size = 1;
+	}
+	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
+	LLVMValueRef indices[2] = {};
+	indices[0] = LLVMConstInt(lb_type(m, t_i32), 0, false);
+	indices[1] = LLVMConstInt(lb_type(m, t_int), offset, false);
+	LLVMValueRef gep = LLVMConstInBoundsGEP2(arena_t, arena, indices, 2);
+	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
+}
+
+// HotReloadNewEntry, HotReloadManifest, and HotReloadInitEntry are defined in
+// llvm_backend.hpp so llvm_backend_stmt.cpp can see them (unity build order).
+
+gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
+	string_map_init(&hm->orig);
+	string_map_init(&hm->newg);
+	string_map_init(&hm->tls_newg);
+	hm->exists = false;
+	hm->next_free = 0;
+	hm->arena_size = build_context.hot_reload_arena_size;
+	hm->tls_next_free = 0;
+	hm->tls_arena_size = build_context.hot_reload_tls_arena_size;
+
+	if (build_context.hot_reload_manifest.len == 0) {
+		return;
+	}
+	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
+	gbFileContents fc = gb_file_read_contents(permanent_allocator(), true, path_c);
+	if (fc.data == nullptr || fc.size == 0) {
+		return; // no manifest yet: this is the base (exe) build
+	}
+	hm->exists = true;
+	build_context.hot_reload_is_reload = true;
+
+	String content = make_string(cast(u8 const *)fc.data, cast(isize)fc.size);
+	isize i = 0;
+	while (i < content.len) {
+		isize start = i;
+		while (i < content.len && content[i] != '\n') { i++; }
+		String line = make_string(content.text + start, i - start);
+		if (i < content.len) { i++; }
+		if (line.len > 0 && line[line.len-1] == '\r') { line.len--; }
+		if (line.len == 0) { continue; }
+
+		// Tokens are space separated; the (possibly space-containing) name is the
+		// remainder of the line after the fixed numeric fields.
+		isize p = 0;
+		auto tok = [](String s, isize *pp) -> String {
+			isize st = *pp;
+			while (st < s.len && s[st] == ' ') { st++; }
+			isize en = st;
+			while (en < s.len && s[en] != ' ') { en++; }
+			*pp = en;
+			return make_string(s.text + st, en - st);
+		};
+		auto rest = [](String s, isize p) -> String {
+			while (p < s.len && s[p] == ' ') { p++; }
+			return make_string(s.text + p, s.len - p);
+		};
+
+		String tag = tok(line, &p);
+		if (tag == "arena_size") {
+			hm->arena_size = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			build_context.hot_reload_arena_size = hm->arena_size;
+		} else if (tag == "next_free") {
+			hm->next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+		} else if (tag == "tls_arena_size") {
+			hm->tls_arena_size = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			build_context.hot_reload_tls_arena_size = hm->tls_arena_size;
+		} else if (tag == "tls_next_free") {
+			hm->tls_next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+		} else if (tag == "orig") {
+			u64 th = lb_hot_reload_parse_u64(tok(line, &p));
+			String name = rest(line, p);
+			if (name.len > 0) { string_map_set(&hm->orig, name, th); }
+		} else if (tag == "new") {
+			i64 off     = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			u64 th      = lb_hot_reload_parse_u64(tok(line, &p));
+			i64 flag_p1 = cast(i64)lb_hot_reload_parse_u64(tok(line, &p)); // stored as offset+1 (0 == none)
+			String name = rest(line, p);
+			if (name.len > 0) {
+				HotReloadNewEntry ne = {off, th, flag_p1 - 1};
+				string_map_set(&hm->newg, name, ne);
+			}
+		} else if (tag == "tls_new") {
+			i64 off     = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			u64 th      = lb_hot_reload_parse_u64(tok(line, &p));
+			i64 flag_p1 = cast(i64)lb_hot_reload_parse_u64(tok(line, &p)); // per-thread guard offset+1 (0 == none)
+			String name = rest(line, p);
+			if (name.len > 0) {
+				HotReloadNewEntry ne = {off, th, flag_p1 - 1};
+				string_map_set(&hm->tls_newg, name, ne);
+			}
+		}
+	}
+}
+
+gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
+	if (build_context.hot_reload_manifest.len == 0) {
+		return;
+	}
+	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
+	gbFile f = {};
+	if (gb_file_open_mode(&f, gbFileMode_Write, path_c) != gbFileError_None) {
+		return;
+	}
+	defer (gb_file_close(&f));
+	gb_fprintf(&f, "arena_size %llu\n", cast(unsigned long long)hm->arena_size);
+	gb_fprintf(&f, "next_free %llu\n", cast(unsigned long long)hm->next_free);
+	gb_fprintf(&f, "tls_arena_size %llu\n", cast(unsigned long long)hm->tls_arena_size);
+	gb_fprintf(&f, "tls_next_free %llu\n", cast(unsigned long long)hm->tls_next_free);
+	for (u32 idx = 0; idx < hm->orig.count; idx++) {
+		StringMapEntry<u64> const &e = hm->orig.entries[idx];
+		gb_fprintf(&f, "orig %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));
+	}
+	for (u32 idx = 0; idx < hm->newg.count; idx++) {
+		StringMapEntry<HotReloadNewEntry> const &e = hm->newg.entries[idx];
+		gb_fprintf(&f, "new %llu %llu %llu %.*s\n", cast(unsigned long long)e.value.offset, cast(unsigned long long)e.value.type_hash, cast(unsigned long long)(e.value.init_flag_offset + 1), LIT(e.key));
+	}
+	for (u32 idx = 0; idx < hm->tls_newg.count; idx++) {
+		StringMapEntry<HotReloadNewEntry> const &e = hm->tls_newg.entries[idx];
+		gb_fprintf(&f, "tls_new %llu %llu %llu %.*s\n", cast(unsigned long long)e.value.offset, cast(unsigned long long)e.value.type_hash, cast(unsigned long long)(e.value.init_flag_offset + 1), LIT(e.key));
+	}
+}
+
 // Emit `runtime.hot_reload_symbol_table` — a constant array of
-// {name: string, address: rawptr, is_hot: bool} for every generated procedure
-// and global variable. An in-process hot-reload loader uses it to resolve the
+// {name, address, is_hot, kind, type_hash} for every generated procedure and
+// global variable. An in-process hot-reload loader uses it to resolve the
 // symbols referenced by a freshly compiled object against the running process.
 gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbGlobalVariable> const &global_variables) {
 	lbModule *m = &gen->default_module;
@@ -3083,18 +3303,25 @@ gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbG
 	LLVMTypeRef elem_llvm = lb_type(m, elem_t);
 	LLVMTypeRef rawptr_llvm = lb_type(m, t_rawptr);
 	LLVMTypeRef bool_llvm = lb_type(m, t_bool);
+	LLVMTypeRef u8_llvm   = lb_type(m, t_u8);
+	LLVMTypeRef u64_llvm  = lb_type(m, t_u64);
+
+	// runtime.Hot_Reload_Kind
+	enum { HOT_RELOAD_KIND_PROC = 0, HOT_RELOAD_KIND_GLOBAL = 1, HOT_RELOAD_KIND_TLS = 2 };
 
 	auto entries = array_make<LLVMValueRef>(heap_allocator(), 0, 1024);
 	defer (array_free(&entries));
 
-	auto add_entry = [&](String name, LLVMValueRef ptr_value, bool is_hot) {
+	auto add_entry = [&](String name, LLVMValueRef ptr_value, bool is_hot, u8 kind, u64 type_hash) {
 		if (name.len == 0 || ptr_value == nullptr) {
 			return;
 		}
-		LLVMValueRef vals[3] = {};
+		LLVMValueRef vals[5] = {};
 		vals[0] = lb_find_or_add_entity_string(m, name, false).value;
 		vals[1] = LLVMConstPointerCast(ptr_value, rawptr_llvm);
 		vals[2] = LLVMConstInt(bool_llvm, is_hot ? 1 : 0, false);
+		vals[3] = LLVMConstInt(u8_llvm, kind, false);
+		vals[4] = LLVMConstInt(u64_llvm, type_hash, false);
 		array_add(&entries, llvm_const_named_struct(m, elem_t, vals, gb_count_of(vals)));
 	};
 
@@ -3103,10 +3330,11 @@ gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbG
 		bool is_hot = p->entity != nullptr &&
 		              p->entity->kind == Entity_Procedure &&
 		              p->entity->Procedure.is_hot_reload;
-		add_entry(p->name, p->value, is_hot);
+		add_entry(p->name, p->value, is_hot, HOT_RELOAD_KIND_PROC, 0);
 	}
 
-	// Global variables.
+	// Global variables. `type_hash` is the build-stable canonical hash of the
+	// global's type so the loader can detect a layout change across a reload.
 	for (lbGlobalVariable const &gv : global_variables) {
 		if (gv.decl == nullptr) {
 			continue;
@@ -3115,7 +3343,68 @@ gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbG
 		if (e == nullptr || e->Variable.is_foreign) {
 			continue;
 		}
-		add_entry(lb_get_entity_name(m, e), gv.var.value, false);
+		if (e->Variable.thread_local_model.len != 0) {
+			// Thread-local: a plain address is meaningless (it is the .tls template,
+			// not a per-thread slot). Handled below via a HOT_RELOAD_KIND_TLS entry.
+			continue;
+		}
+		add_entry(lb_get_entity_name(m, e), gv.var.value, false, HOT_RELOAD_KIND_GLOBAL, type_hash_canonical_type(e->type));
+	}
+
+	// Function-local `@(static)` variables (collected during procedure codegen).
+	// Publishing them lets the loader resolve a reload object's reference to the
+	// exe's preserved copy, exactly as for a file-scope global. New statics (ones
+	// absent from the exe) are arena-backed instead and never appear here.
+	for (lbHotReloadStaticSym const &s : gen->hot_reload_static_syms) {
+		add_entry(s.name, s.value, false, HOT_RELOAD_KIND_GLOBAL, s.type_hash);
+	}
+
+	// Always reserve the per-thread TLS arena in the exe and publish it as a
+	// thread-local, so (a) every thread's static TLS block includes the arena (new
+	// thread-locals introduced by a reload live at offsets inside it), and (b) the
+	// loader learns the arena's exe TLS-block offset (a new thread-local's access is
+	// a GEP into this arena, so its SECREL resolves through this one accessor).
+	if (build_context.hot_reload_tls_arena_size > 0) {
+		LLVMValueRef tls_arena = lb_hot_reload_tls_arena(m);
+		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0};
+		array_add(&gen->hot_reload_tls_syms, s);
+	}
+
+	// Thread-local variables (file-scope globals + local `@(static)`). A thread-local
+	// is accessed via `_tls_index` + a per-variable SECREL offset into the TLS block,
+	// so it cannot be resolved to a plain address. For each we emit a tiny accessor
+	// `__odin_hrtls_<i>() -> rawptr { return &var }` — a use of the thread_local global
+	// inside a function lowers to the exe's TLS access sequence, so it returns the
+	// per-thread address. The loader calls it to compute the variable's offset in the
+	// exe's TLS block and rewrites the reload object's SECREL sites to that offset.
+	{
+		LLVMTypeRef acc_ty = LLVMFunctionType(rawptr_llvm, nullptr, 0, false);
+		isize idx = 0;
+		for (lbHotReloadStaticSym const &s : gen->hot_reload_tls_syms) {
+			if (s.name.len == 0 || s.value == nullptr) {
+				continue;
+			}
+			char const *acc_name = gb_bprintf("__odin_hrtls_%td", cast(isize)idx++);
+			LLVMValueRef acc = LLVMAddFunction(m->mod, acc_name, acc_ty);
+			LLVMSetLinkage(acc, LLVMInternalLinkage);
+			LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(m->ctx, acc, "entry");
+			LLVMBuilderRef b = LLVMCreateBuilderInContext(m->ctx);
+			LLVMPositionBuilderAtEnd(b, bb);
+			LLVMValueRef addr = LLVMBuildPointerCast(b, s.value, rawptr_llvm, "");
+			LLVMBuildRet(b, addr);
+			LLVMDisposeBuilder(b);
+			lb_append_to_compiler_used(m, acc); // reached only via the baked table
+			add_entry(s.name, acc, false, HOT_RELOAD_KIND_TLS, s.type_hash);
+		}
+	}
+
+	// Reserve a zero-init arena so a reload object can place *new* globals (ones
+	// that did not exist when this exe was built) into stable, in-image storage
+	// that survives every subsequent reload. New-global references compile to
+	// relocations against this symbol; the loader resolves it via this table.
+	if (build_context.hot_reload_arena_size > 0) {
+		LLVMValueRef arena = lb_hot_reload_arena(m);
+		add_entry(str_lit("__odin_hot_reload_global_arena"), arena, false, HOT_RELOAD_KIND_GLOBAL, 0);
 	}
 
 	LLVMValueRef arr = LLVMConstArray(elem_llvm, entries.data, cast(unsigned)entries.count);
@@ -3450,6 +3739,23 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	auto global_variables = array_make<lbGlobalVariable>(permanent_allocator(), 0, global_variable_max_count);
 
+	// Under -hot-reload, load the manifest so we can tell original globals (emit
+	// normally, resolved to the exe's live copy) from new ones (redirected into
+	// the reserved arena so their state persists across reloads). The manifest,
+	// the new-global init list, and the local-static symbol list are generator-
+	// scoped: both this (single-threaded) loop and `lb_build_static_variables`
+	// (on the procedure thread pool) contribute to them. The manifest is written
+	// and the init table emitted only after all procedures — and therefore all
+	// local statics — have been generated (see below).
+	HotReloadManifest &hot_reload_manifest = gen->hot_reload_manifest;
+	Array<HotReloadInitEntry> &hot_reload_inits = gen->hot_reload_inits;
+	if (build_context.hot_reload) {
+		hot_reload_inits = array_make<HotReloadInitEntry>(heap_allocator(), 0, 16);
+		gen->hot_reload_static_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
+		gen->hot_reload_tls_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
+		hot_reload_manifest_read(&hot_reload_manifest);
+	}
+
 	for (DeclInfo *d : info->variable_init_order) {
 		Entity *e = d->entity;
 
@@ -3485,6 +3791,136 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 		lbGlobalVariable var = {};
 		var.decl = decl;
+
+		if (build_context.hot_reload && !is_foreign) {
+			if (hot_reload_manifest.exists) {
+				u64 th = type_hash_canonical_type(e->type);
+				u64 *orig_th = string_map_get(&hot_reload_manifest.orig, name);
+				if (orig_th != nullptr) {
+					// Original global: emit normally below; the loader preserves it.
+					if (*orig_th != th) {
+						error(e->token, "hot-reload: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
+					}
+				} else if (e->Variable.thread_local_model.len != 0) {
+					// Brand-new thread-local introduced by this reload: place it in the
+					// per-thread TLS arena (reserved in the exe) at a manifest-pinned
+					// offset. Access goes through the arena's thread_local symbol, so the
+					// loader's SECREL handler resolves it to the exe's TLS block. Odin
+					// thread-locals cannot have initializers (checker rule), so this is
+					// always zero-init — and the per-thread arena is already zeroed.
+					i64 offset = 0;
+					HotReloadNewEntry *ne = string_map_get(&hot_reload_manifest.tls_newg, name);
+					if (ne != nullptr) {
+						offset = ne->offset;
+						if (ne->type_hash != th) {
+							error(e->token, "hot-reload: new thread-local '%.*s' changed type/layout across a reload; its TLS arena storage cannot be reinterpreted safely", LIT(name));
+						}
+					} else {
+						i64 al = gb_max(type_align_of(e->type), 1);
+						i64 sz = gb_max(type_size_of(e->type), 1);
+						offset = align_formula(hot_reload_manifest.tls_next_free, al);
+						hot_reload_manifest.tls_next_free = offset + sz;
+						if (hot_reload_manifest.tls_next_free > hot_reload_manifest.tls_arena_size) {
+							error(e->token, "hot-reload: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-tls-arena-size", cast(long long)hot_reload_manifest.tls_next_free, cast(long long)hot_reload_manifest.tls_arena_size);
+						}
+						HotReloadNewEntry added = {offset, th, -1};
+						string_map_set(&hot_reload_manifest.tls_newg, name, added);
+					}
+
+					lbValue g = {};
+					g.type  = alloc_type_pointer(e->type);
+					g.value = lb_hot_reload_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
+					var.is_initialized = true;
+					var.var = g;
+					array_add(&global_variables, var);
+					lb_add_entity(m, e, g);
+					lb_add_member(m, name, g);
+					continue;
+				} else {
+					// Brand-new global introduced by this reload: redirect into the arena.
+					//
+					// Classify the initializer: none/zero/nil -> zero-init (the arena is
+					// already zero); a compile-time constant -> the loader copies its bytes
+					// into the arena slot once (guarded by a flag byte); anything runtime
+					// (including new @(init)) -> unsupported.
+					bool has_const_init = false;
+					bool runtime_init   = false;
+					lbValue init = {};
+					if (decl->init_expr != nullptr) {
+						if (is_type_any(e->type)) {
+							runtime_init = true;
+						} else {
+							TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
+							if (tav.mode != Addressing_Invalid && tav.value.kind != ExactValue_Invalid) {
+								if (!is_type_untyped_nil(tav.type)) {
+									auto cc = LB_CONST_CONTEXT_DEFAULT;
+									cc.allow_local = false;
+									init = lb_const_value(m, e->type, tav.value, cc);
+									if (init.value != nullptr && !LLVMIsNull(init.value)) {
+										has_const_init = true;
+									}
+								}
+							} else {
+								runtime_init = true;
+							}
+						}
+					}
+					if (runtime_init) {
+						error(e->token, "hot-reload: new global '%.*s' has a non-constant initializer; only compile-time constant initializers are supported for a global introduced across a reload (runtime initializers and new @(init) are not yet supported)", LIT(name));
+					}
+
+					i64 offset   = 0;
+					i64 flag_off = -1;
+					HotReloadNewEntry *ne = string_map_get(&hot_reload_manifest.newg, name);
+					if (ne != nullptr) {
+						offset   = ne->offset;
+						flag_off = ne->init_flag_offset;
+						if (ne->type_hash != th) {
+							error(e->token, "hot-reload: new global '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
+						}
+					} else {
+						i64 al = gb_max(type_align_of(e->type), 1);
+						i64 sz = gb_max(type_size_of(e->type), 1);
+						offset = align_formula(hot_reload_manifest.next_free, al);
+						hot_reload_manifest.next_free = offset + sz;
+						if (has_const_init) {
+							// One byte, gating the once-only copy in the loader.
+							flag_off = hot_reload_manifest.next_free;
+							hot_reload_manifest.next_free = flag_off + 1;
+						}
+						if (hot_reload_manifest.next_free > hot_reload_manifest.arena_size) {
+							error(e->token, "hot-reload: new-global arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-arena-size", cast(long long)hot_reload_manifest.next_free, cast(long long)hot_reload_manifest.arena_size);
+						}
+						HotReloadNewEntry added = {offset, th, flag_off};
+						string_map_set(&hot_reload_manifest.newg, name, added);
+
+						// Only the introducing build emits the constant + descriptor.
+						if (has_const_init) {
+							char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)hot_reload_inits.count);
+							LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), blob_name);
+							LLVMSetInitializer(blob, init.value);
+							LLVMSetGlobalConstant(blob, true);
+							LLVMSetLinkage(blob, LLVMPrivateLinkage);
+							HotReloadInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
+							array_add(&hot_reload_inits, ie);
+						}
+					}
+
+					lbValue g = {};
+					g.type  = alloc_type_pointer(e->type);
+					g.value = lb_hot_reload_arena_ptr(m, offset, alloc_type_pointer(e->type));
+					var.is_initialized = true;
+					var.var = g;
+					array_add(&global_variables, var);
+					lb_add_entity(m, e, g);
+					lb_add_member(m, name, g);
+					continue;
+				}
+			} else {
+				// Base (exe) build: record this global as original for later reloads.
+				string_map_set(&hot_reload_manifest.orig, name, type_hash_canonical_type(e->type));
+			}
+		}
 
 		lbValue g = {};
 		g.type = alloc_type_pointer(e->type);
@@ -3553,6 +3989,17 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, g.value);
 		}
 
+		// Hot reload: a thread-local global is accessed via a per-variable SECREL
+		// offset into the exe's TLS block, not a plain pointer — so it cannot be
+		// resolved like an ordinary global. Record the raw thread_local global (a
+		// later pass emits an accessor thunk + a HOT_RELOAD_KIND_TLS table entry so
+		// the loader can rewrite SECREL sites to the exe's offset). `g.value` here is
+		// still the raw global, before the const-pointer-cast below.
+		if (build_context.hot_reload && !is_foreign && e->Variable.thread_local_model.len != 0) {
+			lbHotReloadStaticSym s = {name, g.value, type_hash_canonical_type(e->type)};
+			array_add(&gen->hot_reload_tls_syms, s);
+		}
+
 		if (m->debug_builder) {
 			String global_name = e->token.string;
 			if (global_name.len != 0 && global_name != "_") {
@@ -3603,6 +4050,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_add_entity(m, e, g);
 		lb_add_member(m, name, g);
 	}
+
+	// NOTE: the once-only new-global init table (`__odin_hot_reload_new_global_inits`)
+	// and the manifest write are emitted *after* procedure generation, because local
+	// `@(static)` variables — which also contribute new-global inits and manifest
+	// entries — are only emitted while generating procedure bodies (see below).
 
 	if (build_context.ODIN_DEBUG) {
 		// Custom `.raddbg` section for its debugger
@@ -3669,6 +4121,48 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	if (build_context.hot_reload) {
 		TIME_SECTION("LLVM Hot Reload Symbol Table");
 		lb_generate_hot_reload_symbol_table(gen, global_variables);
+
+		// Emit the once-only init descriptor table for new globals (file-scope and
+		// local `@(static)`) with constant initializers. Layout: { i64 count;
+		// Entry[count] } where Entry = { i64 arena_offset; i64 flag_offset; i64 size;
+		// rawptr blob }. The loader copies each blob into the arena once, gated by its
+		// flag byte. Emitted here (after all procedures) so local statics are included.
+		if (hot_reload_inits.count > 0) {
+			lbModule *m = &gen->default_module;
+			LLVMTypeRef i64t = lb_type(m, t_i64);
+			LLVMTypeRef ptrt = lb_type(m, t_rawptr);
+			LLVMTypeRef entry_field_types[4] = { i64t, i64t, i64t, ptrt };
+			LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 4, false);
+
+			auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, hot_reload_inits.count);
+			for (HotReloadInitEntry const &ie : hot_reload_inits) {
+				LLVMValueRef fields[4] = {};
+				fields[0] = LLVMConstInt(i64t, cast(u64)ie.arena_offset, false);
+				fields[1] = LLVMConstInt(i64t, cast(u64)ie.flag_offset, false);
+				fields[2] = LLVMConstInt(i64t, cast(u64)ie.size, false);
+				fields[3] = LLVMConstPointerCast(ie.blob, ptrt);
+				array_add(&entry_vals, LLVMConstStructInContext(m->ctx, fields, 4, false));
+			}
+			LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entry_vals.count);
+			LLVMValueRef arr = LLVMConstArray(entry_t, entry_vals.data, cast(unsigned)entry_vals.count);
+
+			LLVMTypeRef tbl_field_types[2] = { i64t, arr_t };
+			LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
+			LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
+			LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
+
+			LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_hot_reload_new_global_inits");
+			LLVMSetInitializer(tbl, tbl_val);
+			LLVMSetGlobalConstant(tbl, true);
+			LLVMSetLinkage(tbl, LLVMInternalLinkage);
+			lb_append_to_compiler_used(m, tbl); // the loader reads it by name; keep it from being stripped
+		}
+
+		// Persist the manifest: the base build records every original global (and local
+		// static); a reload build additionally records the arena offsets it assigned to
+		// new ones so the next reload reuses them (preserving state).
+		hot_reload_manifest_write(&hot_reload_manifest);
+		array_free(&hot_reload_inits);
 	}
 
 	if (build_context.ODIN_DEBUG) {

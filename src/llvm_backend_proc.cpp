@@ -139,6 +139,9 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	// map_init(&p->selector_values,  0);
 	// map_init(&p->selector_addr,    0);
 	// map_init(&p->tuple_fix_map,    0);
+	if (build_context.hot_reload) {
+		string_map_init(&p->hot_reload_static_counts, 8);
+	}
 
 	if (p->entity != nullptr && p->entity->Procedure.uses_branch_location) {
 		p->uses_branch_location = true;
@@ -254,6 +257,13 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 		lb_add_attribute_to_proc_with_string(m, p->value,
 			make_string_c("patchable-function"), make_string_c("prologue-short-redirect"));
+		// Emit a 16-byte NOP pad immediately before the entry (linker-independent, so it
+		// works with lld-link/link.exe/radlink alike). The hot-reload loader parks the
+		// full 14-byte absolute jump in this pad and then flips the 2-byte entry to a
+		// short jump into it with one atomic store — a torn-free publish. 16 keeps the
+		// entry 16-byte aligned. See core:sys/hot_reload (HOT_RELOAD_PAD_BYTES).
+		lb_add_attribute_to_proc_with_string(m, p->value,
+			make_string_c("patchable-function-prefix"), make_string_c("16"));
 	}
 
 	if (p->is_export) {

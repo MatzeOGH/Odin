@@ -587,6 +587,10 @@ struct BuildContext {
 	bool   use_single_module;
 	bool   use_separate_modules;
 	bool   hot_reload; // emit runtime.hot_reload_symbol_table for in-process hot reload
+	bool   hot_reload_is_reload;    // true when an existing manifest was found => this build patches a running exe
+	i64    hot_reload_arena_size;   // bytes reserved for new globals introduced across a reload
+	i64    hot_reload_tls_arena_size; // per-thread bytes reserved for new thread-locals introduced across a reload
+	String hot_reload_manifest;     // path to the manifest that pins new-global arena offsets across builds
 	LTOKind lto_kind;
 	bool   module_per_file;
 	bool   cached;

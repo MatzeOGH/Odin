@@ -609,6 +609,13 @@ foreign kernel32 {
 	RtlCaptureStackBackTrace :: proc(FramesToSkip: ULONG, FramesToCapture: ULONG, BackTrace: [^]PVOID, BackTraceHash: PULONG) -> USHORT ---
 	RtlNtStatusToDosError :: proc(status: NTSTATUS) -> ULONG ---
 
+	// Register/unregister a dynamic x64 unwind function table for a range of code not
+	// backed by a loaded image (e.g. JIT'd or manually mapped code), so the OS unwinder
+	// and stack walkers can find `.pdata`/`.xdata` for RIPs in that range. `BaseAddress`
+	// is the image base the entries' RVAs are relative to.
+	RtlAddFunctionTable    :: proc(FunctionTable: PRUNTIME_FUNCTION, EntryCount: DWORD, BaseAddress: DWORD64) -> BOOLEAN ---
+	RtlDeleteFunctionTable :: proc(FunctionTable: PRUNTIME_FUNCTION) -> BOOLEAN ---
+
 	GetSystemPowerStatus :: proc(lpSystemPowerStatus: ^SYSTEM_POWER_STATUS) -> BOOL ---
 
 	RegisterWaitForSingleObject :: proc(

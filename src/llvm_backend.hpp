@@ -198,11 +198,50 @@ struct lbObjCGlobal {
 	Type *    class_impl_type;  // This is set when the class has the objc_implement attribute set to true.
 };
 
+// Hot reload: build-to-build manifest + new-global arena bookkeeping. These
+// live here (rather than in llvm_backend.cpp) so `lb_build_static_variables`
+// in llvm_backend_stmt.cpp — included earlier in the unity build — can see them.
+struct HotReloadNewEntry {
+	i64 offset;
+	u64 type_hash;
+	i64 init_flag_offset; // arena byte offset of the once-only init guard; -1 if the global has no constant initializer
+};
+
+struct HotReloadManifest {
+	bool exists;    // an existing manifest was read => this is a reload object build
+	i64  arena_size;
+	i64  next_free;
+	i64  tls_arena_size;     // per-thread bytes reserved for new thread-locals
+	i64  tls_next_free;      // bump pointer into the TLS arena
+	StringMap<u64>               orig;    // link name -> canonical type hash (from the exe build)
+	StringMap<HotReloadNewEntry> newg;    // link name -> {arena offset, canonical type hash, init-flag offset}
+	StringMap<HotReloadNewEntry> tls_newg; // new thread-local link name -> {TLS arena offset, type hash, per-thread guard offset}
+};
+
+// A new global's compile-time constant initializer: the loader copies `size` bytes
+// from `blob` into the arena at `arena_offset` exactly once, gated by the byte at
+// `flag_offset` in the arena. Collected during codegen, emitted as the object-local
+// table `__odin_hot_reload_new_global_inits`.
+struct HotReloadInitEntry {
+	i64          arena_offset;
+	i64          flag_offset;
+	i64          size;
+	LLVMValueRef blob;
+};
+
+// A local `@(static)` variable to publish in `runtime.hot_reload_symbol_table` so
+// the loader resolves references to the exe's preserved copy across a reload.
+struct lbHotReloadStaticSym {
+	String       name;
+	LLVMValueRef value;
+	u64          type_hash;
+};
+
 struct lbGenerator : LinkerData {
 	CheckerInfo *info;
 
 	PtrMap<void *, lbModule *> modules; // key is `AstPackage *` (`void *` is used for future use)
-	PtrMap<LLVMContextRef, lbModule *> modules_through_ctx; 
+	PtrMap<LLVMContextRef, lbModule *> modules_through_ctx;
 	lbModule default_module;
 
 	lbModule *equal_module;
@@ -218,7 +257,24 @@ struct lbGenerator : LinkerData {
 	MPSCQueue<lbObjCGlobal> objc_classes;
 	MPSCQueue<lbObjCGlobal> objc_ivars;
 	MPSCQueue<String> raddebug_section_strings;
+
+	// Hot reload shared state. The file-scope global loop (single-threaded) and
+	// `lb_build_static_variables` (run on the procedure thread pool) both mutate
+	// `hot_reload_manifest`, `hot_reload_inits`, and `hot_reload_static_syms`, so
+	// all access outside the single-threaded loop is guarded by `hot_reload_mutex`.
+	HotReloadManifest           hot_reload_manifest;
+	Array<HotReloadInitEntry>   hot_reload_inits;
+	Array<lbHotReloadStaticSym> hot_reload_static_syms;
+	// Thread-local variables (file-scope globals + local `@(static)`) to preserve
+	// across a reload: `value` is the LLVM thread_local global. A per-variable
+	// accessor thunk + a `HOT_RELOAD_KIND_TLS` symbol-table entry are emitted for
+	// each so the loader can resolve SECREL references to the exe's TLS block.
+	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
+	BlockingMutex               hot_reload_mutex;
 };
+
+gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 
 
 struct lbBlock {
@@ -380,6 +436,12 @@ struct lbProcedure {
 	lbProcedure *objc_names;
 
 	Type *internal_gen_type; // map_set, map_get, etc.
+
+	// Hot reload: per-procedure occurrence count of each local `@(static)` name,
+	// used to build a source-stable, collision-free symbol name (only initialized
+	// under -hot-reload). Body codegen for a single procedure is sequential, so
+	// this needs no locking.
+	StringMap<u32> hot_reload_static_counts;
 };
 
 

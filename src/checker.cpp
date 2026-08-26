@@ -3223,6 +3223,27 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 
 	thread_pool_wait();
 
+	if (build_context.hot_reload && !build_context.no_rtti) {
+		// Hot reload: a reloaded procedure may reflect on (fmt/any/type_info_of)
+		// ANY type in the program, not just the subset this build happens to use for
+		// RTTI. Emit type_info for every declared entity's type (and, recursively,
+		// the types those reference) so the exe's `type_table` is complete and
+		// hot-code reflection over composite/user types resolves against it. Also
+		// fold in each decl's already-collected type_info_deps.
+		for (Entity *e : c->info.entities) {
+			if (e == nullptr || e->type == nullptr) {
+				continue;
+			}
+			add_min_dep_type_info(c, e->type);
+			DeclInfo *d = decl_info_of_entity(e);
+			if (d != nullptr) {
+				for (TypeInfoPair const tt : d->type_info_deps) {
+					add_min_dep_type_info(c, tt.type);
+				}
+			}
+		}
+	}
+
 
 #undef FORCE_ADD_RUNTIME_ENTITIES
 }

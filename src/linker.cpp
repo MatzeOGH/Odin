@@ -307,6 +307,16 @@ try_cross_linking:;
 				link_settings = gb_string_append_fmt(link_settings, " /DEBUG");
 			}
 
+			if (build_context.hot_reload) {
+				// /OPT:NOICF stops the linker folding identical functions, which would
+				// break per-procedure patching (two procs sharing one body could not be
+				// patched independently). The pre-function pad the atomic patcher needs is
+				// emitted by the compiler itself (patchable-function-prefix, see
+				// llvm_backend_proc.cpp), so it is linker-independent and needs no
+				// /FUNCTIONPADMIN here.
+				link_settings = gb_string_append_fmt(link_settings, " /OPT:NOICF");
+			}
+
 			gbString object_files = gb_string_make(heap_allocator(), "");
 			defer (gb_string_free(object_files));
 			for (String const &object_path : gen->output_object_paths) {

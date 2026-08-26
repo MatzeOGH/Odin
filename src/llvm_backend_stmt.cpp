@@ -2414,6 +2414,10 @@ gb_internal void lb_build_type_switch_stmt(lbProcedure *p, AstTypeSwitchStmt *ss
 
 
 gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
+	lbModule *m = p->module;
+	lbGenerator *gen = m->gen;
+	bool const hot_reload = build_context.hot_reload;
+
 	for_array(i, vd->names) {
 		lbValue value = {};
 
@@ -2437,13 +2441,160 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			value = lb_const_value(p->module, ast_value->tav.type, ast_value->tav.value, cc);
 		}
 
+		bool const is_thread_local = e->Variable.thread_local_model.len != 0;
+
 		String mangled_name = {};
-		{
+		if (hot_reload) {
+			// Source-stable, collision-free key: `<proc>$static$<var>[$<occ>]`.
+			// Unlike the entity-id mangling below, this is reproducible across
+			// builds and across a reload (entity ids are assigned by a global
+			// atomic during multithreaded checking), so the loader can match a
+			// reload object's static against the exe's preserved copy by name.
+			// `<occ>` disambiguates the rare case of two identically named statics
+			// in one procedure (nested scopes) and is stable to adding or removing
+			// *other* statics.
+			u32 *cnt = string_map_get(&p->hot_reload_static_counts, name);
+			u32 occ = cnt ? *cnt : 0;
+			string_map_set(&p->hot_reload_static_counts, name, occ + 1);
+
+			gbString str = gb_string_make_length(permanent_allocator(), p->name.text, p->name.len);
+			str = gb_string_appendc(str, "$static$");
+			str = gb_string_append_length(str, name.text, name.len);
+			if (occ > 0) {
+				str = gb_string_append_fmt(str, "$%u", cast(unsigned)occ);
+			}
+			mangled_name.text = cast(u8 *)str;
+			mangled_name.len = gb_string_length(str);
+		} else {
 			gbString str = gb_string_make_length(permanent_allocator(), p->name.text, p->name.len);
 			str = gb_string_appendc(str, "-");
 			str = gb_string_append_fmt(str, ".%.*s-%llu", LIT(name), cast(long long)e->id);
 			mangled_name.text = cast(u8 *)str;
 			mangled_name.len = gb_string_length(str);
+		}
+
+		// Hot reload: classify original (preserved, resolved to the exe's live copy)
+		// vs new (redirected into the persistent arena). Mirrors the file-scope
+		// global fork in lb_generate_code. Procedure codegen is sequential under
+		// -hot-reload (single module), but the mutex keeps this correct regardless.
+		//
+		// Thread-local statics take a separate path: they cannot be arena-backed
+		// (their storage is per-thread, reached via `_tls_index` + a SECREL offset).
+		// An original one is preserved via a TLS accessor (collected after emission
+		// below); a new one cannot fit the exe's frozen TLS block, so it errors.
+		if (hot_reload) {
+			u64 th = type_hash_canonical_type(e->type);
+			HotReloadManifest &hm = gen->hot_reload_manifest;
+
+			bool is_new = false;
+			mutex_lock(&gen->hot_reload_mutex);
+			if (hm.exists) {
+				u64 *orig_th = string_map_get(&hm.orig, mangled_name);
+				if (orig_th != nullptr) {
+					if (*orig_th != th) {
+						error(e->token, "hot-reload: @(static) variable '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
+					}
+				} else {
+					is_new = true;
+				}
+			} else {
+				// Base (exe) build: record it as an original for later reloads.
+				string_map_set(&hm.orig, mangled_name, th);
+			}
+
+			if (is_thread_local && is_new) {
+				// Brand-new thread-local static introduced by this reload -> per-thread
+				// TLS arena (same as a new file-scope thread-local): access is a GEP into
+				// the arena's thread_local symbol, so the loader's SECREL handler resolves
+				// it to the exe's TLS block. Odin thread-locals cannot have initializers
+				// (checker rule), so this is always zero-init and the arena is zeroed.
+				i64 offset = 0;
+				HotReloadNewEntry *ne = string_map_get(&hm.tls_newg, mangled_name);
+				if (ne != nullptr) {
+					offset = ne->offset;
+					if (ne->type_hash != th) {
+						error(e->token, "hot-reload: new thread-local @(static) variable '%.*s' changed type/layout across a reload; its TLS arena storage cannot be reinterpreted safely", LIT(name));
+					}
+				} else {
+					i64 al = gb_max(type_align_of(e->type), 1);
+					i64 sz = gb_max(type_size_of(e->type), 1);
+					offset = align_formula(hm.tls_next_free, al);
+					hm.tls_next_free = offset + sz;
+					if (hm.tls_next_free > hm.tls_arena_size) {
+						error(e->token, "hot-reload: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-tls-arena-size", cast(long long)hm.tls_next_free, cast(long long)hm.tls_arena_size);
+					}
+					HotReloadNewEntry added = {offset, th, -1};
+					string_map_set(&hm.tls_newg, mangled_name, added);
+				}
+				mutex_unlock(&gen->hot_reload_mutex);
+
+				lbValue g = {};
+				g.type  = alloc_type_pointer(e->type);
+				g.value = lb_hot_reload_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
+				lb_add_entity(m, e, g);
+				lb_add_member(m, mangled_name, g);
+				continue;
+			} else if (is_thread_local) {
+				mutex_unlock(&gen->hot_reload_mutex);
+				// Original thread-local static: fall through to normal emission; it is
+				// collected into hot_reload_tls_syms after the global is created below.
+			} else if (is_new) {
+				// Brand-new static introduced by this reload -> arena, so its state
+				// survives every subsequent reload (a reload object is remapped, so
+				// an object-local copy would reset each time).
+				if (is_type_any(e->type)) {
+					error(e->token, "hot-reload: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
+				}
+				bool has_const_init = value.value != nullptr && !LLVMIsNull(value.value);
+
+				i64 offset   = 0;
+				i64 flag_off = -1;
+				HotReloadNewEntry *ne = string_map_get(&hm.newg, mangled_name);
+				if (ne != nullptr) {
+					offset   = ne->offset;
+					flag_off = ne->init_flag_offset;
+					if (ne->type_hash != th) {
+						error(e->token, "hot-reload: new @(static) variable '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
+					}
+				} else {
+					i64 al = gb_max(type_align_of(e->type), 1);
+					i64 sz = gb_max(type_size_of(e->type), 1);
+					offset = align_formula(hm.next_free, al);
+					hm.next_free = offset + sz;
+					if (has_const_init) {
+						flag_off = hm.next_free;
+						hm.next_free = flag_off + 1;
+					}
+					if (hm.next_free > hm.arena_size) {
+						error(e->token, "hot-reload: new-global arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
+					}
+					HotReloadNewEntry added = {offset, th, flag_off};
+					string_map_set(&hm.newg, mangled_name, added);
+
+					if (has_const_init) {
+						char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->hot_reload_inits.count);
+						LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(value.value), blob_name);
+						LLVMSetInitializer(blob, value.value);
+						LLVMSetGlobalConstant(blob, true);
+						LLVMSetLinkage(blob, LLVMPrivateLinkage);
+						HotReloadInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
+						array_add(&gen->hot_reload_inits, ie);
+					}
+				}
+				mutex_unlock(&gen->hot_reload_mutex);
+
+				lbValue g = {};
+				g.type  = alloc_type_pointer(e->type);
+				g.value = lb_hot_reload_arena_ptr(m, offset, alloc_type_pointer(e->type));
+				lb_add_entity(m, e, g);
+				lb_add_member(m, mangled_name, g);
+				continue;
+			} else {
+				mutex_unlock(&gen->hot_reload_mutex);
+				// Original non-thread-local static: fall through to normal emission
+				// under the stable name; the loader resolves the reload object's copy
+				// to the exe's.
+			}
 		}
 
 		char *c_name = alloc_cstring(permanent_allocator(), mangled_name);
@@ -2495,6 +2646,21 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 		lbValue global_val = {global, alloc_type_pointer(e->type)};
 		lb_add_entity(p->module, e, global_val);
 		lb_add_member(p->module, mangled_name, global_val);
+
+		if (hot_reload) {
+			// Publish original statics so the loader points a reload object's
+			// reference at this exe copy (preserving its value). A thread-local goes
+			// to hot_reload_tls_syms (resolved via a TLS accessor + SECREL offset);
+			// a plain static goes to hot_reload_static_syms (resolved by address).
+			// New statics are handled above (arena / error) and never reach here.
+			MUTEX_GUARD(&gen->hot_reload_mutex);
+			lbHotReloadStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type)};
+			if (is_thread_local) {
+				array_add(&gen->hot_reload_tls_syms, s);
+			} else {
+				array_add(&gen->hot_reload_static_syms, s);
+			}
+		}
 	}
 }
 gb_internal isize lb_append_tuple_values(lbProcedure *p, Array<lbValue> *dst_values, lbValue src_value) {

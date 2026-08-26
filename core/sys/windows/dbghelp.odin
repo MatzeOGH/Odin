@@ -316,5 +316,6 @@ foreign Dbghelp {
 	SymCleanup            :: proc(hProcess: HANDLE) -> BOOL ---
 	SymSetOptions         :: proc(SymOptions: DWORD) -> DWORD ---
 	SymFromAddrW          :: proc(hProcess: HANDLE, Address: DWORD64, Displacement: PDWORD64, Symbol: PSYMBOL_INFOW) -> BOOL ---
+	SymFromNameW          :: proc(hProcess: HANDLE, Name: wstring, Symbol: PSYMBOL_INFOW) -> BOOL ---
 	SymGetLineFromAddrW64 :: proc(hProcess: HANDLE, dwAddr: DWORD64, pdwDisplacement: PDWORD, Line: PIMAGEHLP_LINEW64) -> BOOL ---
 }

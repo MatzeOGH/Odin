@@ -106,6 +106,15 @@ LONG64  :: i64
 DWORD64  :: u64
 PDWORD64 :: ^DWORD64
 
+// An entry of the x64 exception/unwind function table (`.pdata`). Each field is an
+// RVA relative to the base address passed to `RtlAddFunctionTable`.
+RUNTIME_FUNCTION :: struct {
+	BeginAddress:      DWORD,
+	EndAddress:        DWORD,
+	UnwindInfoAddress: DWORD,
+}
+PRUNTIME_FUNCTION :: ^RUNTIME_FUNCTION
+
 PDWORD_PTR :: ^DWORD_PTR
 ATOM       :: distinct WORD
 
@@ -3341,6 +3350,19 @@ CONTEXT :: struct {
 
 PCONTEXT  :: ^CONTEXT
 LPCONTEXT :: ^CONTEXT
+
+// Native x64 `CONTEXT.ContextFlags` selectors. These must be set before a
+// `GetThreadContext`/`SetThreadContext` call to say which register groups are
+// valid. (The `WOW64_CONTEXT_*` values in wow64_apiset.odin are for 32-bit
+// contexts and are NOT interchangeable with these.)
+CONTEXT_AMD64            :: DWORD(0x00100000)
+CONTEXT_CONTROL          :: CONTEXT_AMD64 | 0x1 // SegSs, Rsp, SegCs, Rip, EFlags
+CONTEXT_INTEGER          :: CONTEXT_AMD64 | 0x2 // Rax..R15
+CONTEXT_SEGMENTS         :: CONTEXT_AMD64 | 0x4 // SegDs, SegEs, SegFs, SegGs
+CONTEXT_FLOATING_POINT   :: CONTEXT_AMD64 | 0x8 // Xmm0..Xmm15
+CONTEXT_DEBUG_REGISTERS  :: CONTEXT_AMD64 | 0x10
+CONTEXT_FULL             :: CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT
+CONTEXT_ALL              :: CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS
 
 when size_of(uintptr) == 32 {
 	XSAVE_FORMAT :: struct #align(16) {

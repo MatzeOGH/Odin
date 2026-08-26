@@ -406,6 +406,9 @@ enum BuildFlagKind {
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
 	BuildFlag_HotReload,
+	BuildFlag_HotReloadArenaSize,
+	BuildFlag_HotReloadTlsArenaSize,
+	BuildFlag_HotReloadManifest,
 	BuildFlag_NoThreadedChecker,
 	BuildFlag_ShowDebugMessages,
 	BuildFlag_DidYouMeanLimit,
@@ -668,6 +671,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_HotReload,               str_lit("hot-reload"),               BuildFlagParam_None,    Command__does_build);
+	add_flag(&build_flags, BuildFlag_HotReloadArenaSize,      str_lit("hot-reload-arena-size"),     BuildFlagParam_Integer, Command__does_build);
+	add_flag(&build_flags, BuildFlag_HotReloadTlsArenaSize,   str_lit("hot-reload-tls-arena-size"), BuildFlagParam_Integer, Command__does_build);
+	add_flag(&build_flags, BuildFlag_HotReloadManifest,       str_lit("hot-reload-manifest"),       BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ShowDebugMessages,       str_lit("show-debug-messages"),       BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_DidYouMeanLimit,         str_lit("did-you-mean-limit"),        BuildFlagParam_Integer, Command__does_check);
@@ -1421,6 +1427,40 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							// loader. Force a single module so all procedures share one .text.
 							build_context.hot_reload = true;
 							build_context.use_single_module = true;
+							if (build_context.hot_reload_arena_size == 0) {
+								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
+							}
+							if (build_context.hot_reload_tls_arena_size == 0) {
+								build_context.hot_reload_tls_arena_size = 4*1024; // default per-thread new-thread-local arena
+							}
+							break;
+						case BuildFlag_HotReloadArenaSize:
+							{
+								GB_ASSERT(value.kind == ExactValue_Integer);
+								i64 size = big_int_to_i64(&value.value_integer);
+								if (size < 0) {
+									gb_printf_err("%.*s expected a non-negative number, got %.*s\n", LIT(name), LIT(param));
+									bad_flags = true;
+								} else {
+									build_context.hot_reload_arena_size = size;
+								}
+							}
+							break;
+						case BuildFlag_HotReloadTlsArenaSize:
+							{
+								GB_ASSERT(value.kind == ExactValue_Integer);
+								i64 size = big_int_to_i64(&value.value_integer);
+								if (size < 0) {
+									gb_printf_err("%.*s expected a non-negative number, got %.*s\n", LIT(name), LIT(param));
+									bad_flags = true;
+								} else {
+									build_context.hot_reload_tls_arena_size = size;
+								}
+							}
+							break;
+						case BuildFlag_HotReloadManifest:
+							GB_ASSERT(value.kind == ExactValue_String);
+							build_context.hot_reload_manifest = value.value_string;
 							break;
 						case BuildFlag_NoThreadedChecker:
 							build_context.no_threaded_checker = true;
