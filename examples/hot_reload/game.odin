@@ -1,32 +1,53 @@
 #+build windows
-package hot_reload
+package hot_reload_demo
 
 import "core:fmt"
 import "core:os"
 import "core:strings"
 import win "core:sys/windows"
+import hr "core:sys/hot_reload"
+import rl "vendor:raylib"
 
 State :: struct {
 	counter: i64,
 	step:    i64,
+	mirror:  i64, // hot code mirrors a new global here so the host can observe it
 }
 
-// A package GLOBAL — state that lives in the .exe's data segment. The hot
-// procedure below reads and writes it; when the object is reloaded, the loader
-// resolves that reference to *this exe's* copy of `hits`, so its value carries
-// across reloads. (A DLL-swap approach gets its own separate copy and cannot do
-// this — resolving relocations against the running process is what makes it work.)
+// A package GLOBAL in the exe's data segment. `update` reads/writes it; on reload
+// the loader resolves the reference to *this exe's* copy, so its value carries
+// across reloads. (A DLL-swap approach gets a separate copy and cannot do this.)
 hits: i64
 
+
+
 // A `@(hot_reload)` procedure. With the exe built `-hot-reload`, its body may call
-// the standard library and read/write globals — the loader relocates it against
-// the running process. Edit the arithmetic/message, rebuild the object (see
-// README.md), then type `r` in the running program to replace it in place.
+// other procedures, read/write globals, reference brand-new globals and procedures
+// that did not exist when the exe was built, and — since the loader resolves C-runtime
+// and Windows-API symbols against the running process — call `fmt` and the rest of the
+// standard library. Edit it (see demo.ps1 / README.md), rebuild the object, then press
+// `r` to replace it in place.
 @(hot_reload)
 update :: proc(s: ^State) {
-	s.counter += s.step * 10 // host-owned state, via pointer
-	hits += 2           // global state, resolved to the exe's copy
+	// ---- EDIT HERE, then recompile (ctrl-alt-r) and press `r` in the run terminal ----
+	// Try: change the numbers, print something new, add a global/proc above and use it.
+	fmt.println("   [update] v1")   // bump "v1" -> "v2" to see the reload instantly
+	s.counter += s.step             // host-owned state, via pointer
+	hits += 2                       // global state, resolved to the exe's copy
+	// Foreign-library call from a `vendor:raylib` package that the exe already links
+	// (see `main`). A reload may ADD calls to *other* raylib procedures this source has
+	// not referenced before — e.g. `rl.GetRandomValue(1, 100)` — and the loader resolves
+	// them to their address in the running image via the exe's PDB. See demo_raylib.ps1.
+	// ----------------------------------------------------------------------------------
+
+	a := rl.GetRandomValue(1,100)
+	fmt.println(a)
+	neo = neo + 1
+	fmt.println(v)
 }
+
+@(thread_local) v:int
+@(thread_local) neo : int
 
 OBJ_PATH :: "hot.obj"
 
@@ -34,9 +55,15 @@ main :: proc() {
 	state := State{counter = 0, step = 1}
 	pid := win.GetCurrentProcessId()
 
+	// Reference one `vendor:raylib` procedure so the exe statically links raylib.lib
+	// (pulling its object member into the image). A hot reload can then call *other*
+	// raylib procedures this source never referenced — the loader resolves them via the
+	// exe's PDB. `SetRandomSeed` needs no window/GPU, so this stays a console demo.
+	rl.SetRandomSeed(1)
+
 	fmt.printfln("hot-reload demo — pid %d", pid)
 	fmt.println("commands:  [enter]/t = tick    r = reload from hot.obj    q = quit")
-	fmt.println("edit `update` in game.odin, rebuild the object, then press r.")
+	fmt.println("edit `update` in game.odin, rebuild the object, then press `r`.")
 
 	buf: [256]u8
 	for {
@@ -51,11 +78,11 @@ main :: proc() {
 			case "q":
 				return
 			case "r":
-				ok := load_and_patch(OBJ_PATH, []Hot_Func{{"update", rawptr(update)}})
+				ok := hr.apply(OBJ_PATH)
 				fmt.printfln("reload ok: %v", ok)
 			case: // empty line or "t": advance the simulation
 				update(&state)
-				fmt.printfln("counter = %d   hits = %d", state.counter, hits)
+				fmt.printfln("counter = %d   hits = %d   mirror = %d", state.counter, hits, state.mirror)
 			}
 		}
 	}

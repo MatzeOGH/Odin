@@ -229,8 +229,9 @@ struct HotReloadInitEntry {
 	LLVMValueRef blob;
 };
 
-// A local `@(static)` variable to publish in `runtime.hot_reload_symbol_table` so
-// the loader resolves references to the exe's preserved copy across a reload.
+// A thread-local variable (file-scope global, local `@(static)`, or the TLS arena)
+// for which a per-variable accessor thunk is emitted, so the loader can resolve
+// SECREL references to the exe's TLS block across a reload. `name` is its link name.
 struct lbHotReloadStaticSym {
 	String       name;
 	LLVMValueRef value;
@@ -260,15 +261,14 @@ struct lbGenerator : LinkerData {
 
 	// Hot reload shared state. The file-scope global loop (single-threaded) and
 	// `lb_build_static_variables` (run on the procedure thread pool) both mutate
-	// `hot_reload_manifest`, `hot_reload_inits`, and `hot_reload_static_syms`, so
-	// all access outside the single-threaded loop is guarded by `hot_reload_mutex`.
+	// `hot_reload_manifest`, `hot_reload_inits`, and `hot_reload_tls_syms`, so all
+	// access outside the single-threaded loop is guarded by `hot_reload_mutex`.
 	HotReloadManifest           hot_reload_manifest;
 	Array<HotReloadInitEntry>   hot_reload_inits;
-	Array<lbHotReloadStaticSym> hot_reload_static_syms;
 	// Thread-local variables (file-scope globals + local `@(static)`) to preserve
 	// across a reload: `value` is the LLVM thread_local global. A per-variable
-	// accessor thunk + a `HOT_RELOAD_KIND_TLS` symbol-table entry are emitted for
-	// each so the loader can resolve SECREL references to the exe's TLS block.
+	// accessor thunk (`__odin_hrtls$<name>`) is emitted for each so the loader can
+	// resolve SECREL references to the exe's TLS block (found in the exe's PDB).
 	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
 	BlockingMutex               hot_reload_mutex;
 };

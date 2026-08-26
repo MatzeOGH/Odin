@@ -1423,8 +1423,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							build_context.use_single_module = true;
 							break;
 						case BuildFlag_HotReload:
-							// Emit runtime.hot_reload_symbol_table for an in-process hot-reload
-							// loader. Force a single module so all procedures share one .text.
+							// Emit the hot-reload support symbols (arena + TLS accessors) for an
+							// in-process hot-reload loader; the loader resolves running-exe symbols
+							// from the PDB, so this also requires -debug (checked post-parse).
+							// Force a single module so all procedures share one .text.
 							build_context.hot_reload = true;
 							build_context.use_single_module = true;
 							if (build_context.hot_reload_arena_size == 0) {
@@ -2031,6 +2033,29 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	if (set_flags[BuildFlag_VetUnusedProcedures] && !set_flags[BuildFlag_VetPackages]) {
 		gb_printf_err("-vet-unused-procedures must be used with -vet-packages\n");
 		bad_flags = true;
+	}
+
+	if (build_context.hot_reload) {
+		// The reload object itself (-build-mode:obj, and the asm/llvm intermediate
+		// outputs) is exempt from these host checks: the loader reads the HOST's PDB,
+		// not the object's.
+		bool is_reload_output = build_context.build_mode == BuildMode_Object ||
+		                        build_context.build_mode == BuildMode_Assembly ||
+		                        build_context.build_mode == BuildMode_LLVM_IR;
+		if (!is_reload_output && build_context.build_mode != BuildMode_Executable) {
+			// The loader hardcodes the running EXE module (GetModuleHandleW(nil)) for
+			// symbol enumeration, near-block allocation, and patching, so the host must
+			// be an executable. A DLL/static-lib host would be enumerated/patched against
+			// the wrong image. (Multiple-module / DLL hosts are future work.)
+			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe); reload objects use -build-mode:obj\n");
+			bad_flags = true;
+		} else if (build_context.build_mode == BuildMode_Executable && !build_context.ODIN_DEBUG) {
+			// The loader resolves the running exe's procedures and globals from its PDB
+			// (DbgHelp) instead of a baked symbol table, so a PDB must exist next to it.
+			// Without -debug there is no PDB and no reload can bind.
+			gb_printf_err("-hot-reload requires -debug (the reload loader resolves the running exe's symbols from its PDB)\n");
+			bad_flags = true;
+		}
 	}
 
 	if ((!(build_context.export_timings_format == TimingsExportUnspecified)) && (build_context.export_timings_file.len == 0)) {

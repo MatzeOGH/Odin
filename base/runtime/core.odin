@@ -283,28 +283,6 @@ Type_Info :: struct {
 // This will be set by the compiler
 type_table: []^Type_Info
 
-Hot_Reload_Kind :: enum u8 {
-	Proc,
-	Global,
-	TLS, // thread-local: `address` is a `proc "c" () -> rawptr` accessor returning `&var`
-}
-
-Hot_Reload_Symbol :: struct {
-	name:      string,          // link/COFF name the loader matches on
-	address:   rawptr,          // for .TLS this is an accessor proc, not the datum's address
-	is_hot:    bool,
-	kind:      Hot_Reload_Kind,
-	type_hash: u64,             // canonical structural hash of a global's type; 0 for procs
-}
-
-// Set by the compiler when building with `-hot-reload`: a table of every emitted
-// procedure and global variable. An in-process hot-reload loader uses it to
-// resolve the symbols referenced by a freshly compiled object against the
-// addresses in the already-running process. `kind` distinguishes procedures from
-// globals; `type_hash` is the build-stable canonical hash of a global's type, so
-// the loader can refuse to preserve a global whose layout changed across a reload.
-hot_reload_symbol_table: []Hot_Reload_Symbol
-
 args__: []cstring
 
 when ODIN_OS == .Windows {

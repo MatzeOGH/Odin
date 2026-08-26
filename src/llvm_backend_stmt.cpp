@@ -2647,19 +2647,15 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 		lb_add_entity(p->module, e, global_val);
 		lb_add_member(p->module, mangled_name, global_val);
 
-		if (hot_reload) {
-			// Publish original statics so the loader points a reload object's
-			// reference at this exe copy (preserving its value). A thread-local goes
-			// to hot_reload_tls_syms (resolved via a TLS accessor + SECREL offset);
-			// a plain static goes to hot_reload_static_syms (resolved by address).
-			// New statics are handled above (arena / error) and never reach here.
+		if (hot_reload && is_thread_local) {
+			// A thread-local original static needs a TLS accessor emitted so the loader
+			// can resolve SECREL references to the exe's TLS block; record it. A plain
+			// (non-TLS) original static needs nothing recorded — the loader resolves a
+			// reload object's reference to the exe copy by name via the PDB. New statics
+			// are handled above (arena / error) and never reach here.
 			MUTEX_GUARD(&gen->hot_reload_mutex);
 			lbHotReloadStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type)};
-			if (is_thread_local) {
-				array_add(&gen->hot_reload_tls_syms, s);
-			} else {
-				array_add(&gen->hot_reload_static_syms, s);
-			}
+			array_add(&gen->hot_reload_tls_syms, s);
 		}
 	}
 }

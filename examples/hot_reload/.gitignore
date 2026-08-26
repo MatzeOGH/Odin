@@ -1,4 +1,7 @@
 .work/
+.work_rl/
+.probe/
 *.exe
 *.obj
 *.pdb
+hot.manifest

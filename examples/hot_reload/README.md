@@ -11,16 +11,20 @@ the running process**, and overwrite the prologue of each running `@(hot_reload)
 procedure with a jump to the fresh code. Existing call sites reach the new code
 transparently; process state — including package **globals** — is untouched.
 
+A reload may also **introduce new globals and new procedures** (see below).
+
 ## Manual workflow (edit, then reload by hand)
 
-Use the `odin.exe` from **this repo** (it has `@(hot_reload)` and `-hot-reload`).
+Use the `odin.exe` from **this repo** (it has `@(hot_reload)`, `-hot-reload`, and
+the `core:sys/hot_reload` loader package).
 
 1. **Build the demo once and run it.** `-hot-reload` bakes a symbol table into the
-   exe so the loader can resolve references against the running process. It loads
-   `hot.obj` from its working directory, so run it from this folder:
+   exe and reserves the new-global arena; `-hot-reload-manifest` records the
+   layout so reload builds can line up against it. It loads `hot.obj` from its
+   working directory, so run it from this folder:
 
    ```
-   odin build examples/hot_reload -out:examples/hot_reload/hot_reload.exe -debug -hot-reload
+   odin build examples/hot_reload -out:examples/hot_reload/hot_reload.exe -debug -hot-reload -hot-reload-manifest:examples/hot_reload/hot.manifest
    cd examples/hot_reload
    .\hot_reload.exe
    ```
@@ -28,20 +32,21 @@ Use the `odin.exe` from **this repo** (it has `@(hot_reload)` and `-hot-reload`)
    Type `t` + Enter a few times. `counter` (host state) and `hits` (a global) advance.
    **Leave it running.**
 
-2. **Edit** `examples/hot_reload/game.odin` — change the body of `update`, e.g.
-   `s.counter += s.step * 10`. The body may read/write globals and call other
-   procedures. Save.
+2. **Edit** `examples/hot_reload/game.odin` — change the body of `update`, and
+   optionally **add a new global or a new procedure** and use them from `update`.
+   Save.
 
 3. **Rebuild only the object** in a second terminal (do *not* rebuild the exe —
-   that would restart the process). Write it next to the running exe:
+   that would restart the process). Pass the **same** manifest so any new global
+   gets a stable arena slot:
 
    ```
-   odin build examples/hot_reload -build-mode:obj -use-single-module -out:examples/hot_reload/hot.obj
+   odin build examples/hot_reload -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:examples/hot_reload/hot.manifest -out:examples/hot_reload/hot.obj
    ```
 
 4. Back in the running program, press `r` + Enter. It patches `update` in place.
-   Type `t` again — new behavior, but **`hits` continues** from its previous value
-   and the **pid is unchanged**.
+   Type `t` again — new behavior, `hits` continues, any new global keeps its value
+   across further reloads, and the **pid is unchanged**.
 
 ## Or run the whole thing scripted
 
@@ -49,85 +54,148 @@ Use the `odin.exe` from **this repo** (it has `@(hot_reload)` and `-hot-reload`)
 powershell -ExecutionPolicy Bypass -File examples\hot_reload\demo.ps1
 ```
 
-This builds the exe, simulates an edit → `hot.obj`, and drives the reload
-automatically. Expected output — the **pid is unchanged**, `counter` now advances
-by the edited amount, and the global `hits` **keeps counting across the reload**:
+This builds the exe, simulates an edit that **adds new globals** (`reloads`, and
+`threshold`/`limits` with **compile-time constant initializers**) and a **new
+procedure** (`bonus`), compiles it to `hot.obj`, and drives **two** reloads.
+`mirror` is where hot code stashes the new `threshold` global so the host can see
+it:
 
 ```
-hot-reload demo — pid 25532
-> counter = 1   hits = 1
-counter = 2   hits = 2
-[hot] patched update: 0x7FF673A158F0 -> 0x7FF6738F3400
+==> new-global arena slots recorded in the manifest:
+next_free 49
+new 0  3300913439211647358 0  hot_reload_demo::reloads     # zero-init, no flag
+new 8  3300913439211647358 17 hot_reload_demo::threshold   # const 42, init-flag at 16
+new 24 3211830901467771920 49 hot_reload_demo::limits      # const [3]i64, init-flag at 48
+...
+> counter = 1   hits = 2   mirror = 0
+counter = 2   hits = 4   mirror = 0
 reload ok: true
-counter = 12   hits = 3
-counter = 22   hits = 4
+counter = 37   hits = 6   mirror = 43   # const init applied (42) then +1; counter += 10+5+limits[1]=20
+reload ok: true
+counter = 72   hits = 8   mirror = 44   # threshold persisted across reload 2 (not reset to 43)
 ```
 
-That `hits` goes `2 → 3 → 4` is the point: the reloaded code writes the **exe's**
-copy of the global, not a private one. A DLL swap cannot do this.
+`mirror` reaching `44` (not `43`) is the point: the new global's **constant
+initializer is applied exactly once**, and its state persists across every
+reload. `counter` jumping by 35 per tick shows the aggregate constant `limits`
+was written correctly too. The `[hot] fmt from hot code …` line is printed **by the
+patched `update` itself** — `fmt` of ints now works from inside hot code. (The
+`[hot] note: 0 unresolved and N unsupported …` line is expected: `unsupported`
+counts leftover debug relocation kinds in code paths you never execute (unwind
+`.pdata`/`.xdata` relocations are now handled, so they no longer count here);
+`unresolved` should be 0 — a nonzero count in `.text` now aborts the reload with
+the symbol name.)
 
 ## How it works
 
-1. **The language feature.** `@(hot_reload)` (a new procedure attribute) marks a
-   procedure as replaceable. The compiler gives it `noinline` (so it stays a
-   discrete, patchable function), a patchable prologue
-   (`"patchable-function"="prologue-short-redirect"`), and exports it under a
-   stable, unmangled symbol name so the loader can find it in a recompiled object.
+1. **The language feature.** `@(hot_reload)` (a procedure attribute) marks a
+   procedure as replaceable. The compiler gives it `noinline`, a patchable
+   prologue, and exports it under a stable, unmangled symbol name.
 
-2. **The symbol table.** Building with `-hot-reload` bakes
-   `runtime.hot_reload_symbol_table` into the exe: `{name, address, is_hot}` for
-   every procedure and global. It is the running process's name → address map.
+2. **The baked table.** Building with `-hot-reload` bakes
+   `runtime.hot_reload_symbol_table` into the exe: `{name, address, is_hot, kind,
+   type_hash}` for every procedure and global. It is the running process's
+   name → address map; `type_hash` is the build-stable canonical hash of a
+   global's type.
 
-3. **Recompile to an object.** On reload the whole program is rebuilt to one COFF
-   object (`-use-single-module` puts every procedure in a single `.text`):
+3. **The new-global arena + manifest.** `-hot-reload` also reserves a zero-init
+   arena (`__odin_hot_reload_global_arena`) in the exe. The compiler writes a
+   **manifest** (`-hot-reload-manifest:<path>`) recording every original global
+   and, for reload builds, the arena offset assigned to each **new** global — so
+   the same new global lands at the same address every reload and its state
+   persists.
 
-   ```
-   odin build <package> -build-mode:obj -use-single-module -out:hot.obj
-   ```
+4. **Recompile to an object.** On reload the whole program is rebuilt to one COFF
+   object with `-hot-reload -hot-reload-manifest:<same path> -build-mode:obj
+   -use-single-module`.
 
-4. **Load + relocate + patch** (`hot_reload.odin`):
+5. **Load + relocate + patch** (`core:sys/hot_reload`, call `hot_reload.apply("hot.obj")`):
    - Map the object's sections into one contiguous block reserved **within ±2 GB
      of the exe** (so RIP-relative references stay in range).
    - Apply `AMD64_REL32`/`REL32_1..5`/`ADDR64` relocations. Each target symbol is
      resolved by policy: a symbol that exists in the running exe and is **not** hot
-     → the exe's address (this reuses functions and, crucially, points global
-     references at the exe's globals); a **hot** symbol → the object's fresh copy;
-     an object-local symbol (constants, labels) → its loaded copy.
-   - Overwrite each running hot procedure's first 14 bytes with
-     `FF 25 00000000 <qword target>` (a RIP-relative absolute jump) and
-     `FlushInstructionCache`. Procedures are 16-byte aligned, so the patch stays
-     inside the procedure's own slot.
+     → the exe's address (reuses procedures and points existing globals at the
+     exe's copy); a **hot** symbol → the object's fresh copy; an object-local
+     symbol (new procedures, constants, labels) → its loaded copy. New globals
+     reference the arena symbol (resolved to the exe's arena) plus a byte offset.
+     An **undefined external** not in the table — a C-runtime helper
+     (`memcpy`/`memset`/…), `_tls_index`, an `__imp_*` import cell, or a Windows-API
+     symbol — is resolved against the running process via `GetProcAddress` / an
+     in-image reference / a synthesised pointer cell; if the target is beyond REL32
+     range it is reached through a near-block absolute-jump trampoline. This is what
+     lets hot code call `fmt` and the rest of the standard library. As a final
+     fallback the external is looked up in the exe's **PDB** (DbgHelp
+     `SymFromNameW`), which resolves non-exported, in-image symbols — in particular a
+     **statically-linked foreign-library function** (e.g. a `vendor:raylib` proc) the
+     base source never referenced. That needs the exe built with `-debug` (a PDB) and
+     `/OPT:NOREF,NOICF` so the linker keeps such unreferenced functions in the image;
+     see `demo_raylib.ps1`. Adding a library *not* linked into the base exe at all is
+     not supported.
+   - Overwrite each running hot procedure's first 14 bytes with a RIP-relative
+     absolute jump and `FlushInstructionCache`. `apply` discovers which procedures
+     to patch from the baked table, so callers don't list them.
 
 ## Scope and limitations
 
-Works: replacing a running procedure; hot code that reads/writes package globals
-(state preserved) and references other procedures/data in the program.
+Works: replacing a running procedure; hot code that reads/writes existing package
+globals (state preserved); **new procedures** (called from hot code, transitively);
+**new globals** (persist across reloads via the arena); and **`fmt`/`any`/reflection
+from hot code**, including `%v` over user structs and `typeid_of(T)` for any type
+present in the program at exe-build time.
 
-Out of scope for this PoC (documented edges, not attempted):
+Out of scope for this PoC (documented edges):
 
-- **Calls whose result depends on runtime type identity** (e.g. `fmt.*` and other
-  variadic/`any`-based APIs) from *inside* hot code. Simple calls and global access
-  work, but `any`/typeid values constructed in the reloaded object are not
-  guaranteed to match the running exe's type numbering, so keep printing/logging in
-  the host (as the demo does) rather than in the hot procedure.
-- **Changing data layout across a reload** — adding/removing globals or types, or
-  changing a struct's size. The reload assumes the type/global set is stable (only
-  procedure *bodies* change). This is the same restriction Live++ imposes.
-- Non-atomic patching (patch at a safe point — the demo does it between ticks);
-  each reload leaks the previously mapped block; whole-program recompile per reload
-  (Odin has no incremental builds yet); x64 / Windows / COFF only.
+- **Runtime initializers for new globals.** New globals may carry **compile-time
+  constant** initializers — the loader writes them into the arena exactly once (via
+  a per-global flag byte), so they start at their declared value and then persist.
+  A *runtime* (non-constant) initializer or a new `@(init)` for a fresh global is
+  still unsupported (rejected at build time).
+- **New host-callable entry points.** A brand-new procedure is reachable through
+  the patched call graph, but the frozen host cannot gain a new direct call site.
+- **Changing an existing global's type/layout** across a reload is rejected at
+  build time (its preserved memory cannot be reinterpreted). The new-global arena
+  is a fixed size (`-hot-reload-arena-size`, default 256 KiB).
+- **Reflection over a brand-new type introduced only by a hot edit.** `fmt`/`any`/
+  reflection over any type that exists in the program at exe-build time now works
+  from hot code (`typeid` is the build-stable canonical hash; under `-hot-reload` the
+  exe's `type_table` is made complete and hot code resolves `type_info` through it).
+  But a type that appears *only* in a reload edit is absent from the exe's frozen
+  `type_table`, so reflection on it won't be correct.
+- Each reload leaks the mapped block (new-global storage is in the exe arena, so it is
+  unaffected); whole-program recompile per reload; x64 / Windows / COFF only.
+
+Thread safety: patching is safe while other threads run the hot procedures. On a reload
+the loader suspends every other thread, checks none is parked in a prologue it is about to
+overwrite (retrying if so), and publishes each redirect by flipping the 2-byte hotpatch
+entry to a short jump into a compiler-emitted 16-byte pad with a single atomic store — so
+a concurrent thread never executes a half-written instruction. In-flight calls already
+inside the old body finish on the old code (it stays mapped); new calls take the jump. The
+`examples/hot_reload/mt_test` program is an automated regression test for this
+(`run_mt_test.ps1`: worker threads hammer the hot proc while the main thread reloads 200×;
+exit 0 = PASS).
 
 ## Files
 
-- `game.odin` — the demo: a `@(hot_reload)` procedure and a `main` REPL that reloads it.
-- `hot_reload.odin` — the COFF object loader, relocator, and in-process patcher.
-- `demo.ps1` — builds the exe, simulates an edit → `hot.obj`, and drives a reload.
+- `game.odin` — the demo: a `@(hot_reload)` procedure and a `main` REPL that calls
+  `hot_reload.apply`.
+- `demo.ps1` — builds the exe, simulates an edit that adds a new global + proc →
+  `hot.obj`, and drives two reloads.
+- `demo_raylib.ps1` — builds the exe with `vendor:raylib` statically linked, then
+  reloads code that calls a raylib procedure the base source never referenced
+  (`rl.GetRandomValue`), resolved via the exe's PDB.
+- The loader itself now ships as **`core:sys/hot_reload`** (no longer copied here).
 
-## Compiler changes this depends on
+## Compiler / library changes this depends on
 
 - `@(hot_reload)` procedure attribute — `src/checker.{hpp,cpp}`, `src/entity.cpp`,
   `src/check_decl.cpp`, `src/llvm_backend_proc.cpp`.
-- `-hot-reload` build flag + `runtime.hot_reload_symbol_table` emission —
+- `-hot-reload`, `-hot-reload-arena-size`, `-hot-reload-manifest` flags; baked
+  table (`{name, address, is_hot, kind, type_hash}`); new-global arena + manifest —
   `src/main.cpp`, `src/build_settings.cpp`, `src/llvm_backend.cpp`,
   `base/runtime/core.odin`.
+- Reflection from hot code — under `-hot-reload`, a complete `type_table`
+  (`src/checker.cpp`, `generate_minimum_dependency_set`) and typeid-based
+  `type_info` resolution (`src/llvm_backend_type.cpp`, `lb_type_info` →
+  `__type_info_of`).
+- `core:sys/hot_reload` — the COFF loader/relocator/patcher + `apply`.
 - `FlushInstructionCache` binding — `core/sys/windows/kernel32.odin`.

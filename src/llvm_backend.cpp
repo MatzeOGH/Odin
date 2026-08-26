@@ -3109,7 +3109,9 @@ gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
 		LLVMSetLinkage(arena, LLVMExternalLinkage); // reference the exe's arena
 	} else {
 		LLVMSetInitializer(arena, LLVMConstNull(arena_t));
-		LLVMSetLinkage(arena, LLVMInternalLinkage);
+		// External (public) so the loader can find the arena by name in the exe's PDB
+		// (the baked symbol table that used to carry its address is gone).
+		LLVMSetLinkage(arena, LLVMExternalLinkage);
 	}
 	// Over-align the arena so aggregate / f64 / SIMD globals placed at aligned
 	// offsets within it are correctly aligned relative to the (aligned) base.
@@ -3289,135 +3291,69 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	}
 }
 
-// Emit `runtime.hot_reload_symbol_table` — a constant array of
-// {name, address, is_hot, kind, type_hash} for every generated procedure and
-// global variable. An in-process hot-reload loader uses it to resolve the
-// symbols referenced by a freshly compiled object against the running process.
-gb_internal void lb_generate_hot_reload_symbol_table(lbGenerator *gen, Array<lbGlobalVariable> const &global_variables) {
+// Emit the hot-reload support symbols the loader resolves from the running exe via
+// its PDB. No name->address table is baked into the exe anymore — the loader finds
+// every running procedure and global with DbgHelp `SymFromNameW`, so ordinary
+// symbols are left to normal dead-code elimination (which the old baked table
+// disabled by taking the address of every symbol). Only the few symbols the loader
+// looks up by a *fixed, source-derived name* are force-kept here via `llvm.used` +
+// external linkage, so they survive DCE and appear in the PDB:
+//   - the new-global arena `__odin_hot_reload_global_arena`;
+//   - the per-thread TLS arena (kept transitively via its accessor);
+//   - a per-thread-local accessor `__odin_hrtls$<link-name>`.
+// A procedure's `@(hot_reload)`-ness and a thread-local's identity are recovered by
+// the loader structurally (the patchable prologue) and by naming convention (the
+// accessor name), respectively, so no metadata section is needed.
+gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
-
-	lbValue table_var = lb_find_runtime_value(m, str_lit("hot_reload_symbol_table"));
-	Type *slice_t = type_deref(table_var.type);
-	GB_ASSERT(is_type_slice(slice_t));
-	Type *elem_t = base_type(slice_t)->Slice.elem;
-	LLVMTypeRef elem_llvm = lb_type(m, elem_t);
 	LLVMTypeRef rawptr_llvm = lb_type(m, t_rawptr);
-	LLVMTypeRef bool_llvm = lb_type(m, t_bool);
-	LLVMTypeRef u8_llvm   = lb_type(m, t_u8);
-	LLVMTypeRef u64_llvm  = lb_type(m, t_u64);
 
-	// runtime.Hot_Reload_Kind
-	enum { HOT_RELOAD_KIND_PROC = 0, HOT_RELOAD_KIND_GLOBAL = 1, HOT_RELOAD_KIND_TLS = 2 };
-
-	auto entries = array_make<LLVMValueRef>(heap_allocator(), 0, 1024);
-	defer (array_free(&entries));
-
-	auto add_entry = [&](String name, LLVMValueRef ptr_value, bool is_hot, u8 kind, u64 type_hash) {
-		if (name.len == 0 || ptr_value == nullptr) {
-			return;
-		}
-		LLVMValueRef vals[5] = {};
-		vals[0] = lb_find_or_add_entity_string(m, name, false).value;
-		vals[1] = LLVMConstPointerCast(ptr_value, rawptr_llvm);
-		vals[2] = LLVMConstInt(bool_llvm, is_hot ? 1 : 0, false);
-		vals[3] = LLVMConstInt(u8_llvm, kind, false);
-		vals[4] = LLVMConstInt(u64_llvm, type_hash, false);
-		array_add(&entries, llvm_const_named_struct(m, elem_t, vals, gb_count_of(vals)));
-	};
-
-	// Procedures (single module is forced under -hot-reload, so all live here).
-	for (lbProcedure *p : m->generated_procedures) {
-		bool is_hot = p->entity != nullptr &&
-		              p->entity->kind == Entity_Procedure &&
-		              p->entity->Procedure.is_hot_reload;
-		add_entry(p->name, p->value, is_hot, HOT_RELOAD_KIND_PROC, 0);
-	}
-
-	// Global variables. `type_hash` is the build-stable canonical hash of the
-	// global's type so the loader can detect a layout change across a reload.
-	for (lbGlobalVariable const &gv : global_variables) {
-		if (gv.decl == nullptr) {
-			continue;
-		}
-		Entity *e = gv.decl->entity; // implicit atomic load
-		if (e == nullptr || e->Variable.is_foreign) {
-			continue;
-		}
-		if (e->Variable.thread_local_model.len != 0) {
-			// Thread-local: a plain address is meaningless (it is the .tls template,
-			// not a per-thread slot). Handled below via a HOT_RELOAD_KIND_TLS entry.
-			continue;
-		}
-		add_entry(lb_get_entity_name(m, e), gv.var.value, false, HOT_RELOAD_KIND_GLOBAL, type_hash_canonical_type(e->type));
-	}
-
-	// Function-local `@(static)` variables (collected during procedure codegen).
-	// Publishing them lets the loader resolve a reload object's reference to the
-	// exe's preserved copy, exactly as for a file-scope global. New statics (ones
-	// absent from the exe) are arena-backed instead and never appear here.
-	for (lbHotReloadStaticSym const &s : gen->hot_reload_static_syms) {
-		add_entry(s.name, s.value, false, HOT_RELOAD_KIND_GLOBAL, s.type_hash);
-	}
-
-	// Always reserve the per-thread TLS arena in the exe and publish it as a
-	// thread-local, so (a) every thread's static TLS block includes the arena (new
-	// thread-locals introduced by a reload live at offsets inside it), and (b) the
-	// loader learns the arena's exe TLS-block offset (a new thread-local's access is
-	// a GEP into this arena, so its SECREL resolves through this one accessor).
+	// Reserve the per-thread TLS arena and record it so a new thread-local (a GEP into
+	// it) resolves through this arena's accessor. Every thread's static TLS block then
+	// includes the arena, so new thread-locals introduced by a reload have per-thread
+	// storage.
 	if (build_context.hot_reload_tls_arena_size > 0) {
 		LLVMValueRef tls_arena = lb_hot_reload_tls_arena(m);
 		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0};
 		array_add(&gen->hot_reload_tls_syms, s);
 	}
 
-	// Thread-local variables (file-scope globals + local `@(static)`). A thread-local
-	// is accessed via `_tls_index` + a per-variable SECREL offset into the TLS block,
-	// so it cannot be resolved to a plain address. For each we emit a tiny accessor
-	// `__odin_hrtls_<i>() -> rawptr { return &var }` — a use of the thread_local global
+	// Thread-locals (file-scope globals, local `@(static)`, and the TLS arena). A
+	// thread-local is accessed via `_tls_index` + a per-variable SECREL offset into the
+	// TLS block, so it has no plain address. For each we emit a tiny accessor
+	// `__odin_hrtls$<link-name>() -> rawptr { return &var }`; a use of the thread_local
 	// inside a function lowers to the exe's TLS access sequence, so it returns the
-	// per-thread address. The loader calls it to compute the variable's offset in the
-	// exe's TLS block and rewrites the reload object's SECREL sites to that offset.
+	// per-thread address. The loader derives this name from a SECREL relocation's
+	// target variable, finds the accessor in the exe's PDB, and calls it to learn the
+	// variable's offset in the exe's TLS block — no baked mapping required, because the
+	// name is a pure function of the variable's (build-stable) link name.
 	{
 		LLVMTypeRef acc_ty = LLVMFunctionType(rawptr_llvm, nullptr, 0, false);
-		isize idx = 0;
 		for (lbHotReloadStaticSym const &s : gen->hot_reload_tls_syms) {
 			if (s.name.len == 0 || s.value == nullptr) {
 				continue;
 			}
-			char const *acc_name = gb_bprintf("__odin_hrtls_%td", cast(isize)idx++);
+			char const *acc_name = gb_bprintf("__odin_hrtls$%.*s", LIT(s.name));
 			LLVMValueRef acc = LLVMAddFunction(m->mod, acc_name, acc_ty);
-			LLVMSetLinkage(acc, LLVMInternalLinkage);
+			LLVMSetLinkage(acc, LLVMExternalLinkage); // public: found via the exe's PDB
 			LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(m->ctx, acc, "entry");
 			LLVMBuilderRef b = LLVMCreateBuilderInContext(m->ctx);
 			LLVMPositionBuilderAtEnd(b, bb);
 			LLVMValueRef addr = LLVMBuildPointerCast(b, s.value, rawptr_llvm, "");
 			LLVMBuildRet(b, addr);
 			LLVMDisposeBuilder(b);
-			lb_append_to_compiler_used(m, acc); // reached only via the baked table
-			add_entry(s.name, acc, false, HOT_RELOAD_KIND_TLS, s.type_hash);
+			lb_append_to_used(m, acc); // loader calls it by name; survive linker DCE
 		}
 	}
 
-	// Reserve a zero-init arena so a reload object can place *new* globals (ones
-	// that did not exist when this exe was built) into stable, in-image storage
-	// that survives every subsequent reload. New-global references compile to
-	// relocations against this symbol; the loader resolves it via this table.
+	// Reserve the new-global arena and force-keep it. A reload object references it as
+	// an external symbol (new globals compile to relocations against it), so it must
+	// exist in the exe and be resolvable by name in the exe's PDB for every subsequent
+	// reload — even a base build that has no new globals of its own.
 	if (build_context.hot_reload_arena_size > 0) {
 		LLVMValueRef arena = lb_hot_reload_arena(m);
-		add_entry(str_lit("__odin_hot_reload_global_arena"), arena, false, HOT_RELOAD_KIND_GLOBAL, 0);
+		lb_append_to_used(m, arena);
 	}
-
-	LLVMValueRef arr = LLVMConstArray(elem_llvm, entries.data, cast(unsigned)entries.count);
-	LLVMValueRef arr_global = LLVMAddGlobal(m->mod, LLVMArrayType(elem_llvm, cast(unsigned)entries.count), "__odin_hot_reload_symbols");
-	LLVMSetInitializer(arr_global, arr);
-	LLVMSetLinkage(arr_global, LLVMInternalLinkage);
-	LLVMSetGlobalConstant(arr_global, true);
-
-	LLVMValueRef data = LLVMConstPointerCast(arr_global, lb_type(m, alloc_type_pointer(elem_t)));
-	LLVMValueRef len = LLVMConstInt(lb_type(m, t_int), entries.count, true);
-	LLVMValueRef slice = llvm_const_slice_internal(m, data, len);
-	LLVMSetInitializer(table_var.value, slice);
-	LLVMSetGlobalConstant(table_var.value, true);
 }
 
 gb_internal bool lb_generate_code(lbGenerator *gen) {
@@ -3751,7 +3687,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	Array<HotReloadInitEntry> &hot_reload_inits = gen->hot_reload_inits;
 	if (build_context.hot_reload) {
 		hot_reload_inits = array_make<HotReloadInitEntry>(heap_allocator(), 0, 16);
-		gen->hot_reload_static_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
 		gen->hot_reload_tls_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
 		hot_reload_manifest_read(&hot_reload_manifest);
 	}
@@ -4013,10 +3948,22 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 				u32 align_in_bits = cast(u32)(8*type_align_of(e->type));
 
+				// Under -hot-reload the loader resolves a reloaded object's reference to a
+				// pre-existing global by looking its LINK name up in the exe's PDB. LLVM's
+				// CodeView emitter names a global's PDB symbol after the debug DISPLAY name
+				// (not the linkage name), and a global's display name is only its source
+				// identifier (`hits`, not `pkg::hits`) — so a reload's `pkg::hits`
+				// reference would miss and silently get a fresh copy (state not preserved).
+				// Functions already store their link name in the PDB, so they resolve. Make
+				// globals resolvable too by using the link name as the debug name here.
+				// (A hot-reload build is a dev build; the debugger then shows `pkg::hits`.)
+				String dbg_name = build_context.hot_reload ? name : global_name;
+				char const *link_name = build_context.hot_reload ? cast(char const *)name.text : "";
+				isize       link_len  = build_context.hot_reload ? name.len                  : 0;
 				LLVMMetadataRef global_variable_metadata = LLVMDIBuilderCreateGlobalVariableExpression(
 					m->debug_builder, llvm_scope,
-					cast(char const *)global_name.text, global_name.len,
-					"", 0, // linkage
+					cast(char const *)dbg_name.text, dbg_name.len,
+					link_name, link_len, // linkage name (PDB-resolvable under -hot-reload)
 					llvm_file, e->token.pos.line,
 					lb_debug_type(m, e->type),
 					local_to_unit,
@@ -4119,8 +4066,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	}
 
 	if (build_context.hot_reload) {
-		TIME_SECTION("LLVM Hot Reload Symbol Table");
-		lb_generate_hot_reload_symbol_table(gen, global_variables);
+		TIME_SECTION("LLVM Hot Reload Support Symbols");
+		lb_hot_reload_emit_support(gen);
 
 		// Emit the once-only init descriptor table for new globals (file-scope and
 		// local `@(static)`) with constant initializers. Layout: { i64 count;

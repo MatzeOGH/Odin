@@ -313,7 +313,8 @@ try_cross_linking:;
 				// patched independently). The pre-function pad the atomic patcher needs is
 				// emitted by the compiler itself (patchable-function-prefix, see
 				// llvm_backend_proc.cpp), so it is linker-independent and needs no
-				// /FUNCTIONPADMIN here.
+				// /FUNCTIONPADMIN here. (The /OPT:REF vs NOREF choice is made below via
+				// `opt_ref`, so it overrides the linker templates' hardcoded /opt:ref.)
 				link_settings = gb_string_append_fmt(link_settings, " /OPT:NOICF");
 			}
 
@@ -335,11 +336,21 @@ try_cross_linking:;
 				lld_lto_flags = gb_string_append_fmt(lld_lto_flags, "/opt:lldltojobs=%d ", build_context.thread_count);
 			}
 
+			// Under -hot-reload use /opt:noref so functions the base source never
+			// referenced — chiefly members of already-linked static libraries
+			// (e.g. vendor:raylib) — stay in the image, so a reload can call a
+			// foreign-library procedure the base never used and the loader can resolve it
+			// via the exe's PDB. (Odin procs/globals the base doesn't use are still dead-
+			// code-eliminated at the LLVM level, which the dropped baked table re-enabled;
+			// this only keeps linker-visible library members. Add /WHOLEARCHIVE:<lib> to
+			// also pull a member the base never touched at all.)
+			char const *opt_ref = build_context.hot_reload ? "/opt:noref" : "/opt:ref";
+
 			switch (build_context.linker_choice) {
 			case Linker_lld:
 				result = system_exec_command_line_app("msvc-lld-link",
 					"\"%.*s\\bin\\lld-link\" %s -OUT:\"%.*s\" %s "
-					"/nologo /incremental:no /opt:ref /subsystem:%.*s "
+					"/nologo /incremental:no %s /subsystem:%.*s "
 					"%.*s "
 					"%.*s "
 					"%s "
@@ -347,6 +358,7 @@ try_cross_linking:;
 					"",
 					LIT(build_context.ODIN_ROOT), object_files, LIT(output_filename),
 					link_settings,
+					opt_ref,
 					LIT(windows_subsystem_names[build_context.ODIN_WINDOWS_SUBSYSTEM]),
 					LIT(build_context.link_flags),
 					LIT(build_context.extra_linker_flags),
@@ -361,13 +373,14 @@ try_cross_linking:;
 			case Linker_radlink:
 				result = system_exec_command_line_app("msvc-rad-link",
 					"\"%.*s\\bin\\radlink\" %s -OUT:\"%.*s\" %s "
-					"/nologo /incremental:no /opt:ref /subsystem:%.*s "
+					"/nologo /incremental:no %s /subsystem:%.*s "
 					"%.*s "
 					"%.*s "
 					"%s "
 					"",
 					LIT(build_context.ODIN_ROOT), object_files, LIT(output_filename),
 					link_settings,
+					opt_ref,
 					LIT(windows_subsystem_names[build_context.ODIN_WINDOWS_SUBSYSTEM]),
 					LIT(build_context.link_flags),
 					LIT(build_context.extra_linker_flags),
@@ -417,7 +430,7 @@ try_cross_linking:;
 					linker_name = str_lit("lib.exe");
 					break;
 				default:
-					link_settings = gb_string_append_fmt(link_settings, " /incremental:no /opt:ref");
+					link_settings = gb_string_append_fmt(link_settings, " /incremental:no %s", opt_ref);
 					break;
 				}
 

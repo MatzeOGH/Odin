@@ -292,6 +292,21 @@ PIMAGEHLP_LINEW64 :: ^IMAGEHLP_LINE64
 SYMOPT_LOAD_LINES     :: 0x00000010
 SYMOPT_DEFERRED_LOADS :: 0x00000004
 
+// SYMBOL_INFO(W).Flags bits. A symbol whose address is NOT a plain virtual address
+// (TLS-relative, register-relative, frame-relative, in a register, or a literal value)
+// must not be treated as an address.
+SYMFLAG_VALUEPRESENT :: 0x00000001
+SYMFLAG_REGISTER     :: 0x00000008
+SYMFLAG_REGREL       :: 0x00000010
+SYMFLAG_FRAMEREL     :: 0x00000020
+SYMFLAG_TLSREL       :: 0x00004000
+SYMFLAG_FUNCTION     :: 0x00000800
+SYMFLAG_CONSTANT     :: 0x00000100
+
+// Callback invoked once per symbol by SymEnumSymbolsW. Return TRUE to continue the
+// enumeration, FALSE to stop. `pSymInfo.Name` holds `pSymInfo.NameLen` WCHARs.
+PSYM_ENUMERATESYMBOLS_CALLBACKW :: #type proc "system" (pSymInfo: PSYMBOL_INFOW, SymbolSize: ULONG, UserContext: PVOID) -> BOOL
+
 @(default_calling_convention = "system")
 foreign Dbghelp {
 	MiniDumpWriteDump :: proc(
@@ -318,4 +333,5 @@ foreign Dbghelp {
 	SymFromAddrW          :: proc(hProcess: HANDLE, Address: DWORD64, Displacement: PDWORD64, Symbol: PSYMBOL_INFOW) -> BOOL ---
 	SymFromNameW          :: proc(hProcess: HANDLE, Name: wstring, Symbol: PSYMBOL_INFOW) -> BOOL ---
 	SymGetLineFromAddrW64 :: proc(hProcess: HANDLE, dwAddr: DWORD64, pdwDisplacement: PDWORD, Line: PIMAGEHLP_LINEW64) -> BOOL ---
+	SymEnumSymbolsW       :: proc(hProcess: HANDLE, BaseOfDll: ULONG64, Mask: wstring, EnumSymbolsCallback: PSYM_ENUMERATESYMBOLS_CALLBACKW, UserContext: PVOID) -> BOOL ---
 }
