@@ -615,6 +615,9 @@ foreign kernel32 {
 	// is the image base the entries' RVAs are relative to.
 	RtlAddFunctionTable    :: proc(FunctionTable: PRUNTIME_FUNCTION, EntryCount: DWORD, BaseAddress: DWORD64) -> BOOLEAN ---
 	RtlDeleteFunctionTable :: proc(FunctionTable: PRUNTIME_FUNCTION) -> BOOLEAN ---
+	RtlLookupFunctionEntry :: proc(ControlPc: DWORD64, ImageBase: ^DWORD64, HistoryTable: rawptr) -> PRUNTIME_FUNCTION ---
+	RtlCaptureContext :: proc(ContextRecord: ^CONTEXT) ---
+	RtlVirtualUnwind :: proc(HandlerType: DWORD, ImageBase: DWORD64, ControlPc: DWORD64, FunctionEntry: PRUNTIME_FUNCTION, ContextRecord: ^CONTEXT, HandlerData: ^rawptr, EstablisherFrame: ^DWORD64, ContextPointers: rawptr) -> rawptr ---
 
 	GetSystemPowerStatus :: proc(lpSystemPowerStatus: ^SYSTEM_POWER_STATUS) -> BOOL ---
 

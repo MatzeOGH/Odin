@@ -933,11 +933,24 @@ apply_many :: proc(obj_paths: []string) -> bool {
 					// `target - o.block` plus any inline addend (e.g. an .pdata EndAddress that
 					// points at func+size). Assumes the target is in-block (always true for
 					// unwind data); an external target would wrap to a bogus RVA.
+					// .pdata/.xdata unwind data references THIS object's own .text/.xdata,
+					// almost always via a SECTION symbol (`.text` + inline addend). Resolve
+					// such a reference to the object-local section address, NOT the whole-set
+					// symbol decision: a section symbol name like `.text`/`.xdata` otherwise
+					// resolves against the EXE's identically-named section (PASS 1c), pushing
+					// the RVA >2GB out of block so the entry is refused — leaving new/patched
+					// hot procs with no usable unwind info (stack walks through them derail).
+					local_target := target
+					usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
+					tsn := int(usym.section_number)
+					if tsn > 0 && o.section_bases[tsn] != nil {
+						local_target = rawptr(uintptr(o.section_bases[tsn]) + uintptr(usym.value))
+					}
 					addend := i64((^i32)(site)^)
-					off := i64(uintptr(target)) - i64(uintptr(o.block))
+					off := i64(uintptr(local_target)) - i64(uintptr(o.block))
 					if off < 0 || off + addend < 0 || off + addend > i64(o.total) {
-						// External target: the RVA would wrap. Refuse rather than corrupt the
-						// unwind tables (does not arise for Odin unwind data today).
+						// Target genuinely outside this object's block: the RVA would wrap.
+						// Refuse rather than corrupt the unwind tables.
 						unresolved += 1
 						if is_text { unresolved_text += 1 }
 						fmt.eprintln("[hot] ADDR32NB target out of block (RVA would wrap)")
