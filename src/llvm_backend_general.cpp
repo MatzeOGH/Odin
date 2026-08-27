@@ -56,15 +56,13 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	Checker *c = m->checker;
 	m->info = &c->info;
 
-	// Per-module optimization level. Normally the global level. Under -hot-reload the split is
-	// fixed: builtin collections at -o:2, everything the user can edit at -o:none. See tech_design.md §8.
+	// NOTE(mh): do we fix optimization_level? Should this be taken from the cli? 
 	if (build_context.hot_reload) {
 		bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
 		m->optimization_level = is_builtin ? 2 : -1; // -1 == -o:none
 	} else {
 		m->optimization_level = build_context.optimization_level;
 	}
-
 
 	String name = build_context.build_paths[BuildPath_Output].name;
 	gbString module_name = gb_string_make(heap_allocator(), "");
@@ -3818,9 +3816,8 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 
 		if (is_external) {
 			String name = lb_get_entity_name(other_module, e);
-
-			// Hot-reload new globals are inline arena GEPs registered only in default_module;
-			// re-materialize the GEP for a cross-module reference. See tech_design.md §4.
+			
+			// add new globals
 			if (build_context.hot_reload) {
 				HotReloadManifest &hm = m->gen->hot_reload_manifest;
 				if (hm.exists) {

@@ -203,7 +203,7 @@ struct lbObjCGlobal {
 struct HotReloadNewEntry {
 	i64 offset;
 	u64 type_hash;
-	i64 init_flag_offset; // arena byte offset of the once-only init guard
+	i64 init_flag_offset;
 };
 
 struct HotReloadManifest {
@@ -246,7 +246,7 @@ struct lbGenerator : LinkerData {
 	CheckerInfo *info;
 
 	PtrMap<void *, lbModule *> modules; // key is `AstPackage *` (`void *` is used for future use)
-	PtrMap<LLVMContextRef, lbModule *> modules_through_ctx;
+	PtrMap<LLVMContextRef, lbModule *> modules_through_ctx; 
 	lbModule default_module;
 
 	lbModule *equal_module;
@@ -263,18 +263,15 @@ struct lbGenerator : LinkerData {
 	MPSCQueue<lbObjCGlobal> objc_ivars;
 	MPSCQueue<String> raddebug_section_strings;
 
-	// Hot reload shared state. The global loop and lb_build_static_variables (thread pool)
-	// both mutate these, so access outside the single-threaded loop takes hot_reload_mutex.
-	HotReloadManifest           hot_reload_manifest;
-	Array<HotReloadInitEntry>   hot_reload_inits;
-	Array<lbHotReloadStaticSym> hot_reload_tls_syms;     // thread-locals to preserve (§5)
-	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms; // @(rodata)/#load globals to repoint (§10)
-	BlockingMutex               hot_reload_mutex;
+	HotReloadManifest  hot_reload_manifest;
+	Array<HotReloadInitEntry> hot_reload_inits;
+	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
+	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms;
+	BlockingMutex hot_reload_mutex;
 };
 
 gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
-// Defined in llvm_backend.cpp; forward-declared for llvm_backend_stmt.cpp (unity build order).
 gb_internal bool lb_is_load_directive_expr(Ast *expr);
 gb_internal String lb_call_basic_directive_name(Ast *expr);
 
@@ -439,7 +436,6 @@ struct lbProcedure {
 
 	Type *internal_gen_type; // map_set, map_get, etc.
 
-	// Per-proc occurrence count of each local @(static) name, for a stable symbol name (§4).
 	StringMap<u32> hot_reload_static_counts;
 };
 

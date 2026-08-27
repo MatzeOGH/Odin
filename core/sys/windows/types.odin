@@ -3349,10 +3349,6 @@ CONTEXT :: struct {
 PCONTEXT  :: ^CONTEXT
 LPCONTEXT :: ^CONTEXT
 
-// Native x64 `CONTEXT.ContextFlags` selectors. These must be set before a
-// `GetThreadContext`/`SetThreadContext` call to say which register groups are
-// valid. (The `WOW64_CONTEXT_*` values in wow64_apiset.odin are for 32-bit
-// contexts and are NOT interchangeable with these.)
 CONTEXT_AMD64            :: DWORD(0x00100000)
 CONTEXT_CONTROL          :: CONTEXT_AMD64 | 0x1 // SegSs, Rsp, SegCs, Rip, EFlags
 CONTEXT_INTEGER          :: CONTEXT_AMD64 | 0x2 // Rax..R15
