@@ -3822,6 +3822,33 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 		if (is_external) {
 			String name = lb_get_entity_name(other_module, e);
 
+			// Hot-reload new globals/thread-locals live in the exe's reserved arena, not as
+			// named symbols (they are inline arena GEPs registered only in default_module).
+			// A cross-module reference must re-materialize that GEP in THIS module rather than
+			// declare an undefined external by link name (which the loader can't resolve ->
+			// "unresolved symbol: <name>"). The arena base is a real external the loader
+			// resolves via the exe's PDB, so the GEP is valid in any module. Offsets are
+			// already pinned in the manifest (populated by the global loop before proc codegen).
+			if (build_context.hot_reload) {
+				HotReloadManifest &hm = m->gen->hot_reload_manifest;
+				if (hm.exists) {
+					if (HotReloadNewEntry *ne = string_map_get(&hm.newg, name)) {
+						lbValue g = {};
+						g.type  = alloc_type_pointer(e->type);
+						g.value = lb_hot_reload_arena_ptr(m, ne->offset, g.type);
+						lb_add_entity(m, e, g);
+						return g;
+					}
+					if (HotReloadNewEntry *ne = string_map_get(&hm.tls_newg, name)) {
+						lbValue g = {};
+						g.type  = alloc_type_pointer(e->type);
+						g.value = lb_hot_reload_tls_arena_ptr(m, ne->offset, g.type);
+						lb_add_entity(m, e, g);
+						return g;
+					}
+				}
+			}
+
 			lbValue g = {};
 			g.value = LLVMAddGlobal(m->mod, lb_type(m, e->type), alloc_cstring(permanent_allocator(), name));
 			g.type = alloc_type_pointer(e->type);
