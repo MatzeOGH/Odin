@@ -238,6 +238,18 @@ struct lbHotReloadStaticSym {
 	u64          type_hash;
 };
 
+// An immutable-data global — `@(rodata)` or one whose initializer is a `#load(...)`
+// directive — that the loader must "repoint" on each reload: it overwrites the exe's
+// copy with this reload object's fresh copy so edits to the data appear. `size` is
+// `type_size_of` the variable: for a slice/string/`#load` global that is the 16-byte
+// header (repointed at the object's fresh blob, so a size change is free); for a
+// value-type `@(rodata)` it is the full byte size (overwritten in place). Collected
+// during codegen, emitted as the self-contained table `__odin_hot_reload_refresh_syms`.
+struct lbHotReloadRefreshSym {
+	String name;
+	i64    size;
+};
+
 struct lbGenerator : LinkerData {
 	CheckerInfo *info;
 
@@ -270,11 +282,20 @@ struct lbGenerator : LinkerData {
 	// accessor thunk (`__odin_hrtls$<name>`) is emitted for each so the loader can
 	// resolve SECREL references to the exe's TLS block (found in the exe's PDB).
 	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
+	// Immutable-data globals (@(rodata) / `#load`) the loader repoints from the exe's
+	// stale copy to this reload's fresh copy. Contributed by both the file-scope loop
+	// and `lb_build_static_variables`, so guarded by `hot_reload_mutex` outside the
+	// single-threaded loop.
+	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms;
 	BlockingMutex               hot_reload_mutex;
 };
 
 gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+// Defined in llvm_backend.cpp; forward-declared so lb_build_static_variables
+// (llvm_backend_stmt.cpp, earlier in the unity build) can detect `#load` initializers.
+gb_internal bool lb_is_load_directive_expr(Ast *expr);
+gb_internal String lb_call_basic_directive_name(Ast *expr);
 
 
 struct lbBlock {

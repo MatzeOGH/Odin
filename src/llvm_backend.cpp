@@ -3311,6 +3311,83 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 // the kept text, so the hash differs — while debug-only differences (which do not change
 // machine code) and metadata-ID renumbering from unrelated edits hash equal, so an
 // unchanged procedure keeps the same hash across builds.
+// Append a little-endian u64 to a byte buffer (for the self-contained loader tables).
+gb_internal void lb_hot_reload_put_u64_le(Array<u8> *buf, u64 v) {
+	for (int b = 0; b < 8; b++) {
+		array_add(buf, cast(u8)((v >> (8*b)) & 0xff));
+	}
+}
+
+// If `expr` is directly a `#name(...)` basic-directive call, return `name`; else "".
+gb_internal String lb_call_basic_directive_name(Ast *expr) {
+	if (expr == nullptr) {
+		return str_lit("");
+	}
+	Ast *init = unparen_expr(expr);
+	if (init != nullptr && init->kind == Ast_CallExpr &&
+	    init->CallExpr.proc != nullptr && init->CallExpr.proc->kind == Ast_BasicDirective) {
+		return init->CallExpr.proc->BasicDirective.name.string;
+	}
+	return str_lit("");
+}
+
+// Whether `expr` is a compile-time embedded-data directive call whose result is baked into
+// the binary and should be re-provided fresh on reload: `#load`/`#load_directory` (file bytes)
+// and `#hash`/`#load_hash` (a constant integer hash of a string literal / file contents). All
+// but `#load_directory` already produce a constant the global loop bakes directly; a
+// `#load_directory` global is baked via lb_const_load_directory_slice (see the global loop).
+gb_internal bool lb_is_load_directive_expr(Ast *expr) {
+	String n = lb_call_basic_directive_name(expr);
+	return n == "load" || n == "load_directory" || n == "hash" || n == "load_hash";
+}
+
+// Build the constant `[]Load_Directory_File` slice value for a `#load_directory(call)` at
+// MODULE scope (the codegen path in lb_build_builtin_proc is procedure-scoped). Used to bake
+// a #load_directory global's initializer under -hot-reload so its static storage holds a real
+// slice header the loader can repoint (a runtime-initialized global's storage would be zero).
+gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
+	TEMPORARY_ALLOCATOR_GUARD();
+	LoadDirectoryCache *cache = map_must_get(&m->info->load_directory_map, call);
+	isize count = cache->files.count;
+
+	LLVMValueRef *elements = gb_alloc_array(temporary_allocator(), LLVMValueRef, count);
+	for_array(i, cache->files) {
+		LoadFileCache *file = cache->files[i];
+		String file_name = filename_without_directory(file->path);
+		LLVMValueRef values[2] = {};
+		values[0] = lb_const_string(m, file_name).value;
+		values[1] = lb_const_value(m, t_u8_slice, exact_value_string(file->data)).value;
+		elements[i] = llvm_const_named_struct(m, t_load_directory_file, values, gb_count_of(values));
+	}
+	LLVMValueRef backing_array = llvm_const_array(m, lb_type(m, t_load_directory_file), elements, count);
+
+	Type *array_type = alloc_type_array(t_load_directory_file, count);
+	char const *bn = gb_bprintf("ldir$%s$%x", m->module_name, m->global_array_index.fetch_add(1));
+	lbAddr backing = lb_add_global_generated_with_name(m, array_type, {backing_array, array_type}, make_string_c(bn));
+	lb_make_global_private_const(backing);
+
+	LLVMValueRef backing_ptr = LLVMConstPointerCast(backing.addr.value, lb_type(m, t_load_directory_file_ptr));
+	LLVMValueRef const_slice = llvm_const_slice_internal(m, backing_ptr, LLVMConstInt(lb_type(m, t_int), count, false));
+
+	lbValue res = {};
+	res.value = const_slice;
+	res.type  = t_load_directory_file_slice;
+	return res;
+}
+
+// Whether a file-scope global (or local `@(static)`) holds immutable embedded data
+// that the hot-reload loader must re-provide fresh on each reload rather than preserve:
+//   * an `@(rodata)` variable, or
+//   * a variable whose initializer is directly a `#load(...)` / `#load_directory(...)` directive.
+// The bytes are read-only in either case (writing through them faults), so there is no
+// runtime state to protect; the loader repoints the exe's copy at the reload's data.
+gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
+	if (e != nullptr && e->kind == Entity_Variable && e->Variable.is_rodata) {
+		return true;
+	}
+	return decl != nullptr && lb_is_load_directive_expr(decl->init_expr);
+}
+
 gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
@@ -3812,6 +3889,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	if (build_context.hot_reload) {
 		hot_reload_inits = array_make<HotReloadInitEntry>(heap_allocator(), 0, 16);
 		gen->hot_reload_tls_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
+		gen->hot_reload_refresh_syms = array_make<lbHotReloadRefreshSym>(heap_allocator(), 0, 16);
 		hot_reload_manifest_read(&hot_reload_manifest);
 	}
 
@@ -3852,14 +3930,30 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		var.decl = decl;
 
 		if (build_context.hot_reload && !is_foreign) {
+			bool is_refresh = lb_is_hot_reload_refresh_global(e, decl);
+			if (is_refresh) {
+				// Immutable embedded data (@(rodata) / `#load`): keep it a NORMAL global
+				// (never arena-backed) and record {link name, size} so the loader repoints
+				// the exe's copy at this reload's fresh data ("repoint old -> new"). An
+				// ORIGINAL one flows through the orig type-guard below and its references
+				// alias to the exe's single canonical copy (which the loader overwrites); a
+				// NEW one falls through to object-local emission (resolved fresh each reload).
+				lbHotReloadRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
+				array_add(&gen->hot_reload_refresh_syms, rs);
+			}
 			if (hot_reload_manifest.exists) {
 				u64 th = type_hash_canonical_type(e->type);
 				u64 *orig_th = string_map_get(&hot_reload_manifest.orig, name);
 				if (orig_th != nullptr) {
-					// Original global: emit normally below; the loader preserves it.
+					// Original global: emit normally below; the loader preserves it (or, for
+					// an immutable-data global, repoints it — see is_refresh above).
 					if (*orig_th != th) {
 						error(e->token, "hot-reload: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
 					}
+				} else if (is_refresh) {
+					// Brand-new immutable-data global: emit normally below (an object-local
+					// fresh copy each reload) rather than routing into the persist-arena, so
+					// its data is re-provided every reload and stays genuinely read-only.
 				} else if (e->Variable.thread_local_model.len != 0) {
 					// Brand-new thread-local introduced by this reload: place it in the
 					// per-thread TLS arena (reserved in the exe) at a manifest-pinned
@@ -3987,7 +4081,18 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 		if (decl->init_expr != nullptr) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
-			if (!is_type_any(e->type)) {
+			if (build_context.hot_reload && lb_call_basic_directive_name(decl->init_expr) == "load_directory") {
+				// #load_directory yields a runtime VALUE, so a package-scope global would
+				// normally be built by the startup runtime — leaving the reload object's
+				// static storage zero, which the refresh repoint cannot use. Under
+				// -hot-reload, bake the const slice as the initializer (like #load) so the
+				// object carries a real header the loader repoints at the fresh backing data.
+				lbValue init = lb_const_load_directory_slice(m, unparen_expr(decl->init_expr));
+				LLVMDeleteGlobal(g.value);
+				g.value = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), alloc_cstring(permanent_allocator(), name));
+				LLVMSetInitializer(g.value, init.value);
+				var.is_initialized = true;
+			} else if (!is_type_any(e->type)) {
 				if (tav.mode != Addressing_Invalid) {
 					if (tav.value.kind != ExactValue_Invalid) {
 						auto cc = LB_CONST_CONTEXT_DEFAULT;
@@ -4234,11 +4339,39 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, tbl); // the loader reads it by name; keep it from being stripped
 		}
 
+		// Emit the immutable-data ("refresh") symbol table for the loader: for each
+		// @(rodata)/#load global, its {size, link name}. The loader looks each name up in
+		// both the exe (PDB) and this reload object, then overwrites the exe's copy with
+		// the object's fresh copy so edits to the data appear after a reload. Encoded as a
+		// SELF-CONTAINED byte blob (no pointer relocations) so it can be read straight from
+		// the mapped section: [ i64 count ] then per entry [ i64 size ][ i64 name_len ][ name bytes ].
+		if (gen->hot_reload_refresh_syms.count > 0) {
+			lbModule *m = &gen->default_module;
+			auto buf = array_make<u8>(heap_allocator(), 0, 256);
+			lb_hot_reload_put_u64_le(&buf, cast(u64)gen->hot_reload_refresh_syms.count);
+			for (lbHotReloadRefreshSym const &rs : gen->hot_reload_refresh_syms) {
+				lb_hot_reload_put_u64_le(&buf, cast(u64)rs.size);
+				lb_hot_reload_put_u64_le(&buf, cast(u64)rs.name.len);
+				for (isize i = 0; i < rs.name.len; i++) {
+					array_add(&buf, rs.name.text[i]);
+				}
+			}
+			LLVMValueRef blob = LLVMConstStringInContext(m->ctx, cast(char const *)buf.data, cast(unsigned)buf.count, true);
+			LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_hot_reload_refresh_syms");
+			LLVMSetInitializer(tbl, blob);
+			LLVMSetGlobalConstant(tbl, true);
+			LLVMSetLinkage(tbl, LLVMInternalLinkage);
+			LLVMSetAlignment(tbl, 8);
+			lb_append_to_compiler_used(m, tbl); // the loader reads it by name; keep it from being stripped
+			array_free(&buf);
+		}
+
 		// Persist the manifest: the base build records every original global (and local
 		// static); a reload build additionally records the arena offsets it assigned to
 		// new ones so the next reload reuses them (preserving state).
 		hot_reload_manifest_write(&hot_reload_manifest);
 		array_free(&hot_reload_inits);
+		array_free(&gen->hot_reload_refresh_syms);
 	}
 
 	if (build_context.ODIN_DEBUG) {
