@@ -188,6 +188,12 @@ exit 0 = PASS).
 - `demo_raylib.ps1` — builds the exe with `vendor:raylib` statically linked, then
   reloads code that calls a raylib procedure the base source never referenced
   (`rl.GetRandomValue`), resolved via the exe's PDB.
+- `mt_test/` — automated regression test for thread-safe patching (see above).
+- `rodata_test/` — automated regression test for `@(rodata)` / `#load` / `#load_directory`
+  / `#hash` / `#load_hash` refresh (`run_rodata_test.ps1`: a data-only reload changes a
+  `@(rodata)` value, a size-changed `#load` asset, a `#load_directory` file, a `#hash`
+  literal, and the `#load_hash` file; all are observed while an ordinary mutable global
+  keeps its runtime value; exit 0 = PASS).
 - The loader itself now ships as **`core:sys/hot_reload`** (no longer copied here).
 
 ## Reacting to struct layout changes (pre/post-patch hooks)
@@ -257,6 +263,15 @@ out of migrated state), and the diff still compares bit-sets by size alone.
   (`src/checker.cpp`, `generate_minimum_dependency_set`) and typeid-based
   `type_info` resolution (`src/llvm_backend_type.cpp`, `lb_type_info` →
   `__type_info_of`).
+- `@(rodata)` / `#load` / `#load_directory` / `#hash` / `#load_hash` refresh — immutable
+  embedded data is re-provided fresh each reload by repointing the exe's canonical copy at
+  the reload object's fresh copy (`__odin_hot_reload_refresh_syms` table + the loader's
+  repoint pass; `#load_directory` globals are baked const under `-hot-reload` via
+  `lb_const_load_directory_slice` so their header can be repointed; `#hash`/`#load_hash`
+  constant-integer globals are overwritten in place, and their `::` constant form already
+  refreshes via normal recompile), plus per-section W^X tightening of the mapped block —
+  `src/llvm_backend.cpp`, `src/llvm_backend_stmt.cpp`, `src/llvm_backend.hpp`,
+  `core/sys/hot_reload/hot_reload.odin`.
 - `core:sys/hot_reload` — the COFF loader/relocator/patcher + `apply`.
 - `@(pre_patch_hook)` / `@(post_patch_hook)` attributes + emitted hook-name tables
   (`__odin_hot_reload_{pre,post}_patch_hooks`, storing each hook's exported symbol name):

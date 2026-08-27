@@ -173,14 +173,42 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         reload object — essentially link-at-load). A function whose member was never pulled
         into the base build is likewise absent. Removing a package is already free (nothing
         references its symbols). The loader now prints a clear per-symbol hint for these.
-- [ ] **handle @(rodata)** — the user might add and mutate @(rodata) at when compiling for
-	 			hot reload. The hot reload system needs to catch this and provide the new data after a 
-				reload.
-- [ ] **handle #load** — the user might update and add data that is loaded and embedded into
-				the binary. The hot reload system needs to catch this and prvide the new data after a 
-				reload.
-			
-  			
+- [x] **handle `@(rodata)`, `#load`, `#load_directory`, `#hash`, `#load_hash`.** Immutable embedded data — `@(rodata)` globals and
+      globals whose initializer is directly `#load(...)` — is now re-provided fresh on every
+      reload instead of preserved as stale state. Both may be *added* or *edited* across a reload
+      (including a `#load` file whose size changes). Design ("handle it like other globals; repoint
+      old → new"): the compiler keeps such a global a normal (never arena-backed) global and lists
+      its `{link name, size}` in a self-contained `__odin_hot_reload_refresh_syms` table; the loader
+      **overwrites the exe's canonical copy** with the reload object's fresh copy under the same
+      stop-the-world as proc patching. For a slice/string/`#load` global that copy is the 16-byte
+      header, so the exe header comes to point at the object's fresh blob (a size change is free);
+      a value-type `@(rodata)` is overwritten in place. Because the exe's one copy is updated, **all
+      code sees the new data** — no dependence on the referencing procedure being re-patched, so a
+      pure data-only reload (no code change) works. A **new** `@(rodata)`/`#load` global is emitted
+      object-local (not routed into the persist-arena) and resolves fresh each reload. Read-only
+      protection is preserved: after relocations the loader tightens the mapped block from RWX to
+      per-section W^X, so a stray write through refreshed data faults as in a normal build.
+      Compiler: `src/llvm_backend.cpp` (`lb_is_hot_reload_refresh_global` /
+      `lb_is_load_directive_expr`, the fork exemption, the `__odin_hot_reload_refresh_syms` table),
+      `src/llvm_backend_stmt.cpp` (same for local `@(static)`), `src/llvm_backend.hpp`
+      (`lbHotReloadRefreshSym`). Loader: `core/sys/hot_reload/hot_reload.odin` (refresh-target
+      resolution, the repoint pass under suspension, the W^X tightening pass). `#load_directory` is
+      also handled: it yields a runtime *value*, so a package-scope `x := #load_directory(...)` global
+      would normally be built by the startup runtime (static storage left zero, unusable by the
+      repoint); under `-hot-reload` the compiler instead bakes its constant `[]Load_Directory_File`
+      slice as the global's initializer (`lb_const_load_directory_slice`), so the exe's 16-byte slice
+      header is repointed at the reload object's fresh backing data exactly like `#load` (file-scope
+      globals only; a local `@(static) := #load_directory(...)` is not baked and stays preserved).
+      `#hash` (hash of a string literal) and `#load_hash` (hash of a file's contents) are covered
+      too: both return a compile-time constant integer, so the documented `H :: #hash(...)` /
+      `H :: #load_hash(...)` *constant* form is inlined as an immediate and refreshes automatically
+      when its input changes (the referencing proc's content hash changes → it is repatched — no
+      special handling); the rarer mutable-global form `x := #hash(...)` / `x := #load_hash(...)` is
+      added to the refresh set and overwritten in place like any scalar `@(rodata)`.
+      Verified end-to-end by `examples/hot_reload/rodata_test` (`run_rodata_test.ps1`, exit 0 = PASS):
+      a data-only reload changes a `@(rodata)` value, a size-changed `#load` asset, a
+      `#load_directory` file, a `#hash` string literal, and the `#load_hash` file, and all five are
+      observed, while an ordinary mutable global keeps its runtime value.
 
 ### Tier 2 — correctness / capability
 
@@ -415,9 +443,20 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   *non-hot* proc which was recompiled is now stale; a stored pointer to a *hot* proc's entry
   keeps working (the entry is patched to jump). Keep dispatch tables pointing at `@(hot_reload)`
   procs, or rebuild them after a reload.
-- **Editing an existing global's initializer has no effect.** Existing globals are preserved
-  (old value kept); only *new* globals get their compile-time constant initializer applied,
-  once. This is by design (state preservation) but is a sharp edge.
+- **Editing an existing *mutable* global's initializer has no effect.** Ordinary globals are
+  preserved (old value kept); only *new* globals get their compile-time constant initializer
+  applied, once. This is by design (state preservation) but is a sharp edge. **Exception:**
+  `@(rodata)` globals and `#load`-initialized globals are *immutable data*, not state — their
+  edited value/bytes ARE re-provided on every reload (see the `@(rodata)`/`#load` item under
+  Tier 1). To get an editable embedded value refreshed on reload, make it `@(rodata)` or `#load`.
+- **`@(rodata)`/`#load` refresh caveats.** (a) The refresh repoints/overwrites the exe's *canonical*
+  copy, so a pointer to that data saved into other mutable state before the reload becomes stale
+  (it points at the pre-reload bytes; for `#load` that is the previous mapped block — leaked, so
+  still valid, but old). (b) A **value-type** `@(rodata)` is overwritten in place, so its type/size
+  must not change across a reload (the existing type-hash guard rejects a change); variable-size
+  data should be a slice/string/`#load`, whose header is repointed instead. (c) Writing through
+  such data is a user bug and faults (its pages are re-protected read-only by the W^X pass), the
+  same as in a normal build.
 - **Globals show under their mangled link name in the debugger (`-hot-reload` builds only).**
   To make a pre-existing global resolvable in the PDB (so a reload binds to the exe's copy and
   preserves state), the compiler sets a file-scope global's debug DISPLAY name to its link name

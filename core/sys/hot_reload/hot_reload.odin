@@ -89,6 +89,7 @@ Coff_Reloc :: struct #packed {
 
 IMAGE_FILE_MACHINE_AMD64 :: 0x8664
 IMAGE_SCN_MEM_EXECUTE    :: 0x20000000 // section characteristic: executable (code)
+IMAGE_SCN_MEM_WRITE      :: 0x80000000 // section characteristic: writable (.data/.bss)
 
 // x64 relocation kinds we handle.
 IMAGE_REL_AMD64_ADDR64   :: 0x01
@@ -815,17 +816,49 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	defer delete(changed) // outlives the pre hook; freed after the post hook
 	hr_call_patch_hooks(pre_tbl, changed, hr_resolve_pre_hook, nil)
 
+	// 3.7) Immutable-data ("refresh") globals — @(rodata) / #load. The compiler lists each
+	//      one's {size, link name} in a self-contained blob (no relocations). For every one
+	//      that also exists in the exe, repoint the exe's copy at THIS reload's fresh copy:
+	//      overwrite `size` bytes exe<-object. For a slice/string/#load global that size is
+	//      the 16-byte header, so the exe header comes to point at the object's fresh blob
+	//      (which persists in this mapped block) — a data size change is therefore free; a
+	//      value-type @(rodata) is overwritten in place. Because the exe's single canonical
+	//      copy is updated, ALL code (patched or not) sees the new data. A symbol absent from
+	//      the exe is a NEW @(rodata)/#load global — skipped here, since object code already
+	//      references its object-local fresh copy. The writes happen under the stop-the-world
+	//      below so a reader never sees a torn value.
+	Refresh_Target :: struct {
+		exe, obj: rawptr,
+		size:     int,
+	}
+	refresh_targets := make([dynamic]Refresh_Target, context.temp_allocator)
+	if tbl, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_refresh_syms"); ok {
+		p := uintptr(tbl)
+		count := (^i64)(p)^
+		p += 8
+		for _ in 0 ..< int(count) {
+			size := int((^i64)(p)^); p += 8
+			nlen := int((^i64)(p)^); p += 8
+			name := string(([^]u8)(rawptr(p))[:nlen]); p += uintptr(nlen)
+			exe := hr_resolve_pdb(name)
+			obj, found := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, name)
+			if exe != nil && found && size > 0 {
+				append(&refresh_targets, Refresh_Target{exe, obj, size})
+			}
+		}
+	}
+
 	// 4) Patch each discovered hot procedure's running entry to jump to its fresh code.
 	//    `hot_names` were collected in step 2 (an exe symbol whose entry is the
 	//    patchable hot-patch prologue). Resolve every original (exe, via the PDB) and
 	//    fresh (object) address first, then patch the whole batch with all other
 	//    threads suspended and only once no thread is parked in a region we overwrite —
 	//    so a concurrent thread never executes a half-written instruction.
-	if len(hot_names) == 0 {
+	if len(hot_names) == 0 && len(refresh_targets) == 0 {
 		if have_obj_hashes {
 			// Change detection: no procedure's code changed since the currently-live
-			// version — a valid no-op reload (e.g. only comments/data changed, or a new
-			// proc nothing calls yet). Refresh the baseline and succeed.
+			// version and no immutable data to repoint — a valid no-op reload (e.g. only
+			// comments changed, or a new proc nothing calls yet). Refresh the baseline.
 			for k, v in obj_hashes {
 				_hr_cur[k] = v
 			}
@@ -853,9 +886,8 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 		append(&targets, Target{name, original, fresh})
 	}
-	if len(targets) == 0 {
-		return false
-	}
+	// (A reload with only immutable-data changes has no proc targets but non-empty
+	// refresh_targets; the empty-both case already returned above.)
 
 	// Guard the whole region each patch may touch: the atomic path writes the 16-byte
 	// pad BELOW the entry and flips the 2-byte entry; the fallback overwrites PATCH_LEN
@@ -885,6 +917,23 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		win.Sleep(1)
 	}
 
+	// Repoint immutable-data globals now that the world is stopped (no torn reads). Each
+	// copy is `size` bytes exe<-object: a slice/string/#load header (16 bytes) starts
+	// pointing at the object's fresh blob; a value-type @(rodata) is overwritten in place.
+	for r in refresh_targets {
+		old: win.DWORD
+		if win.VirtualProtect(r.exe, win.SIZE_T(r.size), win.PAGE_READWRITE, &old) {
+			intrinsics.mem_copy(r.exe, r.obj, r.size)
+			restored: win.DWORD
+			win.VirtualProtect(r.exe, win.SIZE_T(r.size), old, &restored)
+		} else {
+			fmt.eprintfln("[hot] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
+		}
+	}
+	if len(refresh_targets) > 0 {
+		fmt.printfln("[hot] refreshed %d @(rodata)/#load global(s)", len(refresh_targets))
+	}
+
 	patched := 0
 	for t in targets {
 		ok, atomic := patch_jump(t.original, t.fresh)
@@ -894,6 +943,34 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 	}
 	hr_resume(handles)
+	// 5) Tighten the block from RWX to per-section protections now that all relocations,
+	//    refresh copies, and patches are done: executable code -> execute+read; read-only
+	//    data (@(rodata)/#load payloads, unwind tables) -> read-only so a stray write faults
+	//    as in a normal build; real data (.data/.bss) -> read+write. Sections are page-aligned
+	//    in the block (each owns whole pages), so protect them independently. One-shot per
+	//    reload (each reload maps a fresh block).
+	for i in 0 ..< n_sections {
+		if offsets[i + 1] < 0 {
+			continue
+		}
+		sh := section_header(data, sec_off, i)
+		base := section_bases[i + 1]
+		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
+		if size <= 0 || base == nil {
+			continue
+		}
+		psize := win.SIZE_T(((size + PAGE - 1) / PAGE) * PAGE)
+		ch := u32(sh.characteristics)
+		prot: win.DWORD = win.PAGE_READONLY
+		if (ch & IMAGE_SCN_MEM_EXECUTE) != 0 {
+			prot = win.PAGE_EXECUTE_READ
+		} else if (ch & IMAGE_SCN_MEM_WRITE) != 0 {
+			prot = win.PAGE_READWRITE
+		}
+		old: win.DWORD
+		win.VirtualProtect(base, psize, prot, &old)
+	}
+
 	if patched != len(targets) {
 		return false
 	}
@@ -905,7 +982,7 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		_hr_cur[k] = v
 	}
 
-	// 5) Fire the autowired post-patch hooks — NEW code: each is resolved to its
+	// 6) Fire the autowired post-patch hooks — NEW code: each is resolved to its
 	//    OBJECT-LOCAL (fresh) copy by name, so an ordinary exported proc works (no hot
 	//    prefix needed). A hook here allocates the new layout and deserializes what a
 	//    pre-patch hook saved. Reflecting the new layout requires `change.new` (not

@@ -2486,8 +2486,22 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			u64 th = type_hash_canonical_type(e->type);
 			HotReloadManifest &hm = gen->hot_reload_manifest;
 
+			// Immutable embedded data (@(rodata) / `#load` / `#hash` / `#load_hash`):
+			// re-provided fresh each reload rather than preserved. Kept a normal global
+			// (never arena-backed) and recorded so the loader repoints the exe's copy at the
+			// reload's data (see file-scope fork). (`#load_directory` is excluded here: unlike
+			// the file-scope loop it is not baked to a const initializer for a local
+			// @(static), so its storage would be zero.)
+			String init_dir = vd->values.count > 0 ? lb_call_basic_directive_name(vd->values[i]) : str_lit("");
+			bool is_refresh = e->Variable.is_rodata ||
+			                  init_dir == "load" || init_dir == "hash" || init_dir == "load_hash";
+
 			bool is_new = false;
 			mutex_lock(&gen->hot_reload_mutex);
+			if (is_refresh) {
+				lbHotReloadRefreshSym rs = { mangled_name, gb_max(type_size_of(e->type), 1) };
+				array_add(&gen->hot_reload_refresh_syms, rs);
+			}
 			if (hm.exists) {
 				u64 *orig_th = string_map_get(&hm.orig, mangled_name);
 				if (orig_th != nullptr) {
@@ -2538,10 +2552,12 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				mutex_unlock(&gen->hot_reload_mutex);
 				// Original thread-local static: fall through to normal emission; it is
 				// collected into hot_reload_tls_syms after the global is created below.
-			} else if (is_new) {
+			} else if (is_new && !is_refresh) {
 				// Brand-new static introduced by this reload -> arena, so its state
 				// survives every subsequent reload (a reload object is remapped, so
-				// an object-local copy would reset each time).
+				// an object-local copy would reset each time). Immutable-data statics are
+				// excluded (is_refresh): they fall through to normal object-local emission
+				// and are re-provided fresh each reload instead of persisted.
 				if (is_type_any(e->type)) {
 					error(e->token, "hot-reload: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
 				}
@@ -2591,9 +2607,11 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				continue;
 			} else {
 				mutex_unlock(&gen->hot_reload_mutex);
-				// Original non-thread-local static: fall through to normal emission
-				// under the stable name; the loader resolves the reload object's copy
-				// to the exe's.
+				// Fall through to normal emission under the stable name. An ORIGINAL
+				// non-thread-local static resolves to the exe's copy (preserved, or
+				// repointed by the loader if it is immutable data); a NEW immutable-data
+				// static (is_new && is_refresh) lands here too and is emitted object-local,
+				// resolved fresh each reload.
 			}
 		}
 
