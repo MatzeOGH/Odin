@@ -10,7 +10,7 @@ package hot_reload_migrate_enum
 // ADAPTED FOR EXE-BASED HOT RELOAD: in a DLL reload each module carries its own type
 // table, so `type_info_of(T)` in reloaded code already describes the NEW layout. In
 // THIS exe-based reload, hot-code `type_info_of` still resolves to the exe's OLD table
-// (see core/sys/hot_reload). So `deserialize` takes the destination's NEW `^Type_Info`
+// (see core/hot_reload). So `deserialize` takes the destination's NEW `^Type_Info`
 // explicitly (from `hot_reload.Type_Change.new`) and walks the destination struct via
 // that type-info's own field arrays instead of re-`type_info_of`-ing by typeid — which
 // would drop back to the old layout. `serialize` needs no change: it runs in pre-patch

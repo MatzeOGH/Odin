@@ -54,7 +54,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         `lb_make_global_private_const` (`src/llvm_backend_general.cpp`) so any private const added
         later is covered automatically, plus the two synthetic sites that bypass that helper
         (`src/llvm_backend_const.cpp`, `src/llvm_backend_proc.cpp`). The loader
-        (`core/sys/hot_reload/hot_reload.odin`, `hr_is_object_local_const`) classifies **by section**:
+        (`core/hot_reload/hot_reload.odin`, `hr_is_object_local_const`) classifies **by section**:
         a `.odinti` symbol resolves object-local; everything else (procs, globals, statics,
         `@(rodata)`/`#load`) keeps the exe/hot/object policy so state is preserved — heuristic-free
         and correct in **both** module modes. Verified: string demo prints correctly; the migrate
@@ -107,7 +107,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         (resolved from the exe's PDB); an unchanged user package (all proc content-hashes match
         the manifest baseline — `lb_hot_reload_emit_func_hashes` sets `lbModule.hot_reload_changed`)
         is skipped too.
-      - **Multi-object loader** (`core/sys/hot_reload/hot_reload.odin`): `apply` →
+      - **Multi-object loader** (`core/hot_reload/hot_reload.odin`): `apply` →
         `apply_many([]string)` (and `apply_dir(dir)` which globs `*.obj`). Two passes: map every
         object + build a cross-object `all_syms` (decided address per symbol) and `all_defs`
         (object-local address per symbol); then resolve + relocate + patch each object, with an
@@ -148,11 +148,11 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       The loader resolves the running exe's procedure/global addresses from the exe's PDB
       instead of a compiler-baked table, so no symbols are rooted and DCE stays enabled.
       See Tier 3 "Drop the baked table" below for the full description.
-      - `core/sys/hot_reload/hot_reload.odin` (`hr_dbghelp_ensure` enumerates, `hr_resolve_pdb`),
+      - `core/hot_reload/hot_reload.odin` (`hr_dbghelp_ensure` enumerates, `hr_resolve_pdb`),
         `core/sys/windows/dbghelp.odin` (`SymEnumSymbolsW`),
         `src/llvm_backend.cpp` (`lb_hot_reload_emit_support`).
 - [x] **`FlushInstructionCache` binding** — `core/sys/windows/kernel32.odin`.
-- [x] **COFF object loader / relocator / patcher** — `core/sys/hot_reload/hot_reload.odin`:
+- [x] **COFF object loader / relocator / patcher** — `core/hot_reload/hot_reload.odin`:
       parse COFF, map the object in one block **within ±2 GB of the exe**, apply
       `AMD64_REL32`/`REL32_1..5`/`ADDR64` relocations with the resolver policy
       (in-table & not hot → exe addr; hot → object copy; object-local → loaded copy;
@@ -184,7 +184,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       `@(init)` still error.
 - [x] **New procedures across a reload.** A new proc called from hot code links as
       an object-local symbol and is reachable from patched and other new code.
-- [x] **Loader promoted to `core:sys/hot_reload`** with `apply(obj_path)` that
+- [x] **Loader promoted to `core:hot_reload`** with `apply(obj_path)` that
       auto-discovers the `@(hot_reload)` procedures from the baked table (no more
       copy-pasting a loader into your project).
 - [x] Demo + scripted repro — `game.odin`, `demo.ps1` (adds a new global + proc,
@@ -220,7 +220,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         than corrupting it; after the batch it flushes and resumes. No IP relocation is
         needed — in-flight calls in the old body finish on old code (it stays mapped) and
         only new calls take the jump. Loader: `hr_suspend_others`/`hr_resume`/
-        `hr_ip_conflicts` in `core/sys/hot_reload/hot_reload.odin`; APIs in
+        `hr_ip_conflicts` in `core/hot_reload/hot_reload.odin`; APIs in
         `core/sys/windows` (added the native x64 `CONTEXT_*` flag constants).
   - [x] **Atomic short-jump publish.** Each `@(hot_reload)` proc gets a 16-byte NOP pad
         immediately before its entry via the compiler-emitted LLVM
@@ -235,7 +235,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       relocations in `.pdata`/`.xdata` (RVAs relative to the loaded block) and registers
       the loaded `.pdata` with `RtlAddFunctionTable(pdata, count, block)`, so the OS
       unwinder can find unwind info for RIPs in hot code. Loader:
-      `core/sys/hot_reload/hot_reload.odin` (ADDR32NB case in the relocation switch +
+      `core/hot_reload/hot_reload.odin` (ADDR32NB case in the relocation switch +
       the `.pdata` registration loop after `FlushInstructionCache`); binding:
       `core/sys/windows` (`RUNTIME_FUNCTION`, `RtlAddFunctionTable`,
       `RtlDeleteFunctionTable`).
@@ -290,7 +290,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       foreign symbols are excluded from the baked table and a static-lib function is not
       exported. Fix: the loader gained a **PDB-backed resolver** — a final fallback in
       `hr_resolve_external` that looks the symbol up in the running exe's PDB via DbgHelp
-      `SymFromNameW` (`core/sys/hot_reload/hot_reload.odin` `hr_resolve_pdb` +
+      `SymFromNameW` (`core/hot_reload/hot_reload.odin` `hr_resolve_pdb` +
       `hr_dbghelp_ensure`; new `SymFromNameW` binding in `core/sys/windows/dbghelp.odin`).
       This finds the address of an in-image, non-exported symbol; the existing
       REL32/trampoline/`__imp_` machinery then applies. No compiler change.
@@ -329,7 +329,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       Compiler: `src/llvm_backend.cpp` (`lb_is_hot_reload_refresh_global` /
       `lb_is_load_directive_expr`, the fork exemption, the `__odin_hot_reload_refresh_syms` table),
       `src/llvm_backend_stmt.cpp` (same for local `@(static)`), `src/llvm_backend.hpp`
-      (`lbHotReloadRefreshSym`). Loader: `core/sys/hot_reload/hot_reload.odin` (refresh-target
+      (`lbHotReloadRefreshSym`). Loader: `core/hot_reload/hot_reload.odin` (refresh-target
       resolution, the repoint pass under suspension, the W^X tightening pass). `#load_directory` is
       also handled: it yields a runtime *value*, so a package-scope `x := #load_directory(...)` global
       would normally be built by the startup runtime (static storage left zero, unusable by the
@@ -357,7 +357,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       modules (exe, ntdll, ucrtbase, kernel32) for exported symbols, an in-image reference
       by link name for the non-exported `_tls_index`, and synthesised pointer cells for
       `__imp_*` references. Targets beyond signed-32-bit REL32 range are reached through a
-      near-block absolute-jump trampoline. Loader: `core/sys/hot_reload/hot_reload.odin`
+      near-block absolute-jump trampoline. Loader: `core/hot_reload/hot_reload.odin`
       (`hr_resolve`, `hr_resolve_exported`, `hr_imp_cell`, `hr_trampoline_for`, `Near_Arena`).
       This is what unblocked calling `fmt`/stdlib from hot code without crashing.
 - [x] **Import (`__imp_*`) resolution.** Done (see above) — an `__imp_X` reference gets a
@@ -470,7 +470,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       the PDB carries a resolvable name (functions already do). Files: `base/runtime/core.odin`
       (types + slice removed), `src/llvm_backend.cpp` (`lb_hot_reload_emit_support` replaces
       `lb_generate_hot_reload_symbol_table`; global debug-name change), `src/main.cpp`,
-      `core/sys/windows/dbghelp.odin` (`SymEnumSymbolsW` binding), `core/sys/hot_reload/hot_reload.odin`
+      `core/sys/windows/dbghelp.odin` (`SymEnumSymbolsW` binding), `core/hot_reload/hot_reload.odin`
       (`hr_dbghelp_ensure` enumerates; `hr_resolve_pdb` is now a map lookup; `hr_is_hot_entry`;
       `hr_tls_offset`).
       - **Manifest:** still needed — it persists the arena OFFSETS a reload build assigns to
@@ -517,7 +517,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       build-normalized hash of the procedure's LLVM IR (strips `!`/`#` metadata & attr-group
       numbers, trims trailing commas so -debug/-o:none matches non-debug, and canonicalizes
       the build-specific `$<module>$<hex>` tail of constant-global names). The loader
-      (`core/sys/hot_reload/hot_reload.odin`) seeds a live `name_hash→content_hash` map from
+      (`core/hot_reload/hot_reload.odin`) seeds a live `name_hash→content_hash` map from
       the exe's table and, each reload, patches ONLY procedures whose hash changed (unchanged
       procs — the whole runtime and the loader itself — are skipped, so there is no
       "patch the patcher" hazard and only edited procs relocate). `-hot-reload` now **implies
@@ -552,7 +552,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         reload built with **no** `-o` → **PASS 200/200, probe=1000**; `mt_test`/`free_test`/
         `rodata_test` still pass at the default `-o:none`.
 - [x] **Free the previously mapped block** — a reload no longer leaks its mapped block(s) +
-      `.pdata` registration. Two paths, both in `core/sys/hot_reload/hot_reload.odin`:
+      `.pdata` registration. Two paths, both in `core/hot_reload/hot_reload.odin`:
       - **No-op reload** (change detection finds nothing changed — the common case): the
         freshly-mapped blocks are unreferenced and no thread is inside them, so they are
         `RtlDeleteFunctionTable`'d + `VirtualFree`'d immediately before returning. (`mt_test`'s
@@ -586,14 +586,14 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       pad take the atomic path (write only into their own pad) and are always safe.
       `hr_patch_overwrite` keeps the same check defensively for any direct caller. Verified:
       `mt_test` still 200/200 (every proc has its pad, so the guard never trips on the normal
-      path). Loader: `core/sys/hot_reload/hot_reload.odin` only.
+      path). Loader: `core/hot_reload/hot_reload.odin` only.
 - [x] **Build-identity / staleness check (safety net).** A reload object is now bound to the
       *running* exe. The compiler bakes `__odin_hot_reload_build_id : u64` (external,
       `llvm.used`-kept, PDB-resolvable) into both the exe and every reload object; the base
       build derives it from the exe's reload-relevant layout (arena sizes + an order-independent
       fold of the original globals' `type_hash`es and the hot procs' signature hashes), and a
       reload build bakes back the value it read from the manifest. The loader
-      (`core/sys/hot_reload/hot_reload.odin`, before any write) compares the exe's id (PDB) with
+      (`core/hot_reload/hot_reload.odin`, before any write) compares the exe's id (PDB) with
       the object's id (`find_symbol_address`) and **refuses on mismatch** — so a stale object
       (base exe rebuilt, arena relaid) or one built for a different exe is rejected instead of
       writing const-init blobs at now-wrong offsets. Absent on either side (older exe/object) →
@@ -647,7 +647,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 - [ ] **Built-in file watching + auto-rebuild** — watch sources, rebuild the object,
       and reload automatically (today: `hr.apply_patch()` or press `b`/`r`, no file watcher yet).
 - [x] **Self-contained reload** — the running program drives the rebuild itself, so no external
-      terminal is needed. `core:sys/hot_reload` gained `build_patch()` and `apply_patch()`:
+      terminal is needed. `core:hot_reload` gained `build_patch()` and `apply_patch()`:
       `build_patch` shells out (via `core:os` `process_exec`) to `odin build <pkg_dir>
       -hot-reload-patch`, streaming the compiler's stdout/stderr; `apply_patch` runs that and, only
       on exit 0, loads `<pkg_dir>/hot_objs/` (so a **failed build holds** — the compiler's
@@ -661,7 +661,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       the base build), which avoids bloating the manifest and leaking machine-specific secrets; an
       optional `env` parameter overrides it. The demo's `b` key = `apply_patch()` (rebuild+reload),
       `r` = `apply_dir()` (reload only). Compiler: `src/llvm_backend.{cpp,hpp}` (the `pkg_dir`
-      manifest field/read/write). Loader: `core/sys/hot_reload/hot_reload.odin`
+      manifest field/read/write). Loader: `core/hot_reload/hot_reload.odin`
       (`build_patch`/`apply_patch`/`hr_run_patch_build`/`hr_manifest_pkg_dir`). Verified end-to-end:
       an edited program rebuilt+reloaded itself in-process (`before=1 after=2 apply_patch_ok=true`),
       and a syntax error was surfaced with the reload held (`apply_patch_ok=false`, no crash).
@@ -766,7 +766,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 ## Type-migration gaps (pre/post-patch hooks + reflection migration)
 
 The `@(pre_patch_hook)`/`@(post_patch_hook)` + name-keyed reflection serializer path
-(diff in `core/sys/hot_reload/hot_reload.odin`: `hr_layout_differs` / `hr_contains_changed` /
+(diff in `core/hot_reload/hot_reload.odin`: `hr_layout_differs` / `hr_contains_changed` /
 `hr_build_type_changes`; serializer in `examples/hot_reload/migrate/serializer.odin`, copied
 into `migrate_full/` and `migrate_enum/`) is scoped to **simple layout changes of a single,
 self-contained value struct you hold by pointer**. Everything below is outside that scope.
@@ -829,7 +829,7 @@ self-contained value struct you hold by pointer**. Everything below is outside t
 
 Full findings from the adversarial review of the PDB-based refactor (dropping the baked
 `runtime.hot_reload_symbol_table`). `[x]` = fixed, `[ ]` = still open. Line refs are
-approximate against `core/sys/hot_reload/hot_reload.odin` unless noted.
+approximate against `core/hot_reload/hot_reload.odin` unless noted.
 
 - [x] **F1 — HIGH — `SymEnumSymbolsW` result ignored → partial/empty map → silent state
       loss.** A missing/public-only PDB or a part-way enumeration left `_hr_syms` empty while

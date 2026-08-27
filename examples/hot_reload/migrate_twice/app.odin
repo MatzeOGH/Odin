@@ -23,7 +23,7 @@ package hot_reload_migrate_twice
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 // State / Kind / OnlyV2 / NewV2 / VER are defined per version in state.odin.
 

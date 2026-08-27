@@ -21,7 +21,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:os"
 import win "core:sys/windows"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 State :: struct {
 	n: i64,

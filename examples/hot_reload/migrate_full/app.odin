@@ -13,7 +13,7 @@ package hot_reload_migrate_full
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 // Filled by the (v2) `report` hot proc after migration; asserted by `main`.
 Report :: struct {

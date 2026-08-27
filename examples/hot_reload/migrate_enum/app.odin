@@ -11,7 +11,7 @@ package hot_reload_migrate_enum
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 Report :: struct {
 	id:     i64,

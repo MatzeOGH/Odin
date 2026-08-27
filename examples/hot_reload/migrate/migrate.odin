@@ -20,7 +20,7 @@ package hot_reload_migrate
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 // Bumped 1 -> 2 by the reload edit; also gates the code that reads the new `extra`
 // field so the v1 (exe) build — which has no such field — still compiles.

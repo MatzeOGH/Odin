@@ -14,7 +14,7 @@ package unwind_test
 import "core:fmt"
 import "core:os"
 import win "core:sys/windows"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 import hp "hp"
 
 N :: 6 // hot frames inserted by the reload

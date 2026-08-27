@@ -16,7 +16,7 @@ package hot_reload_hook_test
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 // Bumped 1 -> 2 by the reload edit (run_hook_test.ps1). Exe built with VER==1, reload
 // object with VER==2, so PRE (old/exe) sees 1 and POST (new/obj) sees 2.

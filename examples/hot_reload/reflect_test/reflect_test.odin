@@ -10,7 +10,7 @@ package hot_reload_reflect_test
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 import rl "vendor:raylib"
 
 Thing :: struct {

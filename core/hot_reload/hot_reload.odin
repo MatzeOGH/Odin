@@ -545,6 +545,7 @@ Hr_Generation :: struct {
 // Bounded in steady state — old generations are freed once superseded and no thread is
 // inside them. Exposed for tests/diagnostics; not part of the reload contract.
 live_generations :: proc() -> int {
+	when !ODIN_HOT_RELOAD { return 0 }
 	return len(_hr_generations)
 }
 // Each exe pointer that references a mapped block — a patched hot-proc entry, or a
@@ -667,6 +668,7 @@ hr_try_free_old_generations :: proc(handles: [dynamic]win.HANDLE) {
 // per-call scratch runs on a private arena, so it never touches the app's
 // `context.temp_allocator`.
 apply :: proc(obj_path: string) -> bool {
+	when !ODIN_HOT_RELOAD { return false }
 	return apply_many({obj_path})
 }
 
@@ -676,6 +678,7 @@ apply :: proc(obj_path: string) -> bool {
 // single-object build too (one match). Order is irrelevant: the objects are all mapped
 // before any relocation (see `apply_many`), so cross-object references resolve regardless.
 apply_dir :: proc(dir := "hot_objs") -> bool {
+	when !ODIN_HOT_RELOAD { return false }
 	pattern := fmt.tprintf("%s/*.obj", dir)
 	matches, err := filepath.glob(pattern, context.temp_allocator)
 	if err != nil || len(matches) == 0 {
@@ -706,6 +709,7 @@ apply_dir :: proc(dir := "hot_objs") -> bool {
 // build environment is deliberately NOT baked into the manifest — it would bloat the file and
 // leak machine-specific secrets). Provide `env` only to override that.
 build_patch :: proc(odin := "odin", manifest := "odin-hot-reload.manifest", env: []string = nil) -> bool {
+	when !ODIN_HOT_RELOAD { return false }
 	pkg_dir, ok := hr_manifest_pkg_dir(manifest)
 	if !ok {
 		fmt.eprintfln("[hot] build_patch: no pkg_dir in manifest %q (build the exe with -hot-reload first)", manifest)
@@ -717,6 +721,7 @@ build_patch :: proc(odin := "odin", manifest := "odin-hot-reload.manifest", env:
 // Rebuild the patch (see `build_patch`) and, if it succeeds, load it from
 // `<pkg_dir>/hot_objs/`. Holds on a failed build (returns false without touching running code).
 apply_patch :: proc(odin := "odin", manifest := "odin-hot-reload.manifest", env: []string = nil) -> bool {
+	when !ODIN_HOT_RELOAD { return false }
 	pkg_dir, ok := hr_manifest_pkg_dir(manifest)
 	if !ok {
 		fmt.eprintfln("[hot] apply_patch: no pkg_dir in manifest %q (build the exe with -hot-reload first)", manifest)
@@ -778,6 +783,7 @@ hr_manifest_pkg_dir :: proc(manifest_path: string) -> (string, bool) {
 // lets a new procedure/global defined in one object be referenced from another (resolved via
 // the cross-object `all_syms` map below, through a near trampoline when out of REL32 range).
 apply_many :: proc(obj_paths: []string) -> bool {
+	when !ODIN_HOT_RELOAD { return false }
 	// Refuse a concurrent/nested reload rather than corrupt the shared loader state.
 	if _, swapped := intrinsics.atomic_compare_exchange_strong(&_hr_busy, false, true); !swapped {
 		fmt.eprintln("[hot] a reload is already in progress; apply()/apply_many() must be called from one thread, one reload at a time")

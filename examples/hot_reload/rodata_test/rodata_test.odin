@@ -19,7 +19,7 @@ package hot_reload_rodata_test
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 
 // BASELINE values. run_rodata_test.ps1 rewrites PALETTE[0] (0x11111111 -> 0xAAAAAAAA)
 // and asset.txt for the reload object.

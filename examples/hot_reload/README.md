@@ -18,7 +18,7 @@ A reload may also **introduce new globals and new procedures** (see below).
 ## Manual workflow (edit, then reload by hand)
 
 Use the `odin.exe` from **this repo** (it has `-hot-reload` and the
-`core:sys/hot_reload` loader package).
+`core:hot_reload` loader package).
 
 1. **Build the demo once and run it.** `-hot-reload` reserves the new-global arena,
    implies `-debug` (producing the PDB the loader resolves symbols from), auto-adds
@@ -132,7 +132,7 @@ the symbol name.)
    (`-hot-reload -build-mode:obj -hot-reload-manifest:<path> -out:<dir>`) still work
    and are needed only when the exe and the reload build come from different directories.
 
-5. **Load + relocate + patch** (`core:sys/hot_reload`, call `hot_reload.apply("hot.obj")`):
+5. **Load + relocate + patch** (`core:hot_reload`, call `hot_reload.apply("hot.obj")`):
    - Map the object's sections into one contiguous block reserved **within ±2 GB
      of the exe** (so RIP-relative references stay in range).
    - Apply `AMD64_REL32`/`REL32_1..5`/`ADDR64` relocations. Each target symbol is
@@ -215,7 +215,7 @@ exit 0 = PASS).
   `@(rodata)` value, a size-changed `#load` asset, a `#load_directory` file, a `#hash`
   literal, and the `#load_hash` file; all are observed while an ordinary mutable global
   keeps its runtime value; exit 0 = PASS).
-- The loader itself now ships as **`core:sys/hot_reload`** (no longer copied here).
+- The loader itself now ships as **`core:hot_reload`** (no longer copied here).
 
 ## Reacting to struct layout changes (pre/post-patch hooks)
 
@@ -292,12 +292,12 @@ out of migrated state), and the diff still compares bit-sets by size alone.
   constant-integer globals are overwritten in place, and their `::` constant form already
   refreshes via normal recompile), plus per-section W^X tightening of the mapped block —
   `src/llvm_backend.cpp`, `src/llvm_backend_stmt.cpp`, `src/llvm_backend.hpp`,
-  `core/sys/hot_reload/hot_reload.odin`.
-- `core:sys/hot_reload` — the COFF loader/relocator/patcher + `apply`.
+  `core/hot_reload/hot_reload.odin`.
+- `core:hot_reload` — the COFF loader/relocator/patcher + `apply`.
 - `@(pre_patch_hook)` / `@(post_patch_hook)` attributes + emitted hook-name tables
   (`__odin_hot_reload_{pre,post}_patch_hooks`, storing each hook's exported symbol name):
   `src/checker.{hpp,cpp}`, `src/check_decl.cpp`, `src/entity.cpp`, `src/llvm_backend.cpp`;
   the new-layout type table (`__odin_hot_reload_type_infos`) in `src/llvm_backend_type.cpp`;
   `Type_Change`, the object-vs-exe type-info diff, and by-name hook dispatch in
-  `core/sys/hot_reload/hot_reload.odin`.
+  `core/hot_reload/hot_reload.odin`.
 - `FlushInstructionCache` binding — `core/sys/windows/kernel32.odin`.

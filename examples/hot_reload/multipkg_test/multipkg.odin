@@ -16,7 +16,7 @@ package hot_reload_multipkg
 
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 import a "pkga"
 import b "pkgb"
 import c "pkgc"

@@ -2,7 +2,7 @@
 
 Live++-style in-process hot reload for Odin (Windows / x64). This document is the single
 source of truth for why the feature works the way it does. The source (the compiler plus the
-`core:sys/hot_reload` loader) keeps only short, local comments. Each such comment points back
+`core:hot_reload` loader) keeps only short, local comments. Each such comment points back
 here by section number.
 
 The feature has two halves. They meet at a fixed set of emitted symbols.
@@ -10,7 +10,7 @@ The feature has two halves. They meet at a fixed set of emitted symbols.
 - **Compiler** (`src/*.cpp`): under `-hot-reload` it makes each user procedure patchable. It
   redirects new globals into a persistent arena. It emits a small set of support symbols and
   tables that the loader reads by name.
-- **Loader** (`core/sys/hot_reload/hot_reload.odin`): at run time it maps a fresh object into
+- **Loader** (`core/hot_reload/hot_reload.odin`): at run time it maps a fresh object into
   the running process, relocates it, and overwrites the prologue of each changed procedure with
   a jump to the new code. The process does not restart, and its state does not change.
 

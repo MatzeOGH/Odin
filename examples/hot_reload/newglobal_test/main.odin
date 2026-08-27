@@ -3,7 +3,7 @@ package newglobal_test
 // Repro: a brand-new global introduced by the reload, referenced across packages.
 import "core:fmt"
 import "core:os"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 import a "pkga"
 main :: proc() {
 	base := a.bump() // base: returns 100, no new global yet

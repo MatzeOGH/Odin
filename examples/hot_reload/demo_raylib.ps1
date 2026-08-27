@@ -52,7 +52,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import win "core:sys/windows"
-import hr "core:sys/hot_reload"
+import hr "core:hot_reload"
 import rl "vendor:raylib"
 
 State :: struct {
