@@ -70,25 +70,50 @@ gb_internal void lb_mem_copy_non_overlapping(lbProcedure *p, lbValue dst, lbValu
 }
 
 
-// True iff `fullpath` (a package directory) is at or under the root of the bundled
-// collection named `coll_name` (e.g. "core"). Requires a path-separator boundary right
-// after the root so ".../core" does not match a sibling ".../core_extra".
-gb_internal bool lb_path_under_collection(String fullpath, String coll_name) {
-	String coll_path = {};
-	if (!find_library_collection_path(coll_name, &coll_path)) {
+// Compare two path bytes for equality, treating '/' and '\\' as the same separator and
+// ASCII case-insensitively (Windows paths). ODIN_ROOT is normalized to backslashes while a
+// package `fullpath` may use forward slashes, so a raw byte compare would spuriously fail.
+gb_internal bool lb_path_char_eq(u8 a, u8 b) {
+	if (a == '/') { a = '\\'; }
+	if (b == '/') { b = '\\'; }
+	if (a >= 'A' && a <= 'Z') { a = cast(u8)(a + 32); }
+	if (b >= 'A' && b <= 'Z') { b = cast(u8)(b + 32); }
+	return a == b;
+}
+
+// True iff `fullpath` is at or under directory `dir` (separator- and case-insensitive, with
+// a path boundary after `dir` so ".../core" does not match a sibling ".../core_extra").
+gb_internal bool lb_path_under_dir(String fullpath, String dir) {
+	while (dir.len > 0 && (dir.text[dir.len-1] == '/' || dir.text[dir.len-1] == '\\')) {
+		dir.len -= 1; // ignore any trailing separator on the collection path
+	}
+	if (dir.len == 0 || fullpath.len < dir.len) {
 		return false;
 	}
-	if (coll_path.len == 0 || fullpath.len < coll_path.len) {
-		return false;
+	for (isize i = 0; i < dir.len; i++) {
+		if (!lb_path_char_eq(fullpath.text[i], dir.text[i])) {
+			return false;
+		}
 	}
-	if (!string_starts_with(fullpath, coll_path)) {
-		return false;
-	}
-	if (fullpath.len == coll_path.len) {
+	if (fullpath.len == dir.len) {
 		return true;
 	}
-	u8 c = fullpath.text[coll_path.len];
+	u8 c = fullpath.text[dir.len];
 	return c == '/' || c == '\\';
+}
+
+// True iff `fullpath` is a SHIPPED standard-library package — i.e. under one of Odin's
+// BUILT-IN collections (base/core/vendor), identified by the `builtin` flag set when the
+// compiler registers them (src/main.cpp), NOT by collection name. A user `-collection` (even
+// one named `core`) has builtin=false, so a game engine's `src/engine/core` is not excluded;
+// and `ODIN_ROOT/examples/...` (the hot-reload tests) is under no collection, so it isn't either.
+gb_internal bool lb_path_is_stdlib(String fullpath) {
+	for (auto const &lc : library_collections) {
+		if (lc.builtin && lb_path_under_dir(fullpath, lc.path)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Tagless hot reload: whether procedure `p` is made hot-patchable automatically under
@@ -128,16 +153,16 @@ gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
 	if (pt->Proc.calling_convention == ProcCC_Naked || pt->Proc.calling_convention == ProcCC_InlineAsm) {
 		return false;
 	}
-	// Only the user's own packages are auto hot-patchable; skip the bundled standard-library
-	// collections (see the note above). A package from a user-defined -collection is NOT one
-	// of these three, so it stays hot-reloadable.
+	// Only the user's own packages are auto hot-patchable; skip Odin's shipped standard
+	// library (ODIN_ROOT/{core,base,vendor,shared}). Anchored on ODIN_ROOT + fixed names,
+	// NOT collection names, so a user project's own core/base/vendor (e.g. a game engine's
+	// src/engine/core) stays hot-reloadable; and NOT all of ODIN_ROOT, so ODIN_ROOT/examples
+	// (the hot-reload tests) stays hot-reloadable too.
 	AstPackage *pkg = e->pkg;
 	if (pkg == nullptr) {
 		return false;
 	}
-	if (lb_path_under_collection(pkg->fullpath, str_lit("core"))   ||
-	    lb_path_under_collection(pkg->fullpath, str_lit("base"))   ||
-	    lb_path_under_collection(pkg->fullpath, str_lit("vendor"))) {
+	if (lb_path_is_stdlib(pkg->fullpath)) {
 		return false;
 	}
 	return true;

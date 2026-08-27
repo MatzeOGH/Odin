@@ -213,7 +213,10 @@ struct HotReloadManifest {
 	i64  next_free;
 	i64  tls_arena_size;     // per-thread bytes reserved for new thread-locals
 	i64  tls_next_free;      // bump pointer into the TLS arena
+	u64  build_id;           // fingerprint of the exe's reload-relevant layout; loader refuses a mismatched object (F6)
 	StringMap<u64>               orig;    // link name -> canonical type hash (from the exe build)
+	StringMap<u64>               sig;     // hot proc link name -> canonical signature (proc-type) hash; reload rejects a changed ABI (F8)
+	StringMap<u64>               fhash;   // hot proc link name -> content hash of the previous build; groundwork for compile-time change detection (item 3 cheap half)
 	StringMap<HotReloadNewEntry> newg;    // link name -> {arena offset, canonical type hash, init-flag offset}
 	StringMap<HotReloadNewEntry> tls_newg; // new thread-local link name -> {TLS arena offset, type hash, per-thread guard offset}
 };

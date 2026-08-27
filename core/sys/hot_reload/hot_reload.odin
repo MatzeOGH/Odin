@@ -620,6 +620,23 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		have_obj_hashes = len(obj_hashes) > 0
 	}
 
+	// Build-identity guard (F6): refuse a reload object built against a different exe
+	// layout. A stale object (base exe rebuilt, arena relaid) would resolve names and write
+	// const-init blobs at now-wrong arena offsets -> silent corruption. The compiler bakes
+	// the same `__odin_hot_reload_build_id` into the exe and every object built against it;
+	// mismatch here means "rebuild the reload object". Skipped if either symbol is absent
+	// (older exe/object without the id), matching the func-hash "missing -> lenient" policy.
+	if exe_bid := hr_resolve_pdb("__odin_hot_reload_build_id"); exe_bid != nil {
+		if obj_bid, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_build_id"); ok {
+			exe_id := (^u64)(exe_bid)^
+			obj_id := (^u64)(obj_bid)^
+			if exe_id != obj_id {
+				fmt.eprintfln("[hot] build-id mismatch: this reload object (%d) was not built against the running exe (%d). Rebuild the reload object against the current exe.", obj_id, exe_id)
+				return false
+			}
+		}
+	}
+
 	// 2) Resolve every symbol slot to a runtime address.
 	//    - defined & hot (patchable prologue in exe) -> the object's fresh copy (new code)
 	//    - defined & present in the exe (via PDB)     -> the exe's address (reuse / preserve globals)
@@ -640,6 +657,11 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	}
 
 	resolved := make([]rawptr, n_syms, context.temp_allocator)
+	// name -> this object's address for every DEFINED symbol, built once here so the
+	// later per-proc / per-refresh lookups reuse it instead of re-scanning the whole
+	// symbol table (find_symbol_address is O(n_syms) per call). First-seen wins, matching
+	// find_symbol_address's first-defined-match semantics.
+	obj_syms := make(map[string]rawptr, n_syms, context.temp_allocator)
 	{
 		i := 0
 		for i < n_syms {
@@ -648,6 +670,9 @@ load_and_patch :: proc(obj_path: string) -> bool {
 			sn := int(sym.section_number)
 			if sn > 0 && section_bases[sn] != nil {
 				obj_addr := rawptr(uintptr(section_bases[sn]) + uintptr(sym.value))
+				if _, seen := obj_syms[name]; !seen {
+					obj_syms[name] = obj_addr
+				}
 				exe_addr := hr_resolve_pdb(name)
 				// Only a symbol defined in an executable section can be a hot procedure.
 				// Restricting the (byte-reading) hot check to code symbols also avoids
@@ -875,7 +900,7 @@ load_and_patch :: proc(obj_path: string) -> bool {
 			nlen := int((^i64)(p)^); p += 8
 			name := string(([^]u8)(rawptr(p))[:nlen]); p += uintptr(nlen)
 			exe := hr_resolve_pdb(name)
-			obj, found := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, name)
+			obj, found := obj_syms[name]
 			if exe != nil && found && size > 0 {
 				append(&refresh_targets, Refresh_Target{exe, obj, size})
 			}
@@ -913,7 +938,7 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	targets := make([dynamic]Target, context.temp_allocator)
 	for name in hot_names {
 		original := hr_resolve_pdb(name) // cached; found in step 2
-		fresh, found := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, name)
+		fresh, found := obj_syms[name]   // built in step 2; avoids re-scanning the symbol table
 		if original == nil || !found {
 			fmt.eprintfln("[hot] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v); nothing patched", name, original != nil, found)
 			return false

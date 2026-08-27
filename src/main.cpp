@@ -3884,7 +3884,7 @@ int main(int arg_count, char const **arg_ptr) {
 
 	auto const &add_collection = [](String const &name) {
 		bool ok = false;
-		add_library_collection(name, get_fullpath_relative(heap_allocator(), odin_root_dir(), name, &ok));
+		add_library_collection(name, get_fullpath_relative(heap_allocator(), odin_root_dir(), name, &ok), /*builtin*/true);
 		if (!ok) {
 			compiler_error("Cannot find the library collection '%.*s'. Is the ODIN_ROOT set up correctly?", LIT(name));
 		}

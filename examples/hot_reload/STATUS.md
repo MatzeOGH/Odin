@@ -239,12 +239,18 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 - [ ] **New host-callable entry points.** A brand-new procedure is reachable only
       through the patched call graph; the frozen host cannot gain a new direct call
       site (would need a `resolve(name)`-style dispatch the host consults).
-- [ ] **Hot-procedure signature/ABI guard.** Existing *globals* are protected against a
-      type/layout change (rejected at build time via `type_hash`), but a `@(hot_reload)`
-      *procedure* has no equivalent check: change its parameter/return types and the frozen
-      host's call sites still marshal the OLD ABI into the patched-in new body → silent
-      stack/register corruption. Fix: record each hot proc's canonical signature hash in the
-      manifest and reject a reload that changes it. (Adversarial-review finding F8.)
+- [x] **Hot-procedure signature/ABI guard.** Existing *globals* are protected against a
+      type/layout change (rejected at build time via `type_hash`); hot *procedures* are now
+      protected the same way. The base build records each hot proc's canonical signature hash
+      (`type_hash_canonical_type(p->type)`, covering params/returns/calling-convention) in the
+      manifest (`sig` records); a reload build recomputes it in `lb_hot_reload_emit_func_hashes`
+      and **`error()`s at build time** if an existing hot proc's signature changed — before the
+      frozen host can marshal the old ABI into the new body. New procs (absent from the manifest)
+      are unchecked. A rejected build no longer writes the manifest (`any_errors()` guard in
+      `hot_reload_manifest_write`), so the guard is not "sticky" after a revert. Verified:
+      changing `work :: proc(^State)` to `-> int` is rejected; reverting builds cleanly; unchanged
+      signatures still reload 200/200 (`mt_test`). Compiler: `src/llvm_backend.cpp`,
+      `src/llvm_backend.hpp` (`HotReloadManifest.sig`). (Adversarial-review finding F8.)
 - [x] **Variadic / `any` / reflection from hot code.** Both the crash (unresolved
       `memcpy`/`_tls_index`/`__imp_*`, fixed by the resolver above) and the wrong-output
       for composite/user types are fixed. `fmt.printf("%v", some_struct)`, `typeid_of(T)`,
@@ -350,12 +356,19 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       library (a program using `fmt` transitively pulls in thousands of `core` procedures) and
       keeps each as a standalone function with full CodeView debug info — a multi-GB compile spike
       that OOMs on any `fmt`-using program. Those procs are almost never edited during a reload
-      session; only the user's code is (a user-defined `-collection` stays hot-reloadable — the
-      exclusion is by collection path, `lb_path_under_collection`). A second memory fix: the
-      per-proc content-hash (`lb_hot_reload_proc_content_hash`) now frees its normalized-IR scratch
-      per procedure via `TEMPORARY_ALLOCATOR_GUARD` (it previously accumulated the whole program's
-      normalized IR in the temp allocator). Together these restore compile memory to roughly the
-      plain single-module+`-debug` level (mt_test: ~335 MB vs an un-scoped OOM). The
+      session; only the user's code is. **Exclusion is by BUILT-IN collection, not by name:**
+      `LibraryCollections` gained a `builtin` flag set only when the compiler registers `base`/
+      `core`/`vendor` at startup (`src/main.cpp`, `add_library_collection(..., /*builtin*/true)`);
+      `lb_path_is_stdlib` (`src/llvm_backend_proc.cpp`) excludes a proc whose package path is under
+      any *builtin* collection's path (separator-/case-insensitive, `lb_path_under_dir`). So a user
+      project that defines its OWN `core`/`base`/`vendor` collection (e.g. a game engine's
+      `src/engine/core`) is NOT excluded — its collection has `builtin=false` — and `ODIN_ROOT/
+      examples/...` (the hot-reload tests) is under no collection, so it stays reloadable too.
+      Verified: `mt_test` 200/200, and a proc in `.../src/engine/core` hot-reloads. A second memory
+      fix: the per-proc content-hash (`lb_hot_reload_proc_content_hash`) now frees its normalized-IR
+      scratch per procedure via `TEMPORARY_ALLOCATOR_GUARD` (it previously accumulated the whole
+      program's normalized IR in the temp allocator). Together these restore compile memory to
+      roughly the plain single-module+`-debug` level (mt_test: ~335 MB vs an un-scoped OOM). The
       `@(hot_reload)` attribute is REMOVED; `@(no_hot_reload)` opts a specific proc out (keeps
       it inlinable/optimized and unpatched). No forced `@(export)` — the PDB resolves mangled
       link names. **Change detection** keeps this cheap and safe: the compiler emits a
@@ -380,13 +393,20 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       block per reload); optionally support unpatch / rewind.
 - [ ] **Guard the 14-byte patch** — assert the procedure is ≥14 bytes to its next
       16-byte-aligned neighbor before overwriting (today relies on 16-byte alignment).
-- [ ] **Build-identity / staleness check (safety net).** Nothing binds a reload object +
-      manifest to the *running* exe. Rebuild the base exe (arena relaid) but reload a stale
-      object, or `apply()` an object built for a different exe, and the loader resolves
-      names, writes const-init blobs at now-wrong arena offsets, and patches — silent memory
-      corruption, no diagnostic. Fix: bake a build-id (e.g. manifest-layout hash) into both
-      the exe (a resolvable symbol) and the reload object; loader compares and refuses on
-      mismatch. Live++ does this; highest-value missing safety net.
+- [x] **Build-identity / staleness check (safety net).** A reload object is now bound to the
+      *running* exe. The compiler bakes `__odin_hot_reload_build_id : u64` (external,
+      `llvm.used`-kept, PDB-resolvable) into both the exe and every reload object; the base
+      build derives it from the exe's reload-relevant layout (arena sizes + an order-independent
+      fold of the original globals' `type_hash`es and the hot procs' signature hashes), and a
+      reload build bakes back the value it read from the manifest. The loader
+      (`core/sys/hot_reload/hot_reload.odin`, before any write) compares the exe's id (PDB) with
+      the object's id (`find_symbol_address`) and **refuses on mismatch** — so a stale object
+      (base exe rebuilt, arena relaid) or one built for a different exe is rejected instead of
+      writing const-init blobs at now-wrong offsets. Absent on either side (older exe/object) →
+      skipped, matching the func-hash leniency. Verified: a tampered/mismatched build-id is
+      refused on every reload with the process surviving; matching ids reload 200/200 (`mt_test`).
+      Compiler: `src/llvm_backend.cpp` (`lb_hot_reload_emit_build_id`), `src/llvm_backend.hpp`
+      (`HotReloadManifest.build_id`). (Adversarial-review finding F6.)
 - [x] **Hardened PDB-resolver failure modes (from adversarial review).** (a) The loader now
       treats an empty/failed `SymEnumSymbolsW` (missing/public-only PDB) as a hard error
       instead of silently duplicating every global (`hr_dbghelp_ensure`). (b) TLS/register/
@@ -593,21 +613,21 @@ approximate against `core/sys/hot_reload/hot_reload.odin` unless noted.
       `GetModuleHandleW(nil)` (the exe), but a `-build-mode:dll`/`:staticlib` host would be
       enumerated/patched against the wrong image. FIX: `src/main.cpp` now requires the
       hot-reload host to be `-build-mode:exe` (reload objects use `:obj`).
-- [ ] **F6 — MEDIUM — no build-identity check between reload object, manifest, and running
-      exe.** Reload a stale object (base exe rebuilt, arena relaid) or one built for a
-      different exe and the loader writes const-init blobs at now-wrong offsets and patches —
-      silent corruption. FIX (todo): bake a build-id (manifest-layout hash) into both the exe
-      (a resolvable symbol) and the reload object; loader compares and refuses on mismatch.
-      *Highest-value missing safety net; also listed under Tier 3.*
+- [x] **F6 — MEDIUM — no build-identity check between reload object, manifest, and running
+      exe.** FIXED: the compiler bakes `__odin_hot_reload_build_id` (a fold of the exe's
+      arena sizes + original-global + hot-proc-signature hashes) into both the exe and every
+      reload object, and the loader refuses a reload whose id differs from the running exe's
+      before writing any byte. See the Tier 3 "Build-identity / staleness check" item for the
+      full description.
 - [x] **F7 — MEDIUM — reload not transactional; partial patch on mid-batch failure.** A
       missing hot proc was skipped and the rest patched (program left split across two
       versions). FIX: all hot targets are resolved+validated before the first write; any
       failure aborts the whole reload with nothing applied. (Rollback after a mid-batch
       `patch_jump` failure is still not implemented — see Known limitations.)
-- [ ] **F8 — MEDIUM — no signature/ABI guard on hot procedures** (globals are type-checked,
-      procs are not). Changing a `@(hot_reload)` proc's parameter/return types corrupts the
-      frozen host's call sites. FIX (todo): record a canonical signature hash per hot proc in
-      the manifest and reject a changing reload. *Also listed under Tier 2.*
+- [x] **F8 — MEDIUM — no signature/ABI guard on hot procedures** (globals are type-checked,
+      procs are not). FIXED: each hot proc's canonical signature hash is recorded in the manifest
+      (`sig`) at base build and a reload that changes an existing hot proc's parameter/return
+      types is rejected at build time. See the Tier 2 "Hot-procedure signature/ABI guard" item.
 - [x] **F9 — LOW/MEDIUM — atomic-patch pad write not covered by the IP-conflict region.** The
       stop-the-world check guarded `[entry, entry+PATCH_LEN)` but the atomic path also writes
       the 16-byte pad below the entry. FIX: the region is now `[entry-PAD_LEN, entry+PATCH_LEN)`.
@@ -636,8 +656,6 @@ approximate against `core/sys/hot_reload/hot_reload.odin` unless noted.
 
 ### What's still missing (independent of the TODO tiers above)
 
-- **Build-identity / staleness safety (F6)** and **hot-proc ABI guard (F8)** — the two
-  highest-value correctness safety nets, both absent.
 - **Transactional reload with rollback (F7 remainder)** — no all-or-nothing guarantee if a
   write fails partway through the batch.
 - **Stale function pointers held in state** — see Known limitations (non-hot proc pointers).

@@ -3181,9 +3181,12 @@ gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Ty
 
 gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	string_map_init(&hm->orig);
+	string_map_init(&hm->sig);
+	string_map_init(&hm->fhash);
 	string_map_init(&hm->newg);
 	string_map_init(&hm->tls_newg);
 	hm->exists = false;
+	hm->build_id = 0;
 	hm->next_free = 0;
 	hm->arena_size = build_context.hot_reload_arena_size;
 	hm->tls_next_free = 0;
@@ -3237,10 +3240,20 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 			build_context.hot_reload_tls_arena_size = hm->tls_arena_size;
 		} else if (tag == "tls_next_free") {
 			hm->tls_next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+		} else if (tag == "build_id") {
+			hm->build_id = lb_hot_reload_parse_u64(tok(line, &p));
 		} else if (tag == "orig") {
 			u64 th = lb_hot_reload_parse_u64(tok(line, &p));
 			String name = rest(line, p);
 			if (name.len > 0) { string_map_set(&hm->orig, name, th); }
+		} else if (tag == "sig") {
+			u64 sh = lb_hot_reload_parse_u64(tok(line, &p));
+			String name = rest(line, p);
+			if (name.len > 0) { string_map_set(&hm->sig, name, sh); }
+		} else if (tag == "fhash") {
+			u64 ch = lb_hot_reload_parse_u64(tok(line, &p));
+			String name = rest(line, p);
+			if (name.len > 0) { string_map_set(&hm->fhash, name, ch); }
 		} else if (tag == "new") {
 			i64 off     = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
 			u64 th      = lb_hot_reload_parse_u64(tok(line, &p));
@@ -3267,6 +3280,12 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	if (build_context.hot_reload_manifest.len == 0) {
 		return;
 	}
+	// A rejected build (e.g. the ABI guard below, or an exhausted arena) must not persist
+	// its state: overwriting the manifest with a bad `sig`/offsets would make the guard
+	// "sticky" and reject even a subsequent corrected build. Leave the manifest untouched.
+	if (any_errors()) {
+		return;
+	}
 	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
 	gbFile f = {};
 	if (gb_file_open_mode(&f, gbFileMode_Write, path_c) != gbFileError_None) {
@@ -3277,9 +3296,18 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	gb_fprintf(&f, "next_free %llu\n", cast(unsigned long long)hm->next_free);
 	gb_fprintf(&f, "tls_arena_size %llu\n", cast(unsigned long long)hm->tls_arena_size);
 	gb_fprintf(&f, "tls_next_free %llu\n", cast(unsigned long long)hm->tls_next_free);
+	gb_fprintf(&f, "build_id %llu\n", cast(unsigned long long)hm->build_id);
 	for (u32 idx = 0; idx < hm->orig.count; idx++) {
 		StringMapEntry<u64> const &e = hm->orig.entries[idx];
 		gb_fprintf(&f, "orig %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));
+	}
+	for (u32 idx = 0; idx < hm->sig.count; idx++) {
+		StringMapEntry<u64> const &e = hm->sig.entries[idx];
+		gb_fprintf(&f, "sig %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));
+	}
+	for (u32 idx = 0; idx < hm->fhash.count; idx++) {
+		StringMapEntry<u64> const &e = hm->fhash.entries[idx];
+		gb_fprintf(&f, "fhash %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));
 	}
 	for (u32 idx = 0; idx < hm->newg.count; idx++) {
 		StringMapEntry<HotReloadNewEntry> const &e = hm->newg.entries[idx];
@@ -3481,6 +3509,7 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	LLVMTypeRef entry_field_types[2] = { u64t, u64t }; // { name_hash, content_hash }
 	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 2, false);
 
+	HotReloadManifest &hm = gen->hot_reload_manifest;
 	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
 	for (lbProcedure *p : m->generated_procedures) {
 		if (!lb_proc_is_hot_reloadable(p)) {
@@ -3488,6 +3517,29 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 		}
 		u64 name_hash    = fnv64a(p->name.text, p->name.len);
 		u64 content_hash = lb_hot_reload_proc_content_hash(p);
+
+		// Persist this build's per-proc content hash into the manifest (item 3 cheap half):
+		// the base build's fhash is the exe's per-proc baseline, which a future reload build
+		// can diff against at compile time to decide which procedures to emit. Inert today
+		// (the loader still diffs at runtime); groundwork for minimal object emission.
+		string_map_set(&hm.fhash, p->name, content_hash);
+
+		// Hot-proc ABI guard (F8): the frozen host's call sites marshal the ORIGINAL
+		// signature into the patched-in body, so a hot proc's parameter/return types must
+		// not change across a reload. Record each hot proc's canonical signature hash in
+		// the manifest (base build); on a reload build reject any proc whose signature
+		// changed — mirrors the existing global type-hash guard.
+		if (p->type != nullptr) {
+			u64 sig_hash = type_hash_canonical_type(p->type);
+			if (hm.exists) {
+				u64 *prev = string_map_get(&hm.sig, p->name);
+				if (prev != nullptr && *prev != sig_hash) {
+					Token tok = (p->entity != nullptr) ? p->entity->token : empty_token;
+					error(tok, "hot-reload: procedure '%.*s' changed its signature (parameter/return types); the frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
+				}
+			}
+			string_map_set(&hm.sig, p->name, sig_hash);
+		}
 		LLVMValueRef fields[2] = {
 			LLVMConstInt(u64t, name_hash,    false),
 			LLVMConstInt(u64t, content_hash, false),
@@ -3508,6 +3560,44 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	LLVMSetGlobalConstant(tbl, true);
 	LLVMSetLinkage(tbl, LLVMExternalLinkage); // public: PDB-resolvable baseline in the exe
 	lb_append_to_used(m, tbl);                // survive DCE; the loader reads it by name
+}
+
+// Emit `__odin_hot_reload_build_id : u64` — a fingerprint of the exe's reload-relevant
+// layout (arena sizes + the original globals' and hot procs' canonical hashes). The same
+// value is baked into the exe (base build) and every reload object (read back from the
+// manifest), and the loader refuses a reload whose id differs from the running exe's — so a
+// stale object built against a since-rebuilt exe (arena relaid) is rejected instead of
+// silently corrupting memory at now-wrong arena offsets (F6). Call AFTER
+// `lb_hot_reload_emit_func_hashes` so the manifest's `sig` map is fully populated.
+gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
+	lbModule *m = &gen->default_module;
+	HotReloadManifest &hm = gen->hot_reload_manifest;
+
+	if (!hm.exists) {
+		// Base (exe) build: derive the id from the layout the reload contract depends on.
+		// Fold entries with commutative addition so the value is independent of map/thread
+		// iteration order (reproducible across separate base builds of the same source).
+		u64 id = 0;
+		id += 0x9E3779B97F4A7C15ull ^ cast(u64)hm.arena_size;
+		id += 0xC2B2AE3D27D4EB4Full ^ cast(u64)hm.tls_arena_size;
+		for (u32 idx = 0; idx < hm.orig.count; idx++) {
+			StringMapEntry<u64> const &e = hm.orig.entries[idx];
+			id += fnv64a(e.key.text, e.key.len) * 1099511628211ull + e.value;
+		}
+		for (u32 idx = 0; idx < hm.sig.count; idx++) {
+			StringMapEntry<u64> const &e = hm.sig.entries[idx];
+			id += (fnv64a(e.key.text, e.key.len) ^ 0xD6E8FEB86659FD93ull) * 1099511628211ull + e.value;
+		}
+		hm.build_id = id;
+	}
+	// Reload build: hm.build_id already holds the value read from the manifest (the exe's).
+
+	LLVMTypeRef u64t = lb_type(m, t_u64);
+	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_hot_reload_build_id");
+	LLVMSetInitializer(g, LLVMConstInt(u64t, hm.build_id, false));
+	LLVMSetGlobalConstant(g, true);
+	LLVMSetLinkage(g, LLVMExternalLinkage); // public: PDB-resolvable in the exe, defined in the object
+	lb_append_to_used(m, g);                // survive DCE; the loader reads it by name
 }
 
 gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
@@ -4364,6 +4454,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		// patches only procedures whose code actually changed (see lb_hot_reload_emit_func_hashes).
 		// Emitted here, after all procedures are generated, so every proc is included.
 		lb_hot_reload_emit_func_hashes(gen);
+
+		// Build-identity fingerprint (F6): baked into the exe and every reload object; the
+		// loader refuses a reload built against a different exe layout. Must run after
+		// func-hash emission so the manifest's `sig` map (folded into the id) is complete.
+		lb_hot_reload_emit_build_id(gen);
 
 		// Emit the once-only init descriptor table for new globals (file-scope and
 		// local `@(static)`) with constant initializers. Layout: { i64 count;

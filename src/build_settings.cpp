@@ -1060,12 +1060,13 @@ gb_internal bool is_excluded_target_filename(String name) {
 struct LibraryCollections {
 	String name;
 	String path;
+	bool   builtin; // true for Odin's shipped collections (base/core/vendor), false for user -collection
 };
 
 gb_global Array<LibraryCollections> library_collections = {0};
 
-gb_internal void add_library_collection(String name, String path) {
-	LibraryCollections lc = {name, string_trim_whitespace(path)};
+gb_internal void add_library_collection(String name, String path, bool builtin = false) {
+	LibraryCollections lc = {name, string_trim_whitespace(path), builtin};
 	array_add(&library_collections, lc);
 }
 
