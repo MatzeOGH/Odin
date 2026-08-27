@@ -112,6 +112,300 @@ New_Global_Init :: struct {
 	blob:         rawptr,
 }
 
+// One layout change discovered by diffing the exe's baked type-info (old) against
+// the reload object's freshly emitted type-info (new). `old` is the layout the
+// running program was built with (also what `type_info_of` returns in hot code);
+// `new` is the reloaded layout. A `@(post_patch_hook)` MUST reflect via `new`,
+// because `type_info_of` in hot code still resolves to the exe's old table.
+Type_Change :: struct {
+	old: ^runtime.Type_Info,
+	new: ^runtime.Type_Info,
+}
+
+// A `@(pre_patch_hook)` / `@(post_patch_hook)` procedure. Called by the loader with
+// the set of types whose layout changed this reload. Signature enforced by the
+// compiler (see check_decl.cpp).
+Patch_Hook :: #type proc(changed: []Type_Change)
+
+// One entry of the compiler-emitted `__odin_hot_reload_{pre,post}_patch_hooks` table
+// (src/llvm_backend.cpp): the exported SYMBOL NAME of a hook procedure. The loader
+// resolves the name itself — pre hooks against the exe (old code), post hooks against
+// the reloaded object (new code) — so a post hook need not be a patchable/hot proc.
+Patch_Hook_Entry :: struct {
+	name:     [^]u8,
+	name_len: i64,
+}
+
+// Layout of `__odin_hot_reload_{pre,post}_patch_hooks`: a count followed by that many
+// name entries.
+Patch_Hook_Table :: struct {
+	count:   i64,
+	entries: [0]Patch_Hook_Entry, // variable-length; `count` entries follow inline
+}
+
+// Number of hooks in the table at `tbl_addr` (nil = none).
+@(private)
+hr_hook_count :: proc(tbl_addr: rawptr) -> int {
+	if tbl_addr == nil {
+		return 0
+	}
+	return int((^Patch_Hook_Table)(tbl_addr).count)
+}
+
+// Call every hook named in the table at `tbl_addr` (nil = none) with `changed`,
+// resolving each name to a procedure address via `resolve` (PDB for pre hooks,
+// object-local for post hooks). A name that fails to resolve is skipped with a warning.
+@(private)
+hr_call_patch_hooks :: proc(tbl_addr: rawptr, changed: []Type_Change, resolve: proc(name: string, ctx: rawptr) -> rawptr, ctx: rawptr) {
+	if tbl_addr == nil {
+		return
+	}
+	tbl := (^Patch_Hook_Table)(tbl_addr)
+	entries := ([^]Patch_Hook_Entry)(uintptr(tbl_addr) + size_of(i64))
+	for i in 0 ..< int(tbl.count) {
+		e := entries[i]
+		name := string(e.name[:e.name_len])
+		addr := resolve(name, ctx)
+		if addr == nil {
+			fmt.eprintfln("[hot] could not resolve patch hook %q; skipping", name)
+			continue
+		}
+		hook := (Patch_Hook)(addr)
+		hook(changed)
+	}
+}
+
+// The compiler publishes `[]^runtime.Type_Info` under this name in both the exe and
+// every reload object (src/llvm_backend_type.cpp) — the same backing giant array the
+// runtime `type_table` slices, but externally named so the loader can resolve the
+// exe's copy (old layouts, via the PDB) and the object's copy (new layouts).
+HR_TYPE_INFOS_SYM :: "__odin_hot_reload_type_infos"
+
+// True iff `a` (old) and `b` (new) describe the same NAMED type but a changed layout.
+// Catches: size change; struct field add / remove / reorder / rename (compares each
+// field's name + offset); enum constant add / remove / reorder / rename / re-value
+// (compares each name + value); and a kind change (e.g. struct -> enum) at the same
+// size. // ponytail: unions/bit-sets still fall back to size only — extend if needed.
+@(private)
+hr_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
+	ba := runtime.type_info_base(a)
+	bb := runtime.type_info_base(b)
+	if ba == nil || bb == nil {
+		return false
+	}
+	if ba.size != bb.size {
+		return true
+	}
+
+	sa, a_struct := ba.variant.(runtime.Type_Info_Struct)
+	sb, b_struct := bb.variant.(runtime.Type_Info_Struct)
+	if a_struct != b_struct { // one is a struct, the other isn't: incompatible kind
+		return true
+	}
+	if a_struct && b_struct {
+		if sa.field_count != sb.field_count {
+			return true
+		}
+		for i in 0 ..< int(sa.field_count) {
+			if sa.names[i] != sb.names[i] || sa.offsets[i] != sb.offsets[i] {
+				return true
+			}
+		}
+		return false
+	}
+
+	ea, a_enum := ba.variant.(runtime.Type_Info_Enum)
+	eb, b_enum := bb.variant.(runtime.Type_Info_Enum)
+	if a_enum != b_enum {
+		return true
+	}
+	if a_enum && b_enum {
+		if len(ea.names) != len(eb.names) {
+			return true
+		}
+		for i in 0 ..< len(ea.names) {
+			if ea.names[i] != eb.names[i] || ea.values[i] != eb.values[i] {
+				return true
+			}
+		}
+		return false
+	}
+
+	ua, a_union := ba.variant.(runtime.Type_Info_Union)
+	ub, b_union := bb.variant.(runtime.Type_Info_Union)
+	if a_union != b_union {
+		return true
+	}
+	if a_union && b_union {
+		if len(ua.variants) != len(ub.variants) || ua.tag_offset != ub.tag_offset {
+			return true
+		}
+		// Variant identity by name, order-sensitive: catches reorder / add / remove /
+		// replace (any of which shifts the tag value a live union stores).
+		for i in 0 ..< len(ua.variants) {
+			na, _ := ua.variants[i].variant.(runtime.Type_Info_Named)
+			nb, _ := ub.variants[i].variant.(runtime.Type_Info_Named)
+			if hr_qualified_name(na) != hr_qualified_name(nb) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return false // same size, same (other) kind: treat as unchanged for the first pass
+}
+
+// Read a `[]^runtime.Type_Info` published at `tbl_addr` (nil = none).
+@(private)
+hr_read_type_infos :: proc(tbl_addr: rawptr) -> []^runtime.Type_Info {
+	if tbl_addr == nil {
+		return nil
+	}
+	return (^[]^runtime.Type_Info)(tbl_addr)^
+}
+
+@(private)
+hr_qualified_name :: proc(named: runtime.Type_Info_Named) -> string {
+	return fmt.tprintf("%s.%s", named.pkg, named.name)
+}
+
+// The exe's named types indexed by package-qualified name. The exe never changes across
+// reloads, so this is built once and reused (the map + its keys live for the process).
+@(private) hr_exe_types_cache: map[string]^runtime.Type_Info
+@(private) hr_exe_types_built: bool
+
+@(private)
+hr_exe_types_by_name :: proc() -> map[string]^runtime.Type_Info {
+	if hr_exe_types_built {
+		return hr_exe_types_cache
+	}
+	hr_exe_types_built = true
+	old_tis := hr_read_type_infos(hr_resolve_pdb(HR_TYPE_INFOS_SYM))
+	// Qualified-name keys are strdup'd so they don't alias the temp allocator.
+	hr_exe_types_cache = make(map[string]^runtime.Type_Info)
+	for ti in old_tis {
+		if ti == nil { continue }
+		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
+			key := strings.clone(hr_qualified_name(named))
+			hr_exe_types_cache[key] = ti
+		}
+	}
+	return hr_exe_types_cache
+}
+
+// Diff the reloaded object's freshly emitted type-info (new layout) against the exe's
+// baked type-info (old layout) and return one `Type_Change` per NAMED type whose layout
+// differs. `old` comes from the exe (also what hot-code `type_info_of` returns); `new`
+// comes from the object, so a post-patch hook can reflect the real new layout. The slice
+// is allocated with `context.allocator` (it must outlive the user's pre-patch hook); the
+// caller deletes it.
+@(private)
+hr_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> []Type_Change {
+	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, HR_TYPE_INFOS_SYM)
+	new_tis := hr_read_type_infos(new_addr)
+	if len(new_tis) == 0 {
+		return nil
+	}
+	old_by_name := hr_exe_types_by_name()
+	if len(old_by_name) == 0 {
+		return nil
+	}
+
+	// Pass 1: the DIRECTLY changed set — every new named type whose OWN layout differs.
+	direct := make(map[string]bool, context.temp_allocator)
+	for ti in new_tis {
+		if ti == nil { continue }
+		named, ok := ti.variant.(runtime.Type_Info_Named)
+		if !ok { continue }
+		q := hr_qualified_name(named)
+		if old_ti, found := old_by_name[q]; found && hr_layout_differs(old_ti, ti) {
+			direct[q] = true
+		}
+	}
+
+	// Pass 2: flag a type if it, or anything it embeds BY VALUE, changed — so a struct
+	// holding a nested enum/union that changed in place (its own size/offsets unchanged)
+	// is still migrated. `memo` avoids re-walking shared subgraphs.
+	memo := make(map[rawptr]bool, context.temp_allocator)
+	changes := make([dynamic]Type_Change, context.allocator)
+	for ti in new_tis {
+		if ti == nil { continue }
+		named, ok := ti.variant.(runtime.Type_Info_Named)
+		if !ok { continue }
+		old_ti, found := old_by_name[hr_qualified_name(named)]
+		if !found { continue } // brand-new type: nothing to migrate from
+		if hr_contains_changed(ti, direct, &memo) {
+			append(&changes, Type_Change{old = old_ti, new = ti})
+		}
+	}
+	return changes[:]
+}
+
+// True if `ti` (when named) is itself directly changed, or if any type it embeds BY
+// VALUE (struct fields, array/enumerated-array elements, union variants) transitively is.
+// Indirections (pointers, slices, dynamic arrays, maps) are NOT followed — their bytes
+// are a fixed-size handle, so a change behind them does not shift `ti`'s layout. By-value
+// embedding is acyclic in Odin, so this terminates; `memo` just prevents rework.
+@(private)
+hr_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[string]bool, memo: ^map[rawptr]bool) -> bool {
+	if ti == nil {
+		return false
+	}
+	if v, ok := memo[ti]; ok {
+		return v
+	}
+	memo[ti] = false // guard (by-value graph is acyclic; this is just belt-and-suspenders)
+
+	result := false
+	if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
+		if direct[hr_qualified_name(named)] {
+			result = true
+		}
+	}
+
+	base := runtime.type_info_base(ti)
+	#partial switch b in base.variant {
+	case runtime.Type_Info_Struct:
+		for i in 0 ..< int(b.field_count) {
+			if hr_contains_changed(b.types[i], direct, memo) { result = true }
+		}
+	case runtime.Type_Info_Array:
+		if hr_contains_changed(b.elem, direct, memo) { result = true }
+	case runtime.Type_Info_Enumerated_Array:
+		if hr_contains_changed(b.elem, direct, memo) { result = true }
+	case runtime.Type_Info_Union:
+		for variant in b.variants {
+			if hr_contains_changed(variant, direct, memo) { result = true }
+		}
+	}
+
+	memo[ti] = result
+	return result
+}
+
+@(private)
+hr_resolve_pre_hook :: proc(name: string, ctx: rawptr) -> rawptr {
+	return hr_resolve_pdb(name)
+}
+
+@(private)
+hr_resolve_post_hook :: proc(name: string, ctx: rawptr) -> rawptr {
+	o := (^Hr_Obj_Ref)(ctx)
+	addr, _ := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, name)
+	return addr
+}
+
+// The parsed reload object, threaded to the post-hook resolver so it can look up each
+// post hook's object-local (fresh) copy by name.
+@(private)
+Hr_Obj_Ref :: struct {
+	data:          []byte,
+	sym_off:       int,
+	n_syms:        int,
+	strtab_off:    int,
+	section_bases: []rawptr,
+}
+
 // Reload `obj_path` into this running process, patching every `@(hot_reload)`
 // procedure to its fresh implementation. The set of procedures to patch is
 // discovered structurally from the running exe (see `hr_is_hot_entry`), so the
@@ -423,6 +717,21 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 	}
 
+	// 3.6) If any pre/post-patch hook exists, diff the reloaded object's freshly
+	//      emitted type-info against the exe's baked type_table to find every type whose
+	//      layout changed, then fire the autowired pre-patch hooks — OLD code (resolved
+	//      from the exe by name), while the running state is still laid out the old way,
+	//      so a hook can serialize it. Skip the diff entirely when there are no hooks.
+	obj_ref := Hr_Obj_Ref{data, sym_off, n_syms, strtab_off, section_bases}
+	pre_tbl := hr_resolve_pdb("__odin_hot_reload_pre_patch_hooks")
+	post_tbl, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_post_patch_hooks")
+	changed: []Type_Change
+	if hr_hook_count(pre_tbl) > 0 || hr_hook_count(post_tbl) > 0 {
+		changed = hr_build_type_changes(data, sym_off, n_syms, strtab_off, section_bases)
+	}
+	defer delete(changed) // outlives the pre hook; freed after the post hook
+	hr_call_patch_hooks(pre_tbl, changed, hr_resolve_pre_hook, nil)
+
 	// 4) Patch each discovered hot procedure's running entry to jump to its fresh code.
 	//    `hot_names` were collected in step 2 (an exe symbol whose entry is the
 	//    patchable hot-patch prologue). Resolve every original (exe, via the PDB) and
@@ -492,7 +801,17 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 	}
 	hr_resume(handles)
-	return patched == len(targets)
+	if patched != len(targets) {
+		return false
+	}
+
+	// 5) Fire the autowired post-patch hooks — NEW code: each is resolved to its
+	//    OBJECT-LOCAL (fresh) copy by name, so an ordinary exported proc works (no hot
+	//    prefix needed). A hook here allocates the new layout and deserializes what a
+	//    pre-patch hook saved. Reflecting the new layout requires `change.new` (not
+	//    `type_info_of`, which in hot code still gives the exe's old layout).
+	hr_call_patch_hooks(post_tbl, changed, hr_resolve_post_hook, &obj_ref)
+	return true
 }
 
 // Find a defined function symbol by name and return its runtime address in the

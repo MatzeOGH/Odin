@@ -317,6 +317,8 @@ struct Entity {
 			bool    is_objc_impl_or_import     : 1;
 			bool    is_objc_class_method       : 1;
 			bool    is_hot_reload              : 1;
+			bool    is_pre_patch_hook          : 1;
+			bool    is_post_patch_hook         : 1;
 		} Procedure;
 		struct {
 			bool is_asm_group;

@@ -3356,6 +3356,57 @@ gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	}
 }
 
+// Emit `sym_name : { i64 count; { i8* name; i64 name_len }[count] }` listing the
+// EXPORTED SYMBOL NAME of every procedure flagged `want_pre`/`want_post` (a
+// @(pre_patch_hook)/@(post_patch_hook)). The same table is baked into the exe and
+// every reload object. The loader resolves each name itself — pre-patch hooks against
+// the running exe (old code), post-patch hooks against the reloaded object (new code,
+// its fresh copy). Storing names rather than pointers means a post hook does NOT need
+// to be a patchable/hot procedure to reach its fresh copy: `find_symbol_address` on the
+// object returns the object-local definition directly. Force-kept by name.
+gb_internal void lb_hot_reload_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
+	lbModule *m = &gen->default_module;
+	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
+	LLVMTypeRef i64t = lb_type(m, t_i64);
+	LLVMTypeRef entry_field_types[2] = { ptrt, i64t };
+	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 2, false);
+
+	auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, 8);
+	for (Entity *e : info->entities) {
+		if (e->kind != Entity_Procedure) {
+			continue;
+		}
+		bool match = want_pre ? e->Procedure.is_pre_patch_hook : e->Procedure.is_post_patch_hook;
+		if (!match) {
+			continue;
+		}
+		lbValue fn = lb_find_value_from_entity(m, e);
+		if (fn.value == nullptr) {
+			continue;
+		}
+		size_t name_len = 0;
+		char const *name_c = LLVMGetValueName2(fn.value, &name_len);
+		String name = make_string(cast(u8 const *)name_c, cast(isize)name_len);
+		LLVMValueRef name_ptr = LLVMConstPointerCast(lb_find_or_add_entity_string_ptr(m, name, false), ptrt);
+		LLVMValueRef fields[2] = { name_ptr, LLVMConstInt(i64t, cast(u64)name_len, false) };
+		array_add(&entry_vals, LLVMConstStructInContext(m->ctx, fields, 2, false));
+	}
+
+	LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entry_vals.count);
+	LLVMValueRef arr = LLVMConstArray(entry_t, entry_vals.data, cast(unsigned)entry_vals.count);
+	LLVMTypeRef tbl_field_types[2] = { i64t, arr_t };
+	LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
+	LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
+	LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
+
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, sym_name);
+	LLVMSetInitializer(tbl, tbl_val);
+	LLVMSetGlobalConstant(tbl, true);
+	// External + llvm.used so it survives linker DCE and lands in the exe's PDB.
+	LLVMSetLinkage(tbl, LLVMExternalLinkage);
+	lb_append_to_used(m, tbl);
+}
+
 gb_internal bool lb_generate_code(lbGenerator *gen) {
 	TIME_SECTION("LLVM Initializtion");
 
@@ -4068,6 +4119,12 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	if (build_context.hot_reload) {
 		TIME_SECTION("LLVM Hot Reload Support Symbols");
 		lb_hot_reload_emit_support(gen);
+
+		// Autowired pre/post-patch hooks (Live++-style). Baked into the exe and every
+		// reload object; the loader calls the pre set (from the exe) before patching
+		// and the post set (from the object) after, passing the changed-type set.
+		lb_hot_reload_emit_patch_hook_table(gen, info, true,  "__odin_hot_reload_pre_patch_hooks");
+		lb_hot_reload_emit_patch_hook_table(gen, info, false, "__odin_hot_reload_post_patch_hooks");
 
 		// Emit the once-only init descriptor table for new globals (file-scope and
 		// local `@(static)`) with constant initializers. Layout: { i64 count;

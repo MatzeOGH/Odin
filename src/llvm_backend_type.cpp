@@ -1156,4 +1156,20 @@ gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup typ
 
 	// force it to be constant
 	LLVMSetGlobalConstant(global_type_table.value, true);
+
+	if (build_context.hot_reload) {
+		// The hot-reload loader needs both the exe's (old) and the reload object's
+		// (new) type-info tables to diff struct layouts across a reload. `runtime.type_table`
+		// itself is an internal symbol whose PDB name is awkward to resolve, so publish a
+		// dedicated `[]^Type_Info` slice under a fixed, external name — same backing giant
+		// array, findable by name in the exe's PDB and in the reload object's symbols. The
+		// giant array is a private (anonymous) global referenced section-relative, so the
+		// object's copy stays object-local (new layouts) rather than being reused from the exe.
+		Type *slice_type = type_deref(global_type_table.type);
+		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_hot_reload_type_infos");
+		LLVMSetInitializer(tbl, slice);
+		LLVMSetGlobalConstant(tbl, true);
+		LLVMSetLinkage(tbl, LLVMExternalLinkage);
+		lb_append_to_used(m, tbl);
+	}
 }

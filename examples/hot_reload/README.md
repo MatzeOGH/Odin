@@ -185,6 +185,58 @@ exit 0 = PASS).
   (`rl.GetRandomValue`), resolved via the exe's PDB.
 - The loader itself now ships as **`core:sys/hot_reload`** (no longer copied here).
 
+## Reacting to struct layout changes (pre/post-patch hooks)
+
+A reload can also **change the layout of a struct the running program holds** — add,
+remove, reorder or rename a field. New code addresses fields at new offsets, so live
+state laid out the old way must be migrated. This mirrors Live++'s
+`LPP_HOTRELOAD_PREPATCH_HOOK` / `POSTPATCH_HOOK`:
+
+- Mark a proc `@(pre_patch_hook)` or `@(post_patch_hook)`. The loader **autowires**
+  them — no registration call. Signature: `proc(changed: []hot_reload.Type_Change)`.
+- Before patching, the loader diffs the reloaded object's type-info against the exe's
+  and calls every pre hook (running the **old** code) with the set of types whose
+  layout changed. After patching it calls every post hook (running the **new** code)
+  with the same set. Each `Type_Change` carries the `old` and `new` `^runtime.Type_Info`.
+- Serialization is entirely yours: a pre hook serializes the live state, a post hook
+  rebuilds it in the new layout. Reflect the destination via `change.new` — in hot
+  code `type_info_of(T)` still resolves to the exe's **old** table.
+
+The diff compares each named type by package-qualified name and reports it changed on a
+size change, a struct field add/remove/reorder/rename, an enum constant add/remove/
+reorder/re-value, a union variant add/remove/reorder, or a kind change — and it flags a
+type **transitively**, so a struct is reported when any type it embeds by value (a nested
+enum/union/struct) changed in place even though the struct's own size is unchanged. The
+exe side of the diff is cached (the exe never changes across reloads).
+
+Four self-driving tests:
+
+```
+powershell -ExecutionPolicy Bypass -File examples\hot_reload\migrate\run_migrate_test.ps1
+powershell -ExecutionPolicy Bypass -File examples\hot_reload\migrate_enum\run_migrate_enum_test.ps1
+powershell -ExecutionPolicy Bypass -File examples\hot_reload\migrate_full\run_migrate_full_test.ps1
+powershell -ExecutionPolicy Bypass -File examples\hot_reload\hook_test\run_hook_test.ps1
+```
+
+- `migrate/` — the reload inserts a field at the front of `State` (shifting every
+  offset); a name-keyed reflection serializer (`migrate/serializer.odin`) migrates the
+  survivors to their new offsets while the new field zeroes.
+- `migrate_enum/` — `State`'s own layout is unchanged; only a `u8`-backed enum it holds
+  re-orders. Exercises transitive flagging plus a non-`int` enum remapped by name.
+- `migrate_full/` — one reload that adds, renames (via an `fs:"..."` alias), reorders and
+  removes struct fields, re-orders an enum's constants, **and** re-orders a union's
+  variants; asserts every survivor is migrated by name (enum and union value remapped by
+  name, not raw-copied).
+- `hook_test/` — asserts the hooks autowire, that the pre hook runs old code and the post
+  hook new code, and that the diff reports exactly the changed types (a changed struct, a
+  same-size enum, a same-size union, and a struct flagged only transitively).
+
+Hooks are resolved by exported name — pre hooks against the exe (old code), post hooks
+against the reloaded object (its fresh copy) — so a post hook is an ordinary exported
+proc, not a patchable/hot one. Serializer caveat: the vendored reflection serializer
+handles value types only (no maps/dynamic-arrays/pointers across a reload — keep those
+out of migrated state), and the diff still compares bit-sets by size alone.
+
 ## Compiler / library changes this depends on
 
 - `@(hot_reload)` procedure attribute — `src/checker.{hpp,cpp}`, `src/entity.cpp`,
@@ -198,4 +250,10 @@ exit 0 = PASS).
   `type_info` resolution (`src/llvm_backend_type.cpp`, `lb_type_info` →
   `__type_info_of`).
 - `core:sys/hot_reload` — the COFF loader/relocator/patcher + `apply`.
+- `@(pre_patch_hook)` / `@(post_patch_hook)` attributes + emitted hook-name tables
+  (`__odin_hot_reload_{pre,post}_patch_hooks`, storing each hook's exported symbol name):
+  `src/checker.{hpp,cpp}`, `src/check_decl.cpp`, `src/entity.cpp`, `src/llvm_backend.cpp`;
+  the new-layout type table (`__odin_hot_reload_type_infos`) in `src/llvm_backend_type.cpp`;
+  `Type_Change`, the object-vs-exe type-info diff, and by-name hook dispatch in
+  `core/sys/hot_reload/hot_reload.odin`.
 - `FlushInstructionCache` binding — `core/sys/windows/kernel32.odin`.

@@ -137,6 +137,8 @@ struct AttributeContext {
 	bool    fini                  : 1;
 	bool    set_cold              : 1;
 	bool    hot_reload            : 1;
+	bool    pre_patch_hook        : 1;
+	bool    post_patch_hook       : 1;
 	bool    entry_point_only      : 1;
 	bool    instrumentation_enter : 1;
 	bool    instrumentation_exit  : 1;

@@ -1348,6 +1348,22 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 		// ac.is_export so the normal export path applies (it is consumed below).
 		ac.is_export = true;
 	}
+	if (ac.pre_patch_hook || ac.post_patch_hook) {
+		if (!build_context.hot_reload) {
+			error(e->token, "@(pre_patch_hook)/@(post_patch_hook) require building with -hot-reload");
+		}
+		// The hot-reload loader calls these by their exported symbol (pre from the
+		// running exe, post from the reloaded object), so force a stable, unmangled
+		// name. Expected shape: proc(changed: []hot_reload.Type_Change) — a single
+		// slice parameter, no results. The loader casts the resolved address to this
+		// type, so an odd signature would mis-call; check it loosely here.
+		ac.is_export = true;
+		if (pt->param_count != 1 || pt->result_count != 0) {
+			error(e->token, "a @(pre_patch_hook)/@(post_patch_hook) procedure must take one parameter (a []hot_reload.Type_Change slice) and return nothing");
+		}
+		if (ac.pre_patch_hook)  e->Procedure.is_pre_patch_hook  = true;
+		if (ac.post_patch_hook) e->Procedure.is_post_patch_hook = true;
+	}
 	e->Procedure.optimization_mode = cast(ProcedureOptimizationMode)ac.optimization_mode;
 
 	check_objc_methods(ctx, e, ac);

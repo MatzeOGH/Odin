@@ -4160,6 +4160,18 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 			}
 		}
 		return true;
+	} else if (name == "pre_patch_hook") {
+		if (value != nullptr) {
+			error(elem, "'%.*s' does not take a value", LIT(name));
+		}
+		ac->pre_patch_hook = true;
+		return true;
+	} else if (name == "post_patch_hook") {
+		if (value != nullptr) {
+			error(elem, "'%.*s' does not take a value", LIT(name));
+		}
+		ac->post_patch_hook = true;
+		return true;
 	} else if (name == "optimization_mode") {
 		ExactValue ev = check_decl_attribute_value(c, value);
 		if (ev.kind == ExactValue_String) {

@@ -412,6 +412,68 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   validated before the first write (so a renamed/removed hot proc aborts cleanly with nothing
   applied), but there is no rollback if a write fails partway through the batch.
 
+## Type-migration gaps (pre/post-patch hooks + reflection migration)
+
+The `@(pre_patch_hook)`/`@(post_patch_hook)` + name-keyed reflection serializer path
+(diff in `core/sys/hot_reload/hot_reload.odin`: `hr_layout_differs` / `hr_contains_changed` /
+`hr_build_type_changes`; serializer in `examples/hot_reload/migrate/serializer.odin`, copied
+into `migrate_full/` and `migrate_enum/`) is scoped to **simple layout changes of a single,
+self-contained value struct you hold by pointer**. Everything below is outside that scope.
+
+### Detection gaps — changes the diff will not flag
+- **Same-size field-type substitution** (`x: i32 → x: f32`, or `x: Foo → x: Bar` at the same
+  size/offset/name). `hr_layout_differs` compares struct fields by name + offset only (not
+  type), and transitive flagging fires only on a *changed named type* — `i32`/`f32` are each
+  unchanged in themselves. The struct is not flagged **and** the serializer raw-copies the
+  bytes → **silent corruption**.
+- **Type rename or move to another package.** The diff keys on package-qualified name and has
+  no type-level alias (`fs` is field-level). Old name looks removed, new name brand-new → not
+  migrated (field zeroes).
+- **Bit-sets** are still compared by size alone (a same-size underlying-enum reorder is missed).
+- **Qualified-name collision** — two distinct `pkg.Name` types (local types in different procs,
+  generic instantiations) can mispair; `change.old` is then wrong (the serializer ignores it,
+  but a hook reading it is misled).
+- **Anonymous (unnamed) types** are never reported — only named types are.
+
+### Migration gaps — changes the serializer will not handle even when flagged
+- **Enum value with no matching saved constant** (a raw/out-of-range integer or bit-flags stored
+  in an enum) → `saved_field` stays nil → **nil-deref crash**. Cheapest fixable sharp edge.
+- **`#no_nil` unions** — `if src_tag == 0 do break` treats tag 0 as nil, but for `#no_nil` tag 0
+  is a real variant, so that variant is skipped. Cheap to fix (check union flags).
+- **Pointers / slices / dynamic arrays / maps / cstring / procs** — raw-copied as a handle, never
+  followed. The pointee graph is not migrated; if a pointee's type changed the handle points at
+  old-layout bytes read as new → corruption; owned heap **leaks or dangles**.
+- **Type-incompatible field reuse** (kind mismatch after a name match) falls back to
+  `mem.copy(min(size))` → garbage.
+- **Bit-fields, SOA, matrix/complex/quaternion/simd, and enum/tag backing sizes other than
+  1/2/4/8** are not in the handled variant set → raw copy (fine if unchanged, garbage if changed).
+
+### Architectural gaps — by design of this first pass
+- **No instance enumeration.** The system reports which *types* changed, not which *objects*
+  exist. Finding and migrating **every** live instance of a changed type (entity arrays, nested
+  owners) is entirely the hook's job — there is no object registry. This is the largest practical
+  gap versus a real engine's migration.
+- **Reference invalidation.** The post-hook allocates a new object and swaps one pointer; every
+  other `^T` held elsewhere (other globals, stacks, other threads) dangles against the freed old
+  object.
+- **No semantic migration.** Byte-by-name only: it cannot convert units (`f32` degrees→radians),
+  give a new field a non-zero default, salvage a removed field's data, or re-establish cross-field
+  invariants. All such fix-up must be manual in the hook body.
+- **Not coordinated with other threads** touching the state during pre/post (the *patch* is
+  thread-safe; the *migration* is not).
+- **Ownership/allocator** of the new object is the hook's `context.allocator`; arenas and owned
+  resources are the user's responsibility.
+
+### Severity / fixability
+| Gap | Effect | Cheap fix? |
+|---|---|---|
+| Enum value with no matching constant | crash (nil deref) | yes — guard, fall back to raw/zero |
+| `#no_nil` union tag-0 | wrong variant migrated | yes — check union flags |
+| Same-size field-type substitution | silent corruption | no — needs deep field-type compare + conversion |
+| Type rename / move | field lost | medium — a type-level alias |
+| Pointers/maps not followed | dangling / leak / corruption | no — inherent to reflection migration |
+| Instance enumeration / ref invalidation | unmigrated or dangling objects | no — needs an object-registry design |
+
 ## Adversarial review findings (PDB-resolver refactor)
 
 Full findings from the adversarial review of the PDB-based refactor (dropping the baked
