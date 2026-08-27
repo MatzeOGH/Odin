@@ -2445,14 +2445,8 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 
 		String mangled_name = {};
 		if (hot_reload) {
-			// Source-stable, collision-free key: `<proc>$static$<var>[$<occ>]`.
-			// Unlike the entity-id mangling below, this is reproducible across
-			// builds and across a reload (entity ids are assigned by a global
-			// atomic during multithreaded checking), so the loader can match a
-			// reload object's static against the exe's preserved copy by name.
-			// `<occ>` disambiguates the rare case of two identically named statics
-			// in one procedure (nested scopes) and is stable to adding or removing
-			// *other* statics.
+			// Source-stable, collision-free key `<proc>$static$<var>[$<occ>]` so the loader
+			// can match a static by name across a reload. See tech_design.md §4.
 			u32 *cnt = string_map_get(&p->hot_reload_static_counts, name);
 			u32 occ = cnt ? *cnt : 0;
 			string_map_set(&p->hot_reload_static_counts, name, occ + 1);
@@ -2473,25 +2467,14 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			mangled_name.len = gb_string_length(str);
 		}
 
-		// Hot reload: classify original (preserved, resolved to the exe's live copy)
-		// vs new (redirected into the persistent arena). Mirrors the file-scope
-		// global fork in lb_generate_code. Procedure codegen is sequential under
-		// -hot-reload (single module), but the mutex keeps this correct regardless.
-		//
-		// Thread-local statics take a separate path: they cannot be arena-backed
-		// (their storage is per-thread, reached via `_tls_index` + a SECREL offset).
-		// An original one is preserved via a TLS accessor (collected after emission
-		// below); a new one cannot fit the exe's frozen TLS block, so it errors.
+		// Hot reload: classify original (preserved) vs new (arena) vs refresh, mirroring the
+		// file-scope global fork in lb_generate_code. See tech_design.md §4, §5, §10.
 		if (hot_reload) {
 			u64 th = type_hash_canonical_type(e->type);
 			HotReloadManifest &hm = gen->hot_reload_manifest;
 
-			// Immutable embedded data (@(rodata) / `#load` / `#hash` / `#load_hash`):
-			// re-provided fresh each reload rather than preserved. Kept a normal global
-			// (never arena-backed) and recorded so the loader repoints the exe's copy at the
-			// reload's data (see file-scope fork). (`#load_directory` is excluded here: unlike
-			// the file-scope loop it is not baked to a const initializer for a local
-			// @(static), so its storage would be zero.)
+			// Immutable embedded data (@(rodata) / #load / #hash / #load_hash): refreshed, not
+			// preserved. (#load_directory excluded: not baked to a const for a local @(static).)
 			String init_dir = vd->values.count > 0 ? lb_call_basic_directive_name(vd->values[i]) : str_lit("");
 			bool is_refresh = e->Variable.is_rodata ||
 			                  init_dir == "load" || init_dir == "hash" || init_dir == "load_hash";
@@ -2512,16 +2495,11 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 					is_new = true;
 				}
 			} else {
-				// Base (exe) build: record it as an original for later reloads.
-				string_map_set(&hm.orig, mangled_name, th);
+				string_map_set(&hm.orig, mangled_name, th); // base build: record as original
 			}
 
 			if (is_thread_local && is_new) {
-				// Brand-new thread-local static introduced by this reload -> per-thread
-				// TLS arena (same as a new file-scope thread-local): access is a GEP into
-				// the arena's thread_local symbol, so the loader's SECREL handler resolves
-				// it to the exe's TLS block. Odin thread-locals cannot have initializers
-				// (checker rule), so this is always zero-init and the arena is zeroed.
+				// New thread-local static -> per-thread TLS arena. See tech_design.md §5.
 				i64 offset = 0;
 				HotReloadNewEntry *ne = string_map_get(&hm.tls_newg, mangled_name);
 				if (ne != nullptr) {
@@ -2550,14 +2528,9 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				continue;
 			} else if (is_thread_local) {
 				mutex_unlock(&gen->hot_reload_mutex);
-				// Original thread-local static: fall through to normal emission; it is
-				// collected into hot_reload_tls_syms after the global is created below.
+				// Original thread-local static: normal emission; collected into tls_syms below.
 			} else if (is_new && !is_refresh) {
-				// Brand-new static introduced by this reload -> arena, so its state
-				// survives every subsequent reload (a reload object is remapped, so
-				// an object-local copy would reset each time). Immutable-data statics are
-				// excluded (is_refresh): they fall through to normal object-local emission
-				// and are re-provided fresh each reload instead of persisted.
+				// New static -> arena, so its state survives reloads. See tech_design.md §4.
 				if (is_type_any(e->type)) {
 					error(e->token, "hot-reload: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
 				}
@@ -2607,11 +2580,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				continue;
 			} else {
 				mutex_unlock(&gen->hot_reload_mutex);
-				// Fall through to normal emission under the stable name. An ORIGINAL
-				// non-thread-local static resolves to the exe's copy (preserved, or
-				// repointed by the loader if it is immutable data); a NEW immutable-data
-				// static (is_new && is_refresh) lands here too and is emitted object-local,
-				// resolved fresh each reload.
+				// Normal emission: original static -> exe's copy; new refresh static -> object-local.
 			}
 		}
 
@@ -2666,11 +2635,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 		lb_add_member(p->module, mangled_name, global_val);
 
 		if (hot_reload && is_thread_local) {
-			// A thread-local original static needs a TLS accessor emitted so the loader
-			// can resolve SECREL references to the exe's TLS block; record it. A plain
-			// (non-TLS) original static needs nothing recorded — the loader resolves a
-			// reload object's reference to the exe copy by name via the PDB. New statics
-			// are handled above (arena / error) and never reach here.
+			// Original thread-local static: record for a TLS accessor. See tech_design.md §5.
 			MUTEX_GUARD(&gen->hot_reload_mutex);
 			lbHotReloadStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type), p->module};
 			array_add(&gen->hot_reload_tls_syms, s);

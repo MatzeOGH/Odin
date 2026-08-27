@@ -3224,12 +3224,8 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 	thread_pool_wait();
 
 	if (build_context.hot_reload && !build_context.no_rtti) {
-		// Hot reload: a reloaded procedure may reflect on (fmt/any/type_info_of)
-		// ANY type in the program, not just the subset this build happens to use for
-		// RTTI. Emit type_info for every declared entity's type (and, recursively,
-		// the types those reference) so the exe's `type_table` is complete and
-		// hot-code reflection over composite/user types resolves against it. Also
-		// fold in each decl's already-collected type_info_deps.
+		// Hot reload: emit type_info for every entity's type so hot-code reflection over any
+		// type resolves against the exe's complete type_table. See tech_design.md §9.
 		for (Entity *e : c->info.entities) {
 			if (e == nullptr || e->type == nullptr) {
 				continue;
@@ -4149,8 +4145,7 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 		}
 		return true;
 	} else if (name == "no_hot_reload") {
-		// Under -hot-reload every eligible procedure is made hot-patchable automatically;
-		// this opts a specific procedure OUT (keeps it inlinable/optimized and unpatched).
+		// Opt a procedure out of auto hot-patchability. See tech_design.md §7.
 		if (value == nullptr) {
 			ac->no_hot_reload = true;
 		} else {

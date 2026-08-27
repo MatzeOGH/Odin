@@ -308,13 +308,7 @@ try_cross_linking:;
 			}
 
 			if (build_context.hot_reload) {
-				// /OPT:NOICF stops the linker folding identical functions, which would
-				// break per-procedure patching (two procs sharing one body could not be
-				// patched independently). The pre-function pad the atomic patcher needs is
-				// emitted by the compiler itself (patchable-function-prefix, see
-				// llvm_backend_proc.cpp), so it is linker-independent and needs no
-				// /FUNCTIONPADMIN here. (The /OPT:REF vs NOREF choice is made below via
-				// `opt_ref`, so it overrides the linker templates' hardcoded /opt:ref.)
+				// /OPT:NOICF: no function folding, so procs patch independently. See tech_design.md §12.
 				link_settings = gb_string_append_fmt(link_settings, " /OPT:NOICF");
 			}
 
@@ -336,14 +330,8 @@ try_cross_linking:;
 				lld_lto_flags = gb_string_append_fmt(lld_lto_flags, "/opt:lldltojobs=%d ", build_context.thread_count);
 			}
 
-			// Under -hot-reload use /opt:noref so functions the base source never
-			// referenced — chiefly members of already-linked static libraries
-			// (e.g. vendor:raylib) — stay in the image, so a reload can call a
-			// foreign-library procedure the base never used and the loader can resolve it
-			// via the exe's PDB. (Odin procs/globals the base doesn't use are still dead-
-			// code-eliminated at the LLVM level, which the dropped baked table re-enabled;
-			// this only keeps linker-visible library members. Add /WHOLEARCHIVE:<lib> to
-			// also pull a member the base never touched at all.)
+			// Under -hot-reload use /opt:noref so unreferenced static-library members stay in
+			// the image for a reload to call via the PDB. See tech_design.md §12.
 			char const *opt_ref = build_context.hot_reload ? "/opt:noref" : "/opt:ref";
 
 			switch (build_context.linker_choice) {

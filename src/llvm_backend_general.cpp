@@ -56,17 +56,8 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	Checker *c = m->checker;
 	m->info = &c->info;
 
-	// Per-module optimization level. Normally every module uses the global level. Under
-	// -hot-reload the split is FIXED regardless of the global -o flag: the standard-library
-	// collections (base/core/vendor) are never hot-patched, so build them optimized/inlined
-	// at -o:2, while everything the user can edit — user packages, the default/metadata
-	// module, polymorphic/equal modules — is pinned to -o:none so it stays noinline +
-	// patchable + full-debug and, crucially, so the base exe and every reload object compile
-	// user code identically no matter what -o the user passed (a mismatch would diverge the
-	// change-detection IR hashes and reference core procs the base inlined away). So -o:speed/
-	// -o:size still get an optimized stdlib but keep user code reloadable. (This relies on
-	// separate modules, which -hot-reload forces on — see init_build_context.) A user proc's
-	// IR is independent of a builtin module's opt level (no cross-module inlining without LTO).
+	// Per-module optimization level. Normally the global level. Under -hot-reload the split is
+	// fixed: builtin collections at -o:2, everything the user can edit at -o:none. See tech_design.md §8.
 	if (build_context.hot_reload) {
 		bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
 		m->optimization_level = is_builtin ? 2 : -1; // -1 == -o:none
@@ -3828,13 +3819,8 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 		if (is_external) {
 			String name = lb_get_entity_name(other_module, e);
 
-			// Hot-reload new globals/thread-locals live in the exe's reserved arena, not as
-			// named symbols (they are inline arena GEPs registered only in default_module).
-			// A cross-module reference must re-materialize that GEP in THIS module rather than
-			// declare an undefined external by link name (which the loader can't resolve ->
-			// "unresolved symbol: <name>"). The arena base is a real external the loader
-			// resolves via the exe's PDB, so the GEP is valid in any module. Offsets are
-			// already pinned in the manifest (populated by the global loop before proc codegen).
+			// Hot-reload new globals are inline arena GEPs registered only in default_module;
+			// re-materialize the GEP for a cross-module reference. See tech_design.md §4.
 			if (build_context.hot_reload) {
 				HotReloadManifest &hm = m->gen->hot_reload_manifest;
 				if (hm.exists) {

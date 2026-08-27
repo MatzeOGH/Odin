@@ -1342,20 +1342,14 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 		e->flags |= EntityFlag_Cold;
 	}
 	if (ac.no_hot_reload) {
-		// Opt this procedure OUT of automatic -hot-reload patchability (keeps it
-		// inlinable/optimized and never patched). No export is forced — the reload
-		// loader resolves running procedures from the exe's PDB by their link name.
-		e->Procedure.no_hot_reload = true;
+		e->Procedure.no_hot_reload = true; // opt out of auto hot-patchability; tech_design.md §7
 	}
 	if (ac.pre_patch_hook || ac.post_patch_hook) {
 		if (!build_context.hot_reload) {
 			error(e->token, "@(pre_patch_hook)/@(post_patch_hook) require building with -hot-reload");
 		}
-		// The hot-reload loader calls these by their exported symbol (pre from the
-		// running exe, post from the reloaded object), so force a stable, unmangled
-		// name. Expected shape: proc(changed: []hot_reload.Type_Change) — a single
-		// slice parameter, no results. The loader casts the resolved address to this
-		// type, so an odd signature would mis-call; check it loosely here.
+		// Loader calls these by exported symbol; force a stable name and check the shape
+		// proc(changed: []hot_reload.Type_Change) loosely. See tech_design.md §11.
 		ac.is_export = true;
 		if (pt->param_count != 1 || pt->result_count != 0) {
 			error(e->token, "a @(pre_patch_hook)/@(post_patch_hook) procedure must take one parameter (a []hot_reload.Type_Change slice) and return nothing");

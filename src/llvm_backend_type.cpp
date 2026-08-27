@@ -96,10 +96,8 @@ gb_internal lbValue lb_type_info(lbProcedure *p, Type *type) {
 	lbModule *m = p->module;
 
 	if (build_context.hot_reload) {
-		// Resolve through the running exe's `type_table` by (build-stable) typeid
-		// rather than a build-local index into this object's giant array, so
-		// `type_info_of(T)` / enum reflection in hot code lands on the exe's
-		// Type_Info and matches `any` values built from the same stable typeid.
+		// Resolve through the exe's type_table by build-stable typeid, not a build-local index,
+		// so reflection in hot code lands on the exe's Type_Info. See tech_design.md §9.
 		auto args = array_make<lbValue>(permanent_allocator(), 1);
 		args[0] = lb_typeid(m, type);
 		return lb_emit_runtime_call(p, "__type_info_of", args);
@@ -1158,13 +1156,8 @@ gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup typ
 	LLVMSetGlobalConstant(global_type_table.value, true);
 
 	if (build_context.hot_reload) {
-		// The hot-reload loader needs both the exe's (old) and the reload object's
-		// (new) type-info tables to diff struct layouts across a reload. `runtime.type_table`
-		// itself is an internal symbol whose PDB name is awkward to resolve, so publish a
-		// dedicated `[]^Type_Info` slice under a fixed, external name — same backing giant
-		// array, findable by name in the exe's PDB and in the reload object's symbols. The
-		// giant array is a private (anonymous) global referenced section-relative, so the
-		// object's copy stays object-local (new layouts) rather than being reused from the exe.
+		// Publish the type table under a fixed external name so the loader can diff struct
+		// layouts across a reload. See tech_design.md §9.
 		Type *slice_type = type_deref(global_type_table.type);
 		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_hot_reload_type_infos");
 		LLVMSetInitializer(tbl, slice);

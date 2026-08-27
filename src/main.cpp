@@ -1425,18 +1425,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							build_context.use_single_module = true;
 							break;
 						case BuildFlag_HotReload:
-							// Emit the hot-reload support symbols (arena + TLS accessors) for an
-							// in-process hot-reload loader. The loader resolves running-exe symbols
-							// from the PDB, so -hot-reload IMPLIES -debug (a PDB next to the exe).
-							// Enabling it here also pins base and reload builds to the same
-							// optimization level (-o:none, derived from ODIN_DEBUG), which the
-							// per-function change-detection hashes rely on to match.
-							//
-							// NOTE: -hot-reload no longer forces a single module. At -o:none the
-							// default is separate (per-package) modules, so user code and the
-							// standard-library collections build as independent modules; the loader
-							// consumes the resulting per-package objects. User packages stay
-							// -o:none + noinline + patchable; builtin collections build normally.
+							// Build a host exe that supports in-process hot reload. Implies -debug
+							// (loader needs the PDB) and separate modules. See tech_design.md §2.
 							build_context.hot_reload = true;
 							build_context.ODIN_DEBUG = true;
 							if (build_context.hot_reload_arena_size == 0) {
@@ -1447,13 +1437,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							}
 							break;
 						case BuildFlag_HotReloadPatch:
-							// Build the reload PATCH object for an already-running -hot-reload host.
-							// This is the whole "recompile" step: it implies everything -hot-reload
-							// implies (see above) PLUS -build-mode:obj, and it auto-defaults -out to
-							// <main-package-dir>/hot_objs/hot.obj (created + cleaned; see
-							// init_build_paths). So the recompile command is just
-							// `odin build <pkg> -hot-reload-patch` — no -build-mode, -out, manifest, or
-							// linker flags to hand-align with the host build.
+							// Build the reload patch object for a running host: implies -hot-reload +
+							// -build-mode:obj + a default -out into hot_objs/. See tech_design.md §2.
 							build_context.hot_reload = true;
 							build_context.hot_reload_patch = true;
 							build_context.ODIN_DEBUG = true;
@@ -2065,28 +2050,18 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	}
 
 	if (build_context.hot_reload) {
-		// The reload object itself (-build-mode:obj, and the asm/llvm intermediate
-		// outputs) is exempt from these host checks: the loader reads the HOST's PDB,
-		// not the object's.
+		// The host must be an executable; reload objects (obj/asm/llvm) are exempt. See tech_design.md §2.
 		bool is_reload_output = build_context.build_mode == BuildMode_Object ||
 		                        build_context.build_mode == BuildMode_Assembly ||
 		                        build_context.build_mode == BuildMode_LLVM_IR;
 		if (!is_reload_output && build_context.build_mode != BuildMode_Executable) {
-			// The loader hardcodes the running EXE module (GetModuleHandleW(nil)) for
-			// symbol enumeration, near-block allocation, and patching, so the host must
-			// be an executable. A DLL/static-lib host would be enumerated/patched against
-			// the wrong image. (Multiple-module / DLL hosts are future work.)
 			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe); reload objects use -build-mode:obj\n");
 			bad_flags = true;
 		}
-		// -hot-reload-patch sets -build-mode:obj itself; a later explicit -build-mode that
-		// flips it away is a contradiction (the patch must be an object), so reject it clearly.
 		if (build_context.hot_reload_patch && build_context.build_mode != BuildMode_Object) {
 			gb_printf_err("-hot-reload-patch builds a reload object; it conflicts with -build-mode (drop one)\n");
 			bad_flags = true;
 		}
-		// Note: -hot-reload implies -debug (set in the flag handler) so a PDB exists next
-		// to the exe and base/reload builds share the same optimization level.
 	}
 
 	if ((!(build_context.export_timings_format == TimingsExportUnspecified)) && (build_context.export_timings_file.len == 0)) {

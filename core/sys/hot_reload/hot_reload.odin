@@ -3,51 +3,15 @@ package hot_reload
 
 // Live++-style in-process hot reload for Odin (Windows / x64).
 //
-// Recompile with SEPARATE modules to a directory of COFF objects (one per package):
+// Build the host with `-hot-reload -debug`, recompile after an edit with
+// `-hot-reload-patch`, then call `apply_dir("hot_objs")` from the running process. The
+// objects are loaded directly (no DLL), relocated against the exe and each other, and the
+// prologue of each changed hot procedure is overwritten with a jump to the fresh code. The
+// process never restarts and its state is untouched.
 //
-//     odin build <pkg> -build-mode:obj -hot-reload -hot-reload-manifest:<path> -out:<dir>/hot.obj
-//
-// then call `apply_dir("<dir>")` from the running process (or `apply_many({...})` with an
-// explicit list; `apply("one.obj")` still works for a single object). The objects are loaded
-// directly into the process (no DLL), relocated against the exe AND each other, and the
-// prologue of each running hot procedure whose code changed is overwritten with a jump to the
-// fresh code. Existing direct calls reach the new code; the process never restarts and its
-// state is untouched.
-//
-// The reload set is small: the standard-library collections (base/core/vendor) are NOT
-// emitted on a reload build — that code is already in the running exe and is resolved from its
-// PDB — and an UNCHANGED user package is not re-emitted either. So a reload typically produces
-// just the default/metadata object plus the package(s) actually edited. The loader maps every
-// object before relocating, so a new procedure/global defined in one object is reachable from
-// another (a cross-object reference beyond signed-32-bit REL32 range goes through a near
-// trampoline, like any far external).
-//
-// Relocations against *external* symbols (other procedures, runtime helpers, and
-// globals) are resolved against the addresses in the already-running process by
-// looking each name up in the exe's PDB (DbgHelp `SymFromNameW`) — no symbol table
-// is baked into the exe. A relocation to an existing global resolves to the exe's
-// copy, so global state is preserved. The set of `@(hot_reload)` procedures to
-// patch is recovered structurally: a hot procedure's running entry is the 2-byte
-// MSVC hot-patch slot preceded by a 16-byte patchable-function-prefix pad (see
-// `hr_is_hot_entry`), which ordinary prologues never look like.
-//
-// New symbols across a reload:
-//   - New *procedures* called from hot code link automatically (their code lives
-//     in the loaded object; callers reach them via relocations).
-//   - New *globals* are placed by the compiler into a reserved arena
-//     (`__odin_hot_reload_global_arena`) that lives in the exe, so references
-//     resolve to stable in-image storage and their state persists across every
-//     subsequent reload. New globals are zero-initialized.
-//
-// Build the exe with `-hot-reload -debug` (and the same `-hot-reload-manifest`) so
-// the arena exists and a PDB is present next to the exe; the loader needs the PDB
-// to resolve the running exe's symbols. `-hot-reload` requires `-debug`.
-//
-// The object's `.pdata`/`.xdata` unwind info is registered with `RtlAddFunctionTable`
-// (with the loaded block as the image base), so Windows x64 stack walking works through
-// hot code: `panic`/`assert` backtraces, the runtime's hardware-fault handler, and a
-// debugger's call stack all unwind correctly across hot frames. This is about stack
-// *unwinding* (Odin has no exceptions); it does not make hot code source-debuggable.
+// The full design (symbol ABI, manifest, arena, change detection, TLS, refresh, hooks) is
+// documented in tech_design.md next to this file. Public entry points: apply / apply_dir /
+// apply_many, build_patch / apply_patch.
 
 import "base:intrinsics"
 import "base:runtime"

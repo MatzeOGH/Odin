@@ -20,8 +20,7 @@
 
 #include "llvm_backend.hpp"
 
-// Defined in llvm_backend_proc.cpp (included below), but referenced earlier from
-// llvm_backend_general.cpp to set each module's per-module optimization level.
+// Defined in llvm_backend_proc.cpp; forward-declared for llvm_backend_general.cpp.
 gb_internal bool lb_path_is_stdlib(String fullpath);
 
 #include "llvm_abi.cpp"
@@ -2817,16 +2816,8 @@ gb_internal void lb_add_foreign_library_paths(lbGenerator *gen) {
 	}
 }
 
-// On a hot-reload RELOAD build (an -build-mode:obj build against an existing manifest), decide
-// whether to SKIP emitting an object for module `m`. Two cases are skipped:
-//   1. a builtin-collection (base/core/vendor) module — that code is already in the running exe
-//      and the loader resolves it from the exe's PDB; this drops the standard library (~40
-//      objects) from the reload set; and
-//   2. a USER package module none of whose procedures changed vs the manifest baseline — its
-//      code is unchanged and still in the exe, so re-emitting (and reloading) it is pure waste.
-// So a reload produces objects only for the CHANGED user packages plus the default/metadata
-// module. The base EXE build (build-mode:exe) never skips (everything is linked into the exe).
-// default_module carries the metadata tables + RTTI, has pkg==nullptr, and is always emitted.
+// On a reload build, skip emitting an object for a builtin-collection module or an unchanged
+// user module (both are still in the exe). Minimal-object emission; see tech_design.md §6.
 gb_internal bool lb_hot_reload_skip_object(lbModule *m) {
 	if (!(build_context.hot_reload && build_context.hot_reload_is_reload && build_context.build_mode == BuildMode_Object)) {
 		return false;
@@ -3101,15 +3092,8 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 
 
 // ---------------------------------------------------------------------------
-// Hot reload: arena for new globals + build-to-build manifest
-//
-// A reload object may introduce globals that did not exist when the exe was
-// built. They cannot live in the object's own data (it is remapped every reload,
-// so state would be lost) and there is no room for them in the exe's fixed data
-// sections. Instead the exe reserves a zero-init arena and reload objects place
-// new globals into it at fixed byte offsets, so their state persists across every
-// reload. The manifest is the compiler's persistent record of each new global's
-// offset, kept between builds.
+// Hot reload: arena for new globals + build-to-build manifest.
+// See tech_design.md §4 (arena) and §3 (manifest).
 // ---------------------------------------------------------------------------
 
 gb_internal u64 lb_hot_reload_parse_u64(String s) {
@@ -3122,9 +3106,7 @@ gb_internal u64 lb_hot_reload_parse_u64(String s) {
 	return v;
 }
 
-// The reserved storage new globals are placed into. Defined (zero-init) in the
-// base exe build; an external declaration (resolved by the loader to the exe's
-// arena) in a reload object build.
+// The reserved arena new globals are placed into. See tech_design.md §4.
 gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
 	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_global_arena");
 	if (existing != nullptr) {
@@ -3140,13 +3122,9 @@ gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
 		LLVMSetLinkage(arena, LLVMExternalLinkage); // reference the exe's arena
 	} else {
 		LLVMSetInitializer(arena, LLVMConstNull(arena_t));
-		// External (public) so the loader can find the arena by name in the exe's PDB
-		// (the baked symbol table that used to carry its address is gone).
-		LLVMSetLinkage(arena, LLVMExternalLinkage);
+		LLVMSetLinkage(arena, LLVMExternalLinkage); // public: found by name in the exe's PDB
 	}
-	// Over-align the arena so aggregate / f64 / SIMD globals placed at aligned
-	// offsets within it are correctly aligned relative to the (aligned) base.
-	LLVMSetAlignment(arena, 16);
+	LLVMSetAlignment(arena, 16); // over-align so aligned globals within it stay aligned
 	return arena;
 }
 
@@ -3165,14 +3143,7 @@ gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *
 	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
 }
 
-// Per-thread reserved storage for thread-locals introduced across a reload. This is
-// a `@thread_local` array in the exe, so every thread (existing and future) gets its
-// own zeroed copy at a fixed offset within its TLS block. New thread-locals are
-// placed at offsets inside it; because access goes through this thread_local symbol,
-// the loader's existing SECREL handler resolves them to the exe's TLS block (the
-// arena is published in the symbol table as a HOT_RELOAD_KIND_TLS accessor). Defined
-// (zero-init) in BOTH base and reload builds: TLS references resolve by SECREL name
-// rewrite, not by symbol address, so the reload object's own (unused) copy is fine.
+// Per-thread reserved storage for new thread-locals across a reload. See tech_design.md §5.
 gb_internal LLVMValueRef lb_hot_reload_tls_arena(lbModule *m) {
 	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_tls_arena");
 	if (existing != nullptr) {
@@ -3207,9 +3178,7 @@ gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Ty
 	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
 }
 
-// HotReloadNewEntry, HotReloadManifest, and HotReloadInitEntry are defined in
-// llvm_backend.hpp so llvm_backend_stmt.cpp can see them (unity build order).
-
+// HotReloadManifest et al. are defined in llvm_backend.hpp (unity build order).
 gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	string_map_init(&hm->orig);
 	string_map_init(&hm->sig);
@@ -3227,12 +3196,8 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	if (build_context.hot_reload_manifest.len == 0) {
 		return;
 	}
-	// The base build is the executable: it establishes the reload layout FRESH and (re)writes
-	// the manifest. Only a reload build (`-build-mode:obj`) reads the baseline. This makes the
-	// distinction rely on the build mode rather than on whether a manifest file happens to
-	// exist — so the default manifest path can persist between sessions without a stale file
-	// making the base exe build masquerade as a reload. (`-hot-reload` requires the host be an
-	// executable, so a non-Object build here is always the base.)
+	// Only a reload build (-build-mode:obj) reads the baseline; the base exe build writes it
+	// fresh. Build-mode keys base-vs-reload, not file presence. See tech_design.md §3.
 	if (build_context.build_mode != BuildMode_Object) {
 		return;
 	}
@@ -3254,8 +3219,7 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 		if (line.len > 0 && line[line.len-1] == '\r') { line.len--; }
 		if (line.len == 0) { continue; }
 
-		// Tokens are space separated; the (possibly space-containing) name is the
-		// remainder of the line after the fixed numeric fields.
+		// Space-separated tokens; the name is the line remainder after the numeric fields.
 		isize p = 0;
 		auto tok = [](String s, isize *pp) -> String {
 			isize st = *pp;
@@ -3284,8 +3248,7 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 		} else if (tag == "build_id") {
 			hm->build_id = lb_hot_reload_parse_u64(tok(line, &p));
 		} else if (tag == "pkg_dir") {
-			// Recorded by the base (exe) build; preserve it verbatim so it is not dropped
-			// when a reload (obj) build rewrites the manifest. May contain spaces.
+			// Preserve verbatim so a reload rewrite does not drop it. May contain spaces.
 			String pd = rest(line, p);
 			if (pd.len > 0) { hm->pkg_dir = pd; }
 		} else if (tag == "orig") {
@@ -3326,9 +3289,7 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	if (build_context.hot_reload_manifest.len == 0) {
 		return;
 	}
-	// A rejected build (e.g. the ABI guard below, or an exhausted arena) must not persist
-	// its state: overwriting the manifest with a bad `sig`/offsets would make the guard
-	// "sticky" and reject even a subsequent corrected build. Leave the manifest untouched.
+	// Do not persist a rejected build (a bad sig/offsets would make guards sticky). See tech_design.md §3.
 	if (any_errors()) {
 		return;
 	}
@@ -3343,8 +3304,7 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	gb_fprintf(&f, "tls_arena_size %llu\n", cast(unsigned long long)hm->tls_arena_size);
 	gb_fprintf(&f, "tls_next_free %llu\n", cast(unsigned long long)hm->tls_next_free);
 	gb_fprintf(&f, "build_id %llu\n", cast(unsigned long long)hm->build_id);
-	// Record the base package dir so a running app can rebuild the patch itself
-	// (hot_reload.build_patch/apply_patch): `odin build <pkg_dir> -hot-reload-patch`.
+	// Base package dir, so a running app can rebuild the patch (hot_reload.build_patch).
 	if (hm->pkg_dir.len > 0) {
 		gb_fprintf(&f, "pkg_dir %.*s\n", LIT(hm->pkg_dir));
 	}
@@ -3370,26 +3330,6 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	}
 }
 
-// Emit the hot-reload support symbols the loader resolves from the running exe via
-// its PDB. No name->address table is baked into the exe anymore — the loader finds
-// every running procedure and global with DbgHelp `SymFromNameW`, so ordinary
-// symbols are left to normal dead-code elimination (which the old baked table
-// disabled by taking the address of every symbol). Only the few symbols the loader
-// looks up by a *fixed, source-derived name* are force-kept here via `llvm.used` +
-// external linkage, so they survive DCE and appear in the PDB:
-//   - the new-global arena `__odin_hot_reload_global_arena`;
-//   - the per-thread TLS arena (kept transitively via its accessor);
-//   - a per-thread-local accessor `__odin_hrtls$<link-name>`.
-// A procedure's `@(hot_reload)`-ness and a thread-local's identity are recovered by
-// the loader structurally (the patchable prologue) and by naming convention (the
-// accessor name), respectively, so no metadata section is needed.
-// A stable, debug-normalized content hash of a procedure's emitted code, used for
-// hot-reload change detection. We hash the function's LLVM IR text with debug info
-// removed: skip debug-record lines and truncate each line at its first " !" (metadata
-// operand). This is SOUND for change detection — a real instruction/operand change alters
-// the kept text, so the hash differs — while debug-only differences (which do not change
-// machine code) and metadata-ID renumbering from unrelated edits hash equal, so an
-// unchanged procedure keeps the same hash across builds.
 // Append a little-endian u64 to a byte buffer (for the self-contained loader tables).
 gb_internal void lb_hot_reload_put_u64_le(Array<u8> *buf, u64 v) {
 	for (int b = 0; b < 8; b++) {
@@ -3410,20 +3350,15 @@ gb_internal String lb_call_basic_directive_name(Ast *expr) {
 	return str_lit("");
 }
 
-// Whether `expr` is a compile-time embedded-data directive call whose result is baked into
-// the binary and should be re-provided fresh on reload: `#load`/`#load_directory` (file bytes)
-// and `#hash`/`#load_hash` (a constant integer hash of a string literal / file contents). All
-// but `#load_directory` already produce a constant the global loop bakes directly; a
-// `#load_directory` global is baked via lb_const_load_directory_slice (see the global loop).
+// Whether `expr` is an embedded-data directive (#load/#load_directory/#hash/#load_hash) whose
+// result is refreshed on reload. See tech_design.md §10.
 gb_internal bool lb_is_load_directive_expr(Ast *expr) {
 	String n = lb_call_basic_directive_name(expr);
 	return n == "load" || n == "load_directory" || n == "hash" || n == "load_hash";
 }
 
-// Build the constant `[]Load_Directory_File` slice value for a `#load_directory(call)` at
-// MODULE scope (the codegen path in lb_build_builtin_proc is procedure-scoped). Used to bake
-// a #load_directory global's initializer under -hot-reload so its static storage holds a real
-// slice header the loader can repoint (a runtime-initialized global's storage would be zero).
+// Build the constant `[]Load_Directory_File` slice for a module-scope `#load_directory(call)`,
+// so a hot-reload global carries a real header the loader can repoint. See tech_design.md §10.
 gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 	TEMPORARY_ALLOCATOR_GUARD();
 	LoadDirectoryCache *cache = map_must_get(&m->info->load_directory_map, call);
@@ -3454,12 +3389,8 @@ gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 	return res;
 }
 
-// Whether a file-scope global (or local `@(static)`) holds immutable embedded data
-// that the hot-reload loader must re-provide fresh on each reload rather than preserve:
-//   * an `@(rodata)` variable, or
-//   * a variable whose initializer is directly a `#load(...)` / `#load_directory(...)` directive.
-// The bytes are read-only in either case (writing through them faults), so there is no
-// runtime state to protect; the loader repoints the exe's copy at the reload's data.
+// Whether a global holds immutable embedded data (@(rodata) or a #load initializer) that the
+// loader refreshes rather than preserves. See tech_design.md §10.
 gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
 	if (e != nullptr && e->kind == Entity_Variable && e->Variable.is_rodata) {
 		return true;
@@ -3467,22 +3398,15 @@ gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
 	return decl != nullptr && lb_is_load_directive_expr(decl->init_expr);
 }
 
+// Stable, debug-normalized hash of a proc's emitted IR text, for change detection. See tech_design.md §6.
 gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
-	// Free the normalized-IR scratch (`norm` below) per procedure. Without this, the
-	// whole program's normalized IR text accumulates in the temporary allocator (this
-	// runs for EVERY hot-reloadable proc under -hot-reload / single-module), spiking
-	// compile memory in proportion to total program size.
-	TEMPORARY_ALLOCATOR_GUARD();
+	TEMPORARY_ALLOCATOR_GUARD(); // free the per-proc norm scratch; else it accumulates program-wide
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
 		return 0;
 	}
-	// Compiler-generated constant globals (string backing stores etc.) are named
-	// `<prefix>$<module_name>$<hex-index>` (llvm_backend_general.cpp), where BOTH the
-	// module name (from -out) and the atomic index vary between builds. A procedure that
-	// references a string literal would otherwise hash differently every build. Strip the
-	// build-specific `$<module_name>$<hex>` suffix wherever it appears so such references
-	// canonicalize (the referenced length stays, so a length change is still detected).
+	// Collapse the build-specific `$<module_name>$<hex>` suffix of generated const globals so
+	// references to them canonicalize across builds. See tech_design.md §6.
 	char const *mod = p->module ? p->module->module_name : nullptr;
 	isize mod_len = (mod != nullptr) ? cast(isize)gb_strlen(mod) : 0;
 
@@ -3501,25 +3425,17 @@ gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
 			if (line[i] == 'l' && (line_len - i) >= 9 && gb_strncmp(line+i, "llvm.dbg.", 9) == 0) { is_dbg = true; break; }
 		}
 		if (!is_dbg) {
-			// Truncate at the first " !" or " #": in LLVM IR text '!' introduces trailing
-			// metadata operands (e.g. `, !dbg !12`) and '#' introduces attribute-group
-			// references (e.g. `... #0 ...`). Both are module-globally numbered and renumber
-			// between builds when unrelated code is added/removed, so an unchanged procedure
-			// would otherwise hash differently. Instruction operands always precede them, so
-			// truncating keeps the semantically-relevant prefix.
+			// Truncate at the first " !" (metadata) or " #" (attr group): both renumber between
+			// builds. Instruction operands precede them. See tech_design.md §6.
 			isize keep = line_len;
 			for (isize i = 0; i + 1 < line_len; i++) {
 				if (line[i] == ' ' && (line[i+1] == '!' || line[i+1] == '#')) { keep = i; break; }
 			}
-			// Trim trailing spaces/commas left where metadata was stripped, so a -debug
-			// instruction (`br label %e, !dbg !N` -> `br label %e,`) hashes identically to
-			// its non-debug counterpart (`br label %e`). The base exe is built -debug while
-			// the reload object usually is not, so the two forms must reconcile.
+			// Trim trailing spaces/commas so a -debug instruction hashes as its non-debug form.
 			while (keep > 0 && (line[keep-1] == ' ' || line[keep-1] == ',')) {
 				keep--;
 			}
-			// Append the kept text, collapsing any `$<module_name>$<hex>` run (the
-			// build-specific tail of a compiler-generated constant global's name).
+			// Append the kept text, collapsing any `$<module_name>$<hex>` run.
 			isize i = 0;
 			while (i < keep) {
 				if (mod_len > 0 && line[i] == '$' && (keep - i) >= (mod_len + 2) &&
@@ -3546,12 +3462,8 @@ gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
 	return h;
 }
 
-// Emit `__odin_hot_reload_func_hashes` — a table of {u64 name_hash, u64 content_hash} for
-// every hot-reloadable procedure (same set the patchable prologue is emitted for). It carries
-// NO addresses and roots nothing, so dead-code elimination stays enabled. The reload loader
-// reads the exe's copy (via the PDB) as the change-detection baseline and the reload object's
-// copy (via its COFF symbol) each reload, and patches only procedures whose content hash
-// changed. `name_hash` is FNV-1a-64 of the link name (matches the loader's `hr_fnv64`).
+// Emit `__odin_hot_reload_func_hashes`, the {name_hash, content_hash} change-detection table
+// over every hot-reloadable proc. See tech_design.md §6.
 gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
@@ -3562,10 +3474,8 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 
 	HotReloadManifest &hm = gen->hot_reload_manifest;
 	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
-	// Gather hot procedures from EVERY module, not just default_module: with separate
-	// modules a user proc lives in its own package module, so a default_module-only walk
-	// (the pre-multi-module behaviour) would miss every hot proc and leave the exe's
-	// baseline table empty. The table itself is still DEFINED in default_module (`m`).
+	// Gather hot procs from every module (they live in per-package modules); the table is
+	// still defined in default_module.
 	auto hot_procs = array_make<lbProcedure *>(temporary_allocator(), 0, 1024);
 	for (auto const &entry : gen->modules) {
 		lbModule *mod = entry.value;
@@ -3579,13 +3489,8 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 		u64 name_hash    = fnv64a(p->name.text, p->name.len);
 		u64 content_hash = lb_hot_reload_proc_content_hash(p);
 
-		// Minimal object emission: mark this proc's module CHANGED if its content hash differs
-		// from the manifest baseline (or is new / this is a base build). At object-generation
-		// time an unchanged USER package module is not emitted at all — its code is unchanged
-		// and still in the exe, so a reload skips producing (and loading) its object entirely.
-		// `hm.fhash` still holds the baseline HERE (it is overwritten just below), so read
-		// first. All file-scope globals live in default_module (which is always emitted), so a
-		// user package module changes iff one of its procs changed — proc hashing suffices.
+		// Minimal object emission: mark this proc's module changed if its hash differs from the
+		// baseline (read before the overwrite below). See tech_design.md §6.
 		if (!hm.exists) {
 			p->module->hot_reload_changed = true; // base build: no baseline, treat as changed
 		} else {
@@ -3595,16 +3500,10 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 			}
 		}
 
-		// Persist this build's per-proc content hash into the manifest (item 3 cheap half):
-		// the base build's fhash is the exe's per-proc baseline, which a reload build diffs
-		// against (just above) to decide which package objects to emit.
-		string_map_set(&hm.fhash, p->name, content_hash);
+		string_map_set(&hm.fhash, p->name, content_hash); // persist this build's per-proc baseline
 
-		// Hot-proc ABI guard (F8): the frozen host's call sites marshal the ORIGINAL
-		// signature into the patched-in body, so a hot proc's parameter/return types must
-		// not change across a reload. Record each hot proc's canonical signature hash in
-		// the manifest (base build); on a reload build reject any proc whose signature
-		// changed — mirrors the existing global type-hash guard.
+		// Signature ABI guard (F8): a hot proc's parameter/return types must not change across a
+		// reload (the frozen host calls it with the original ABI). See tech_design.md §6.
 		if (p->type != nullptr) {
 			u64 sig_hash = type_hash_canonical_type(p->type);
 			if (hm.exists) {
@@ -3638,21 +3537,14 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	lb_append_to_used(m, tbl);                // survive DCE; the loader reads it by name
 }
 
-// Emit `__odin_hot_reload_build_id : u64` — a fingerprint of the exe's reload-relevant
-// layout (arena sizes + the original globals' and hot procs' canonical hashes). The same
-// value is baked into the exe (base build) and every reload object (read back from the
-// manifest), and the loader refuses a reload whose id differs from the running exe's — so a
-// stale object built against a since-rebuilt exe (arena relaid) is rejected instead of
-// silently corrupting memory at now-wrong arena offsets (F6). Call AFTER
-// `lb_hot_reload_emit_func_hashes` so the manifest's `sig` map is fully populated.
+// Emit `__odin_hot_reload_build_id : u64`, the layout fingerprint the loader checks to refuse a
+// stale object (F6). Call after emit_func_hashes so `sig` is complete. See tech_design.md §6.
 gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 	HotReloadManifest &hm = gen->hot_reload_manifest;
 
 	if (!hm.exists) {
-		// Base (exe) build: derive the id from the layout the reload contract depends on.
-		// Fold entries with commutative addition so the value is independent of map/thread
-		// iteration order (reproducible across separate base builds of the same source).
+		// Base build: derive the id from the layout, folded commutatively (order-independent).
 		u64 id = 0;
 		id += 0x9E3779B97F4A7C15ull ^ cast(u64)hm.arena_size;
 		id += 0xC2B2AE3D27D4EB4Full ^ cast(u64)hm.tls_arena_size;
@@ -3666,7 +3558,7 @@ gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 		}
 		hm.build_id = id;
 	}
-	// Reload build: hm.build_id already holds the value read from the manifest (the exe's).
+	// Reload build: hm.build_id already holds the exe's value from the manifest.
 
 	LLVMTypeRef u64t = lb_type(m, t_u64);
 	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_hot_reload_build_id");
@@ -3676,38 +3568,26 @@ gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 	lb_append_to_used(m, g);                // survive DCE; the loader reads it by name
 }
 
+// Emit the support symbols the loader resolves by name (arena, TLS arena, TLS accessors). See
+// tech_design.md §5, §13.
 gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
-	// Reserve the per-thread TLS arena and record it so a new thread-local (a GEP into
-	// it) resolves through this arena's accessor. Every thread's static TLS block then
-	// includes the arena, so new thread-locals introduced by a reload have per-thread
-	// storage.
+	// Reserve the per-thread TLS arena and record it for an accessor. See tech_design.md §5.
 	if (build_context.hot_reload_tls_arena_size > 0) {
 		LLVMValueRef tls_arena = lb_hot_reload_tls_arena(m);
 		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0, m};
 		array_add(&gen->hot_reload_tls_syms, s);
 	}
 
-	// Thread-locals (file-scope globals, local `@(static)`, and the TLS arena). A
-	// thread-local is accessed via `_tls_index` + a per-variable SECREL offset into the
-	// TLS block, so it has no plain address. For each we emit a tiny accessor
-	// `__odin_hrtls$<link-name>() -> rawptr { return &var }`; a use of the thread_local
-	// inside a function lowers to the exe's TLS access sequence, so it returns the
-	// per-thread address. The loader derives this name from a SECREL relocation's
-	// target variable, finds the accessor in the exe's PDB, and calls it to learn the
-	// variable's offset in the exe's TLS block — no baked mapping required, because the
-	// name is a pure function of the variable's (build-stable) link name.
+	// Emit a `__odin_hrtls$<link-name>() -> rawptr { return &var }` accessor for each thread-local
+	// so the loader can resolve SECREL references to the exe's TLS block. See tech_design.md §5.
 	{
 		for (lbHotReloadStaticSym const &s : gen->hot_reload_tls_syms) {
 			if (s.name.len == 0 || s.value == nullptr) {
 				continue;
 			}
-			// Emit the accessor into the SAME module that defines the thread-local
-			// (`s.module`): with separate modules a thread-local `@(static)` in, say, a
-			// runtime proc lives in that package's module, and LLVM forbids referencing a
-			// global from a different module. The symbol is public either way, so the
-			// loader still resolves it by name via the exe's PDB regardless of module.
+			// Emit into the module that defines the thread-local (LLVM forbids cross-module refs).
 			lbModule *am = (s.module != nullptr) ? s.module : m;
 			LLVMTypeRef acc_ty = LLVMFunctionType(lb_type(am, t_rawptr), nullptr, 0, false);
 			char const *acc_name = gb_bprintf("__odin_hrtls$%.*s", LIT(s.name));
@@ -3723,24 +3603,15 @@ gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 		}
 	}
 
-	// Reserve the new-global arena and force-keep it. A reload object references it as
-	// an external symbol (new globals compile to relocations against it), so it must
-	// exist in the exe and be resolvable by name in the exe's PDB for every subsequent
-	// reload — even a base build that has no new globals of its own.
+	// Reserve the new-global arena and force-keep it so reloads can resolve it by name.
 	if (build_context.hot_reload_arena_size > 0) {
 		LLVMValueRef arena = lb_hot_reload_arena(m);
 		lb_append_to_used(m, arena);
 	}
 }
 
-// Emit `sym_name : { i64 count; { i8* name; i64 name_len }[count] }` listing the
-// EXPORTED SYMBOL NAME of every procedure flagged `want_pre`/`want_post` (a
-// @(pre_patch_hook)/@(post_patch_hook)). The same table is baked into the exe and
-// every reload object. The loader resolves each name itself — pre-patch hooks against
-// the running exe (old code), post-patch hooks against the reloaded object (new code,
-// its fresh copy). Storing names rather than pointers means a post hook does NOT need
-// to be a patchable/hot procedure to reach its fresh copy: `find_symbol_address` on the
-// object returns the object-local definition directly. Force-kept by name.
+// Emit a patch-hook name table (the exported symbol name of each @(pre/post_patch_hook)). The
+// loader resolves each name itself: pre against the exe, post against the object. See tech_design.md §11.
 gb_internal void lb_hot_reload_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
 	lbModule *m = &gen->default_module;
 	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
@@ -3905,8 +3776,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	for (auto const &entry : gen->modules) {
 		lbModule *m = entry.value;
 
-		// Per-module codegen opt level (see lb_init_module_worker_proc): under -hot-reload
-		// the builtin collections are built optimized while user modules stay -o:none.
+		// Per-module codegen opt level (see lb_init_module_worker_proc; tech_design.md §8).
 		LLVMCodeGenOptLevel code_gen_level = LLVMCodeGenLevelNone;
 		switch (m->optimization_level) {
 		default:/*fallthrough*/
@@ -4106,14 +3976,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	auto global_variables = array_make<lbGlobalVariable>(permanent_allocator(), 0, global_variable_max_count);
 
-	// Under -hot-reload, load the manifest so we can tell original globals (emit
-	// normally, resolved to the exe's live copy) from new ones (redirected into
-	// the reserved arena so their state persists across reloads). The manifest,
-	// the new-global init list, and the local-static symbol list are generator-
-	// scoped: both this (single-threaded) loop and `lb_build_static_variables`
-	// (on the procedure thread pool) contribute to them. The manifest is written
-	// and the init table emitted only after all procedures — and therefore all
-	// local statics — have been generated (see below).
+	// Under -hot-reload, load the manifest to tell original globals from new ones. These
+	// generator-scoped lists are also filled by lb_build_static_variables (thread pool), and the
+	// manifest/init table are written after all procedures. See tech_design.md §3, §4.
 	HotReloadManifest &hot_reload_manifest = gen->hot_reload_manifest;
 	Array<HotReloadInitEntry> &hot_reload_inits = gen->hot_reload_inits;
 	if (build_context.hot_reload) {
@@ -4162,12 +4027,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (build_context.hot_reload && !is_foreign) {
 			bool is_refresh = lb_is_hot_reload_refresh_global(e, decl);
 			if (is_refresh) {
-				// Immutable embedded data (@(rodata) / `#load`): keep it a NORMAL global
-				// (never arena-backed) and record {link name, size} so the loader repoints
-				// the exe's copy at this reload's fresh data ("repoint old -> new"). An
-				// ORIGINAL one flows through the orig type-guard below and its references
-				// alias to the exe's single canonical copy (which the loader overwrites); a
-				// NEW one falls through to object-local emission (resolved fresh each reload).
+				// Immutable embedded data (@(rodata)/#load): normal global, recorded for the
+				// loader to repoint. See tech_design.md §10.
 				lbHotReloadRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
 				array_add(&gen->hot_reload_refresh_syms, rs);
 			}
@@ -4175,22 +4036,14 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 				u64 th = type_hash_canonical_type(e->type);
 				u64 *orig_th = string_map_get(&hot_reload_manifest.orig, name);
 				if (orig_th != nullptr) {
-					// Original global: emit normally below; the loader preserves it (or, for
-					// an immutable-data global, repoints it — see is_refresh above).
+					// Original global: emit normally below; the loader preserves/repoints it.
 					if (*orig_th != th) {
 						error(e->token, "hot-reload: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
 					}
 				} else if (is_refresh) {
-					// Brand-new immutable-data global: emit normally below (an object-local
-					// fresh copy each reload) rather than routing into the persist-arena, so
-					// its data is re-provided every reload and stays genuinely read-only.
+					// New refresh global: emit object-local below, resolved fresh each reload.
 				} else if (e->Variable.thread_local_model.len != 0) {
-					// Brand-new thread-local introduced by this reload: place it in the
-					// per-thread TLS arena (reserved in the exe) at a manifest-pinned
-					// offset. Access goes through the arena's thread_local symbol, so the
-					// loader's SECREL handler resolves it to the exe's TLS block. Odin
-					// thread-locals cannot have initializers (checker rule), so this is
-					// always zero-init — and the per-thread arena is already zeroed.
+					// New thread-local -> per-thread TLS arena. See tech_design.md §5.
 					i64 offset = 0;
 					HotReloadNewEntry *ne = string_map_get(&hot_reload_manifest.tls_newg, name);
 					if (ne != nullptr) {
@@ -4220,12 +4073,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 					lb_add_member(m, name, g);
 					continue;
 				} else {
-					// Brand-new global introduced by this reload: redirect into the arena.
-					//
-					// Classify the initializer: none/zero/nil -> zero-init (the arena is
-					// already zero); a compile-time constant -> the loader copies its bytes
-					// into the arena slot once (guarded by a flag byte); anything runtime
-					// (including new @(init)) -> unsupported.
+					// New global -> arena. Initializer: zero/const (loader copies once) or
+					// runtime (unsupported). See tech_design.md §4.
 					bool has_const_init = false;
 					bool runtime_init   = false;
 					lbValue init = {};
@@ -4300,8 +4149,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 					continue;
 				}
 			} else {
-				// Base (exe) build: record this global as original for later reloads.
-				string_map_set(&hot_reload_manifest.orig, name, type_hash_canonical_type(e->type));
+				string_map_set(&hot_reload_manifest.orig, name, type_hash_canonical_type(e->type)); // base build: record as original
 			}
 		}
 
@@ -4312,11 +4160,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (decl->init_expr != nullptr) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
 			if (build_context.hot_reload && lb_call_basic_directive_name(decl->init_expr) == "load_directory") {
-				// #load_directory yields a runtime VALUE, so a package-scope global would
-				// normally be built by the startup runtime — leaving the reload object's
-				// static storage zero, which the refresh repoint cannot use. Under
-				// -hot-reload, bake the const slice as the initializer (like #load) so the
-				// object carries a real header the loader repoints at the fresh backing data.
+				// Bake the #load_directory const slice so the object carries a repointable header. See tech_design.md §10.
 				lbValue init = lb_const_load_directory_slice(m, unparen_expr(decl->init_expr));
 				LLVMDeleteGlobal(g.value);
 				g.value = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), alloc_cstring(permanent_allocator(), name));
@@ -4383,12 +4227,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, g.value);
 		}
 
-		// Hot reload: a thread-local global is accessed via a per-variable SECREL
-		// offset into the exe's TLS block, not a plain pointer — so it cannot be
-		// resolved like an ordinary global. Record the raw thread_local global (a
-		// later pass emits an accessor thunk + a HOT_RELOAD_KIND_TLS table entry so
-		// the loader can rewrite SECREL sites to the exe's offset). `g.value` here is
-		// still the raw global, before the const-pointer-cast below.
+		// Hot reload: record the raw thread_local global for a later TLS accessor thunk. See
+		// tech_design.md §5. `g.value` is still the raw global here, before the cast below.
 		if (build_context.hot_reload && !is_foreign && e->Variable.thread_local_model.len != 0) {
 			lbHotReloadStaticSym s = {name, g.value, type_hash_canonical_type(e->type), m};
 			array_add(&gen->hot_reload_tls_syms, s);
@@ -4407,15 +4247,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 				u32 align_in_bits = cast(u32)(8*type_align_of(e->type));
 
-				// Under -hot-reload the loader resolves a reloaded object's reference to a
-				// pre-existing global by looking its LINK name up in the exe's PDB. LLVM's
-				// CodeView emitter names a global's PDB symbol after the debug DISPLAY name
-				// (not the linkage name), and a global's display name is only its source
-				// identifier (`hits`, not `pkg::hits`) — so a reload's `pkg::hits`
-				// reference would miss and silently get a fresh copy (state not preserved).
-				// Functions already store their link name in the PDB, so they resolve. Make
-				// globals resolvable too by using the link name as the debug name here.
-				// (A hot-reload build is a dev build; the debugger then shows `pkg::hits`.)
+				// Under -hot-reload use the link name as the debug name so a reloaded global
+				// resolves to the exe's copy via the PDB. See tech_design.md §9.
 				String dbg_name = build_context.hot_reload ? name : global_name;
 				char const *link_name = build_context.hot_reload ? cast(char const *)name.text : "";
 				isize       link_len  = build_context.hot_reload ? name.len                  : 0;
@@ -4457,10 +4290,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_add_member(m, name, g);
 	}
 
-	// NOTE: the once-only new-global init table (`__odin_hot_reload_new_global_inits`)
-	// and the manifest write are emitted *after* procedure generation, because local
-	// `@(static)` variables — which also contribute new-global inits and manifest
-	// entries — are only emitted while generating procedure bodies (see below).
+	// NOTE: the new-global init table and manifest write happen after procedure generation,
+	// because local @(static) vars also contribute inits/manifest entries (emitted below).
 
 	if (build_context.ODIN_DEBUG) {
 		// Custom `.raddbg` section for its debugger
@@ -4528,27 +4359,14 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		TIME_SECTION("LLVM Hot Reload Support Symbols");
 		lb_hot_reload_emit_support(gen);
 
-		// Autowired pre/post-patch hooks (Live++-style). Baked into the exe and every
-		// reload object; the loader calls the pre set (from the exe) before patching
-		// and the post set (from the object) after, passing the changed-type set.
+		// Patch-hook name tables (§11). Change-detection hashes (§6). Build-id (§6). All after
+		// procedure generation so every proc/static is included.
 		lb_hot_reload_emit_patch_hook_table(gen, info, true,  "__odin_hot_reload_pre_patch_hooks");
 		lb_hot_reload_emit_patch_hook_table(gen, info, false, "__odin_hot_reload_post_patch_hooks");
-
-		// Change-detection baseline/delta: a per-procedure content-hash table so the loader
-		// patches only procedures whose code actually changed (see lb_hot_reload_emit_func_hashes).
-		// Emitted here, after all procedures are generated, so every proc is included.
 		lb_hot_reload_emit_func_hashes(gen);
+		lb_hot_reload_emit_build_id(gen); // after func hashes: needs the complete `sig` map
 
-		// Build-identity fingerprint (F6): baked into the exe and every reload object; the
-		// loader refuses a reload built against a different exe layout. Must run after
-		// func-hash emission so the manifest's `sig` map (folded into the id) is complete.
-		lb_hot_reload_emit_build_id(gen);
-
-		// Emit the once-only init descriptor table for new globals (file-scope and
-		// local `@(static)`) with constant initializers. Layout: { i64 count;
-		// Entry[count] } where Entry = { i64 arena_offset; i64 flag_offset; i64 size;
-		// rawptr blob }. The loader copies each blob into the arena once, gated by its
-		// flag byte. Emitted here (after all procedures) so local statics are included.
+		// Once-only init table for new globals with const initializers. See tech_design.md §4, §13.
 		if (hot_reload_inits.count > 0) {
 			lbModule *m = &gen->default_module;
 			LLVMTypeRef i64t = lb_type(m, t_i64);
@@ -4580,12 +4398,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, tbl); // the loader reads it by name; keep it from being stripped
 		}
 
-		// Emit the immutable-data ("refresh") symbol table for the loader: for each
-		// @(rodata)/#load global, its {size, link name}. The loader looks each name up in
-		// both the exe (PDB) and this reload object, then overwrites the exe's copy with
-		// the object's fresh copy so edits to the data appear after a reload. Encoded as a
-		// SELF-CONTAINED byte blob (no pointer relocations) so it can be read straight from
-		// the mapped section: [ i64 count ] then per entry [ i64 size ][ i64 name_len ][ name bytes ].
+		// Refresh table for @(rodata)/#load globals: a self-contained blob [count]{size,name_len,name}.
+		// See tech_design.md §10, §13.
 		if (gen->hot_reload_refresh_syms.count > 0) {
 			lbModule *m = &gen->default_module;
 			auto buf = array_make<u8>(heap_allocator(), 0, 256);
@@ -4607,9 +4421,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			array_free(&buf);
 		}
 
-		// Persist the manifest: the base build records every original global (and local
-		// static); a reload build additionally records the arena offsets it assigned to
-		// new ones so the next reload reuses them (preserving state).
+		// Persist the manifest (originals + assigned arena offsets). See tech_design.md §3.
 		hot_reload_manifest_write(&hot_reload_manifest);
 		array_free(&hot_reload_inits);
 		array_free(&gen->hot_reload_refresh_syms);

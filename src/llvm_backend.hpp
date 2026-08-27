@@ -123,11 +123,8 @@ struct lbModule {
 	AstPackage *pkg; // possibly associated
 	AstFile *file;   // possibly associated
 	char const *module_name;
-	int optimization_level; // per-module opt level: under -hot-reload, builtin-collection
-	                        // modules build optimized/inlined while user modules stay -o:none
-	bool hot_reload_changed; // -hot-reload reload build: a proc in this module changed vs the
-	                         // manifest baseline, so its object must be re-emitted (unchanged
-	                         // user modules are skipped — their code is still in the exe)
+	int optimization_level;  // per-module opt level (hot-reload splits builtin/user; §8)
+	bool hot_reload_changed; // reload build: a proc changed, so re-emit this module's object (§6)
 
 	PtrMap<u64/*type hash*/, LLVMTypeRef>  types;                  // mutex: types_mutex
 	PtrMap<void *, lbStructFieldRemapping> struct_field_remapping; // Key: LLVMTypeRef or Type *, mutex: types_mutex
@@ -203,9 +200,8 @@ struct lbObjCGlobal {
 	Type *    class_impl_type;  // This is set when the class has the objc_implement attribute set to true.
 };
 
-// Hot reload: build-to-build manifest + new-global arena bookkeeping. These
-// live here (rather than in llvm_backend.cpp) so `lb_build_static_variables`
-// in llvm_backend_stmt.cpp — included earlier in the unity build — can see them.
+// Hot reload manifest + new-global arena bookkeeping. Defined here (not llvm_backend.cpp) for
+// unity-build order. See tech_design.md §3, §4.
 struct HotReloadNewEntry {
 	i64 offset;
 	u64 type_hash;
@@ -218,19 +214,16 @@ struct HotReloadManifest {
 	i64  next_free;
 	i64  tls_arena_size;     // per-thread bytes reserved for new thread-locals
 	i64  tls_next_free;      // bump pointer into the TLS arena
-	u64  build_id;           // fingerprint of the exe's reload-relevant layout; loader refuses a mismatched object (F6)
-	String pkg_dir;          // absolute main-package dir recorded by the base (exe) build; lets a running app rebuild the patch via hot_reload.build_patch()
+	u64  build_id;           // fingerprint of the exe's layout; loader refuses a mismatched object (F6, §6)
+	String pkg_dir;          // base-build main-package dir; lets a running app rebuild the patch
 	StringMap<u64>               orig;    // link name -> canonical type hash (from the exe build)
-	StringMap<u64>               sig;     // hot proc link name -> canonical signature (proc-type) hash; reload rejects a changed ABI (F8)
-	StringMap<u64>               fhash;   // hot proc link name -> content hash of the previous build; groundwork for compile-time change detection (item 3 cheap half)
+	StringMap<u64>               sig;     // hot proc link name -> signature hash; reload rejects a changed ABI (F8, §6)
+	StringMap<u64>               fhash;   // hot proc link name -> content hash of the previous build (§6)
 	StringMap<HotReloadNewEntry> newg;    // link name -> {arena offset, canonical type hash, init-flag offset}
 	StringMap<HotReloadNewEntry> tls_newg; // new thread-local link name -> {TLS arena offset, type hash, per-thread guard offset}
 };
 
-// A new global's compile-time constant initializer: the loader copies `size` bytes
-// from `blob` into the arena at `arena_offset` exactly once, gated by the byte at
-// `flag_offset` in the arena. Collected during codegen, emitted as the object-local
-// table `__odin_hot_reload_new_global_inits`.
+// A new global's const initializer; the loader copies it into the arena once. See tech_design.md §4.
 struct HotReloadInitEntry {
 	i64          arena_offset;
 	i64          flag_offset;
@@ -238,24 +231,15 @@ struct HotReloadInitEntry {
 	LLVMValueRef blob;
 };
 
-// A thread-local variable (file-scope global, local `@(static)`, or the TLS arena)
-// for which a per-variable accessor thunk is emitted, so the loader can resolve
-// SECREL references to the exe's TLS block across a reload. `name` is its link name.
+// A thread-local for which a per-variable accessor thunk is emitted. See tech_design.md §5.
 struct lbHotReloadStaticSym {
 	String       name;
 	LLVMValueRef value;
 	u64          type_hash;
-	lbModule *   module; // the module that DEFINES `value`; the accessor thunk must be
-	                     // emitted here (LLVM forbids referencing a global cross-module)
+	lbModule *   module; // module that defines `value` (accessor must be emitted there)
 };
 
-// An immutable-data global — `@(rodata)` or one whose initializer is a `#load(...)`
-// directive — that the loader must "repoint" on each reload: it overwrites the exe's
-// copy with this reload object's fresh copy so edits to the data appear. `size` is
-// `type_size_of` the variable: for a slice/string/`#load` global that is the 16-byte
-// header (repointed at the object's fresh blob, so a size change is free); for a
-// value-type `@(rodata)` it is the full byte size (overwritten in place). Collected
-// during codegen, emitted as the self-contained table `__odin_hot_reload_refresh_syms`.
+// An immutable-data global (@(rodata)/#load) the loader repoints on reload. See tech_design.md §10.
 struct lbHotReloadRefreshSym {
 	String name;
 	i64    size;
@@ -282,29 +266,18 @@ struct lbGenerator : LinkerData {
 	MPSCQueue<lbObjCGlobal> objc_ivars;
 	MPSCQueue<String> raddebug_section_strings;
 
-	// Hot reload shared state. The file-scope global loop (single-threaded) and
-	// `lb_build_static_variables` (run on the procedure thread pool) both mutate
-	// `hot_reload_manifest`, `hot_reload_inits`, and `hot_reload_tls_syms`, so all
-	// access outside the single-threaded loop is guarded by `hot_reload_mutex`.
+	// Hot reload shared state. The global loop and lb_build_static_variables (thread pool)
+	// both mutate these, so access outside the single-threaded loop takes hot_reload_mutex.
 	HotReloadManifest           hot_reload_manifest;
 	Array<HotReloadInitEntry>   hot_reload_inits;
-	// Thread-local variables (file-scope globals + local `@(static)`) to preserve
-	// across a reload: `value` is the LLVM thread_local global. A per-variable
-	// accessor thunk (`__odin_hrtls$<name>`) is emitted for each so the loader can
-	// resolve SECREL references to the exe's TLS block (found in the exe's PDB).
-	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
-	// Immutable-data globals (@(rodata) / `#load`) the loader repoints from the exe's
-	// stale copy to this reload's fresh copy. Contributed by both the file-scope loop
-	// and `lb_build_static_variables`, so guarded by `hot_reload_mutex` outside the
-	// single-threaded loop.
-	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms;
+	Array<lbHotReloadStaticSym> hot_reload_tls_syms;     // thread-locals to preserve (§5)
+	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms; // @(rodata)/#load globals to repoint (§10)
 	BlockingMutex               hot_reload_mutex;
 };
 
 gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
-// Defined in llvm_backend.cpp; forward-declared so lb_build_static_variables
-// (llvm_backend_stmt.cpp, earlier in the unity build) can detect `#load` initializers.
+// Defined in llvm_backend.cpp; forward-declared for llvm_backend_stmt.cpp (unity build order).
 gb_internal bool lb_is_load_directive_expr(Ast *expr);
 gb_internal String lb_call_basic_directive_name(Ast *expr);
 
@@ -469,10 +442,7 @@ struct lbProcedure {
 
 	Type *internal_gen_type; // map_set, map_get, etc.
 
-	// Hot reload: per-procedure occurrence count of each local `@(static)` name,
-	// used to build a source-stable, collision-free symbol name (only initialized
-	// under -hot-reload). Body codegen for a single procedure is sequential, so
-	// this needs no locking.
+	// Per-proc occurrence count of each local @(static) name, for a stable symbol name (§4).
 	StringMap<u32> hot_reload_static_counts;
 };
 

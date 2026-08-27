@@ -70,9 +70,7 @@ gb_internal void lb_mem_copy_non_overlapping(lbProcedure *p, lbValue dst, lbValu
 }
 
 
-// Compare two path bytes for equality, treating '/' and '\\' as the same separator and
-// ASCII case-insensitively (Windows paths). ODIN_ROOT is normalized to backslashes while a
-// package `fullpath` may use forward slashes, so a raw byte compare would spuriously fail.
+// Path byte compare, '/'=='\\' and case-insensitive (Windows paths).
 gb_internal bool lb_path_char_eq(u8 a, u8 b) {
 	if (a == '/') { a = '\\'; }
 	if (b == '/') { b = '\\'; }
@@ -81,8 +79,7 @@ gb_internal bool lb_path_char_eq(u8 a, u8 b) {
 	return a == b;
 }
 
-// True iff `fullpath` is at or under directory `dir` (separator- and case-insensitive, with
-// a path boundary after `dir` so ".../core" does not match a sibling ".../core_extra").
+// True iff `fullpath` is at or under directory `dir` (path boundary after `dir`). See tech_design.md §7.
 gb_internal bool lb_path_under_dir(String fullpath, String dir) {
 	while (dir.len > 0 && (dir.text[dir.len-1] == '/' || dir.text[dir.len-1] == '\\')) {
 		dir.len -= 1; // ignore any trailing separator on the collection path
@@ -102,11 +99,8 @@ gb_internal bool lb_path_under_dir(String fullpath, String dir) {
 	return c == '/' || c == '\\';
 }
 
-// True iff `fullpath` is a SHIPPED standard-library package — i.e. under one of Odin's
-// BUILT-IN collections (base/core/vendor), identified by the `builtin` flag set when the
-// compiler registers them (src/main.cpp), NOT by collection name. A user `-collection` (even
-// one named `core`) has builtin=false, so a game engine's `src/engine/core` is not excluded;
-// and `ODIN_ROOT/examples/...` (the hot-reload tests) is under no collection, so it isn't either.
+// True iff `fullpath` is under a shipped builtin collection (base/core/vendor), by the
+// `builtin` flag (not collection name). See tech_design.md §7.
 gb_internal bool lb_path_is_stdlib(String fullpath) {
 	for (auto const &lc : library_collections) {
 		if (lc.builtin && lb_path_under_dir(fullpath, lc.path)) {
@@ -116,19 +110,8 @@ gb_internal bool lb_path_is_stdlib(String fullpath) {
 	return false;
 }
 
-// Tagless hot reload: whether procedure `p` is made hot-patchable automatically under
-// -hot-reload. Eligible = has a body, not foreign, not the program entry point, not opted
-// out via @(no_hot_reload), not force-inlined (mutually exclusive with noinline and no
-// out-of-line body to patch), has a normal prologue (exclude naked / inline-asm), and lives
-// in one of the USER's own packages (not the bundled core/base/vendor collections). Used
-// both when stamping the patchable attributes and when emitting the change-detection hashes,
-// so the two sets stay identical.
-//
-// Excluding core/base/vendor is essential for compile memory: making EVERY procedure in the
-// program noinline + patchable + full-debug + content-hashed defeats inlining of the entire
-// standard library (a program using `fmt` pulls in thousands of core procedures) and keeps
-// each as a standalone function with full CodeView debug info — a multi-GB compile spike.
-// Those procedures are almost never edited during a hot-reload session; the user's code is.
+// Whether `p` is auto hot-patchable under -hot-reload. Same predicate is used to stamp the
+// patchable attributes and to emit the change-detection hashes. See tech_design.md §7.
 gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
 	if (!build_context.hot_reload) {
 		return false;
@@ -153,11 +136,7 @@ gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
 	if (pt->Proc.calling_convention == ProcCC_Naked || pt->Proc.calling_convention == ProcCC_InlineAsm) {
 		return false;
 	}
-	// Only the user's own packages are auto hot-patchable; skip Odin's shipped standard
-	// library (ODIN_ROOT/{core,base,vendor,shared}). Anchored on ODIN_ROOT + fixed names,
-	// NOT collection names, so a user project's own core/base/vendor (e.g. a game engine's
-	// src/engine/core) stays hot-reloadable; and NOT all of ODIN_ROOT, so ODIN_ROOT/examples
-	// (the hot-reload tests) stays hot-reloadable too.
+	// Only user packages are auto hot-patchable; skip the shipped stdlib. See tech_design.md §7.
 	AstPackage *pkg = e->pkg;
 	if (pkg == nullptr) {
 		return false;
@@ -349,20 +328,12 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "cold");
 	}
 
-	// Tagless hot reload: under -hot-reload EVERY eligible procedure is made hot-patchable
-	// automatically (no @(hot_reload) tag). The reload loader detects these structurally by
-	// the prologue pad and patches only the ones whose code changed (see lb_proc_is_hot_reloadable).
+	// -hot-reload: make every eligible proc noinline + patchable, with a 16-byte prologue
+	// pad the loader parks its jump in. See tech_design.md §7.
 	if (lb_proc_is_hot_reloadable(p)) {
-		// Keep the procedure a discrete, non-inlined function so its machine code can
-		// be replaced at runtime, and give it a patchable prologue.
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 		lb_add_attribute_to_proc_with_string(m, p->value,
 			make_string_c("patchable-function"), make_string_c("prologue-short-redirect"));
-		// Emit a 16-byte NOP pad immediately before the entry (linker-independent, so it
-		// works with lld-link/link.exe/radlink alike). The hot-reload loader parks the
-		// full 14-byte absolute jump in this pad and then flips the 2-byte entry to a
-		// short jump into it with one atomic store — a torn-free publish. 16 keeps the
-		// entry 16-byte aligned. See core:sys/hot_reload.
 		lb_add_attribute_to_proc_with_string(m, p->value,
 			make_string_c("patchable-function-prefix"), make_string_c("16"));
 	}

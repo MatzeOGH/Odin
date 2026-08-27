@@ -2100,10 +2100,7 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		}
 	}
 
-	// -hot-reload compiles builtin collections optimized (-o:2) and user code unoptimized
-	// (-o:none) in the SAME build (see lb_init_module_worker_proc), which requires separate
-	// (per-package) modules. At -o:none that is already the default above, but at -o:speed/
-	// -o:size it is not — so force it on regardless of the global optimization level.
+	// -hot-reload needs separate modules for its per-module opt split. See tech_design.md §8.
 	if (bc->hot_reload && !is_arch_wasm()) {
 		bc->use_separate_modules = true;
 	}
@@ -2319,24 +2316,15 @@ gb_internal bool init_build_paths(String init_filename) {
 		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 	}
 
-	// -hot-reload: if no manifest path was given, default it to a stable file in the main
-	// package's directory. The manifest pins new-global arena offsets / build-id / the per-proc
-	// baseline hashes across the base exe build and every reload obj build; both builds of the
-	// SAME package resolve to the same file, so the user need not pass -hot-reload-manifest.
-	// (The base build is the executable and always (re)writes it fresh — see
-	// hot_reload_manifest_read — so a stale file from a previous session is not mistaken for a
-	// reload baseline.)
+	// -hot-reload: default the manifest to <pkg>/odin-hot-reload.manifest. See tech_design.md §3.
 	if (bc->hot_reload && bc->hot_reload_manifest.len == 0) {
 		String pkg_dir = bc->build_paths[BuildPath_Main_Package].basename;
 		bc->hot_reload_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-hot-reload.manifest"));
 	}
 
-	// -hot-reload-patch: when no explicit -out was given, default the reload patch object's
-	// output into a stable per-package `hot_objs/` directory that the loader's `apply_dir()`
-	// reads by convention, and clear any stale `*.obj` from a previous edit-set first so a
-	// reload only ever maps the current one. This is what lets the recompile command be just
-	// `odin build <pkg> -hot-reload-patch` with no -build-mode/-out/manifest to hand-align. An
-	// explicit -out disables both the default and the clean.
+	// -hot-reload-patch: with no -out, default the object into <pkg>/hot_objs/ and clear stale
+	// *.obj so a reload maps only the current set. See tech_design.md §2 (and §14: this side
+	// effect in path init is a known smell).
 	if (bc->hot_reload_patch && bc->out_filepath.len == 0) {
 		String pkg_dir  = bc->build_paths[BuildPath_Main_Package].basename;
 		String objs_dir = concatenate_strings(ha, pkg_dir, STR_LIT("/hot_objs"));
