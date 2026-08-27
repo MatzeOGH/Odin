@@ -56,16 +56,22 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	Checker *c = m->checker;
 	m->info = &c->info;
 
-	// Per-module optimization level. Normally every module uses the global level; under
-	// -hot-reload, the standard-library collections (base/core/vendor) are never
-	// hot-patched, so build them optimized/inlined at -o:2 while user modules stay at the
-	// global level (-o:none + noinline + patchable). A user proc's IR is independent of a
-	// builtin module's opt level (no cross-module inlining without LTO), so this does not
-	// perturb the per-function change-detection hashes. `default_module`, polymorphic, and
-	// equal modules have no builtin package and keep the global level.
-	m->optimization_level = build_context.optimization_level;
-	if (build_context.hot_reload && m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath)) {
-		m->optimization_level = 2;
+	// Per-module optimization level. Normally every module uses the global level. Under
+	// -hot-reload the split is FIXED regardless of the global -o flag: the standard-library
+	// collections (base/core/vendor) are never hot-patched, so build them optimized/inlined
+	// at -o:2, while everything the user can edit — user packages, the default/metadata
+	// module, polymorphic/equal modules — is pinned to -o:none so it stays noinline +
+	// patchable + full-debug and, crucially, so the base exe and every reload object compile
+	// user code identically no matter what -o the user passed (a mismatch would diverge the
+	// change-detection IR hashes and reference core procs the base inlined away). So -o:speed/
+	// -o:size still get an optimized stdlib but keep user code reloadable. (This relies on
+	// separate modules, which -hot-reload forces on — see init_build_context.) A user proc's
+	// IR is independent of a builtin module's opt level (no cross-module inlining without LTO).
+	if (build_context.hot_reload) {
+		bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
+		m->optimization_level = is_builtin ? 2 : -1; // -1 == -o:none
+	} else {
+		m->optimization_level = build_context.optimization_level;
 	}
 
 

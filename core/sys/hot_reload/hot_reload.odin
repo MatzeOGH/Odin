@@ -480,6 +480,144 @@ hr_proc_changed :: proc(name: string, obj_hashes: map[u64]u64, have_obj_hashes: 
 // reload fail loudly instead of corrupting that state (finding F14).
 @(private) _hr_busy: b32
 
+// --- reload generations (deferred free of previously mapped blocks) -----------
+//
+// Each reload maps fresh code/data into VirtualAlloc'd blocks (the per-object block
+// plus trampoline/import-cell "near" pages) and registers its `.pdata` with
+// RtlAddFunctionTable. The old body stays mapped so in-flight calls in it finish on
+// old code; new calls take the patched jump. So the block can only be released once NO
+// thread has any frame inside it — which we test by stack-walking every (suspended)
+// thread. We record each reload's allocations as a "generation" and, at the start of
+// the next reload while the world is stopped, free every older generation that no thread
+// still touches (retrying the rest next time — old frames drain as threads return).
+// Without this, every reload leaked one block + one function-table registration.
+Hr_Range :: struct {
+	lo, hi: uintptr, // [lo, hi) address range of a mapped block
+}
+Hr_Generation :: struct {
+	serial: int,                            // identity; also stored in `_hr_owner` for live-reference tracking
+	blocks: [dynamic]rawptr,                // VirtualFree(MEM_RELEASE): object blocks + near pages
+	pdata:  [dynamic]win.PRUNTIME_FUNCTION, // RtlDeleteFunctionTable: registered unwind tables
+	ranges: [dynamic]Hr_Range,              // membership test for the stack walk (blocks + near pages)
+	owned:  [dynamic]uintptr,               // exe addresses (patched proc entries + refreshed globals) that reference this gen's blocks
+}
+// Process-lifetime; pinned to the OS heap (caller-independent), like `_hr_syms`.
+@(private) _hr_generations: [dynamic]Hr_Generation
+@(private) _hr_serial: int
+
+// Number of reload generations whose mapped blocks are still held (not yet reclaimed).
+// Bounded in steady state — old generations are freed once superseded and no thread is
+// inside them. Exposed for tests/diagnostics; not part of the reload contract.
+live_generations :: proc() -> int {
+	return len(_hr_generations)
+}
+// Each exe pointer that references a mapped block — a patched hot-proc entry, or a
+// refreshed @(rodata)/#load header — maps to the serial of the generation it currently
+// references. A generation is reclaimable only once NONE of its owned pointers still name
+// it (every one re-patched/re-refreshed by a newer generation). This is what makes freeing
+// safe under change detection: a proc edited in gen K and not since keeps its entry pointing
+// into gen K's block, so gen K must be kept even when no thread is currently inside it.
+@(private) _hr_owner: map[uintptr]int
+
+// True iff any suspended thread has a frame whose instruction pointer lies in `ranges`.
+// Conservative: if a thread's context/stack cannot be walked cleanly, returns true (keep
+// the generation) rather than risk freeing a block a thread is still executing in. The
+// standard x64 table-driven unwind loop (works through hot frames because their `.pdata`
+// is still registered until we free them).
+@(private)
+hr_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Hr_Range) -> bool {
+	ctx: win.CONTEXT
+	ctx.ContextFlags = win.CONTEXT_FULL
+	if !win.GetThreadContext(h, &ctx) {
+		return true // cannot read the context -> assume it might be inside
+	}
+	MAX_FRAMES :: 256
+	for _ in 0 ..< MAX_FRAMES {
+		pc := uintptr(ctx.Rip)
+		if pc == 0 {
+			return false // reached the top of the stack, clean
+		}
+		for r in ranges {
+			if pc >= r.lo && pc < r.hi {
+				return true
+			}
+		}
+		image_base: win.DWORD64
+		fe := win.RtlLookupFunctionEntry(win.DWORD64(pc), &image_base, nil)
+		if fe == nil {
+			// Leaf function (no unwind info): the return address sits at [RSP].
+			sp := uintptr(ctx.Rsp)
+			if sp == 0 {
+				return true // cannot step -> conservative
+			}
+			ctx.Rip = win.DWORD64((^uintptr)(sp)^)
+			ctx.Rsp = win.DWORD64(sp + 8)
+		} else {
+			handler_data: rawptr
+			establisher:  win.DWORD64
+			win.RtlVirtualUnwind(0, image_base, win.DWORD64(pc), fe, &ctx, &handler_data, &establisher, nil)
+		}
+	}
+	return true // walk too deep -> conservative
+}
+
+// Free every stored generation no suspended thread still touches; keep the rest for the
+// next reload. Must be called with the world stopped (contexts stable) — see the suspend
+// loop in `load_and_patch`. `handles` are the suspended threads (the loader thread itself
+// is excluded, and it holds no frame inside a hot block at this point).
+@(private)
+hr_try_free_old_generations :: proc(handles: [dynamic]win.HANDLE) {
+	if len(_hr_generations) == 0 {
+		return
+	}
+	kept := make([dynamic]Hr_Generation, 0, len(_hr_generations), runtime.heap_allocator())
+	freed := 0
+	for gen in _hr_generations {
+		// (1) Still referenced? A patched entry or refreshed header that still names this
+		// generation means the exe jumps/points into its block regardless of any thread — keep it.
+		referenced := false
+		for e in gen.owned {
+			if _hr_owner[e] == gen.serial {
+				referenced = true
+				break
+			}
+		}
+		if referenced {
+			append(&kept, gen)
+			continue
+		}
+		// (2) No live reference, but a thread may still be mid-call inside the old body — keep
+		// it until the stack walk shows every thread has left.
+		in_use := false
+		for h in handles {
+			if hr_thread_touches(h, gen.ranges) {
+				in_use = true
+				break
+			}
+		}
+		if in_use {
+			append(&kept, gen)
+			continue
+		}
+		for p in gen.pdata {
+			win.RtlDeleteFunctionTable(p)
+		}
+		for b in gen.blocks {
+			win.VirtualFree(b, 0, win.MEM_RELEASE)
+		}
+		delete(gen.blocks)
+		delete(gen.pdata)
+		delete(gen.ranges)
+		delete(gen.owned)
+		freed += 1
+	}
+	delete(_hr_generations)
+	_hr_generations = kept
+	if freed > 0 {
+		fmt.printfln("[hot] freed %d stale reload generation(s); %d still in use", freed, len(kept))
+	}
+}
+
 // Reload `obj_path` into this running process, patching every `@(hot_reload)`
 // procedure to its fresh implementation. The set of procedures to patch is
 // discovered structurally from the running exe (see `hr_is_hot_entry`), so the
@@ -671,6 +809,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		text_size:     int,
 		near_arena:    Near_Arena,
 		resolved:      []rawptr,
+		pdata_regs:    [dynamic]win.PRUNTIME_FUNCTION, // .pdata registered via RtlAddFunctionTable (for later RtlDeleteFunctionTable)
 	}
 	PAGE :: 0x1000
 
@@ -751,6 +890,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			cells  = make(map[uintptr]rawptr, context.temp_allocator),
 		}
 		o.resolved = make([]rawptr, o.n_syms, context.temp_allocator)
+		o.pdata_regs = make([dynamic]win.PRUNTIME_FUNCTION, context.temp_allocator)
 		append(&objs, o)
 	}
 
@@ -990,6 +1130,8 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			if count > 0 {
 				if !win.RtlAddFunctionTable(win.PRUNTIME_FUNCTION(pbase), win.DWORD(count), win.DWORD64(uintptr(o.block))) {
 					fmt.eprintln("[hot] RtlAddFunctionTable failed; stack traces through hot code may be wrong")
+				} else {
+					append(&o.pdata_regs, win.PRUNTIME_FUNCTION(pbase)) // remember it so a later free can RtlDeleteFunctionTable
 				}
 			}
 		}
@@ -1095,6 +1237,20 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	//    and fresh (object) address first, then patch the whole batch with all other threads
 	//    suspended and only once no thread is parked in a region we overwrite.
 	if len(hot_names) == 0 && len(refresh_targets) == 0 {
+		// Nothing will jump into or point at this reload's freshly-mapped blocks, and no thread
+		// is inside them (nothing was patched), so free them immediately instead of leaking — a
+		// no-op reload (the common change-detection case) otherwise leaked one block per reload.
+		for &o in objs {
+			for p in o.pdata_regs {
+				win.RtlDeleteFunctionTable(p)
+			}
+			if o.block != nil {
+				win.VirtualFree(o.block, 0, win.MEM_RELEASE)
+			}
+			if o.near_arena.block != nil {
+				win.VirtualFree(o.near_arena.block, 0, win.MEM_RELEASE)
+			}
+		}
 		if have_obj_hashes {
 			// Change detection: no procedure's code changed since the currently-live version
 			// and no immutable data to repoint — a valid no-op reload. Refresh the baseline.
@@ -1121,6 +1277,18 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		if original == nil || !found {
 			fmt.eprintfln("[hot] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v); nothing patched", h.name, original != nil, found)
 			return false
+		}
+		// A proc with a usable 16-byte pad is patched atomically (writes only into its own
+		// pad) and is always safe. Without a pad the fallback overwrites PATCH_LEN bytes AT
+		// the entry, which would spill into the next symbol if the proc is shorter than that.
+		// Validate the gap here so an unsafe overwrite aborts the whole batch before any byte
+		// is written, rather than corrupting a neighbor mid-batch.
+		if !hr_has_patch_pad(original) {
+			gap := hr_next_symbol_after(uintptr(original)) - uintptr(original)
+			if gap < PATCH_LEN {
+				fmt.eprintfln("[hot] aborting reload: hot procedure %q has no patch pad and only %d bytes to its next symbol (need %d); nothing patched", h.name, gap, PATCH_LEN)
+				return false
+			}
 		}
 		append(&targets, Target{h.name, original, fresh})
 	}
@@ -1155,6 +1323,20 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		win.Sleep(1)
 	}
 
+	// The world is stopped and contexts are stable: reclaim any earlier reload's blocks
+	// that no thread still executes in (stack-walked), pairing RtlDeleteFunctionTable +
+	// VirtualFree. Generations still in use are retried next reload. Done here (before the
+	// patch) so a just-freed range could even be reused for the next mapping.
+	hr_try_free_old_generations(handles)
+
+	// This reload's generation identity. Every exe pointer we make reference this reload's
+	// blocks (a refreshed @(rodata)/#load header, a patched proc entry) is stamped into
+	// `_hr_owner` with this serial, so a later reload knows when those references have all
+	// moved on and the block is reclaimable. `owned` (heap-pinned) is that pointer set.
+	_hr_serial += 1
+	gen_serial := _hr_serial
+	gen_owned := make([dynamic]uintptr, runtime.heap_allocator())
+
 	// Repoint immutable-data globals now that the world is stopped (no torn reads). Each
 	// copy is `size` bytes exe<-object: a slice/string/#load header (16 bytes) starts
 	// pointing at the object's fresh blob; a value-type @(rodata) is overwritten in place.
@@ -1164,6 +1346,11 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			intrinsics.mem_copy(r.exe, r.obj, r.size)
 			restored: win.DWORD
 			win.VirtualProtect(r.exe, win.SIZE_T(r.size), old, &restored)
+			// The exe copy now references this reload's block (header -> object blob, or an
+			// in-place value that lives with the block's generation); track it so the block
+			// this refresh points into is not freed until a later reload re-refreshes it.
+			_hr_owner[uintptr(r.exe)] = gen_serial
+			append(&gen_owned, uintptr(r.exe))
 		} else {
 			fmt.eprintfln("[hot] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
 		}
@@ -1178,6 +1365,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		if ok {
 			fmt.printfln("[hot] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, atomic ? "atomic" : "overwrite")
 			patched += 1
+			// This entry now jumps into this reload's block; record the ownership so the block
+			// is kept alive until every proc it provides has been re-patched by a later reload.
+			_hr_owner[uintptr(t.original)] = gen_serial
+			append(&gen_owned, uintptr(t.original))
 		}
 	}
 	hr_resume(handles)
@@ -1225,6 +1416,39 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	//    live in any object. A hook allocates the new layout and deserializes what a pre-patch
 	//    hook saved. Reflecting the new layout requires `change.new` (not `type_info_of`).
 	hr_call_patch_hooks(post_tbl, changed, hr_resolve_post_hook, &all_defs)
+
+	// Record this reload's allocations as a generation so the NEXT reload can free them once
+	// no thread executes in them (see hr_try_free_old_generations). Pinned to the OS heap —
+	// process-lifetime, caller-allocator-independent, like `_hr_syms`.
+	{
+		gen: Hr_Generation
+		gen.serial = gen_serial
+		gen.owned  = gen_owned
+		gen.blocks = make([dynamic]rawptr, runtime.heap_allocator())
+		gen.pdata  = make([dynamic]win.PRUNTIME_FUNCTION, runtime.heap_allocator())
+		gen.ranges = make([dynamic]Hr_Range, runtime.heap_allocator())
+		for &o in objs {
+			if o.block != nil {
+				append(&gen.blocks, o.block)
+				append(&gen.ranges, Hr_Range{uintptr(o.block), uintptr(o.block) + uintptr(o.total)})
+			}
+			// The near arena's final page (trampolines + import cells) is jumped-to/read by
+			// the patched code, so a thread can be parked in a trampoline: track + free it too.
+			// ponytail: only the LAST near page is captured; if the arena overflowed >4 KiB of
+			// thunks in one reload it already orphaned earlier pages (a pre-existing rare leak).
+			if o.near_arena.block != nil {
+				append(&gen.blocks, o.near_arena.block)
+				append(&gen.ranges, Hr_Range{uintptr(o.near_arena.block), uintptr(o.near_arena.block) + uintptr(o.near_arena.cap)})
+			}
+			for p in o.pdata_regs {
+				append(&gen.pdata, p)
+			}
+		}
+		if _hr_generations == nil {
+			_hr_generations = make([dynamic]Hr_Generation, runtime.heap_allocator())
+		}
+		append(&_hr_generations, gen)
+	}
 	return true
 }
 
@@ -1371,6 +1595,13 @@ hr_patch_atomic :: proc(original: rawptr, target: rawptr) -> bool {
 // otherwise execute the half-written prologue). Relies on 16-byte proc alignment.
 @(private)
 hr_patch_overwrite :: proc(original: rawptr, target: rawptr) -> bool {
+	// Belt-and-suspenders: the batch already refuses an unsafe overwrite before any write
+	// (see load_and_patch's resolve-first loop), but guard here too so a direct caller can
+	// never spill PATCH_LEN bytes into the next symbol.
+	if gap := hr_next_symbol_after(uintptr(original)) - uintptr(original); gap < PATCH_LEN {
+		fmt.eprintfln("[hot] refusing overwrite patch: only %d bytes to next symbol (need %d)", gap, PATCH_LEN)
+		return false
+	}
 	old_protect: win.DWORD
 	if !win.VirtualProtect(original, win.SIZE_T(PATCH_LEN), win.PAGE_EXECUTE_READWRITE, &old_protect) {
 		fmt.eprintln("[hot] VirtualProtect failed")
@@ -1676,6 +1907,23 @@ hr_resolve_pdb :: proc(name: string) -> rawptr {
 		return nil
 	}
 	return _hr_syms[name]
+}
+
+// Address of the nearest enumerated exe symbol strictly above `addr`, or max(uintptr)
+// if none. Used to bound how many bytes the non-atomic prologue overwrite may safely
+// write before it would spill into the next procedure/symbol (see hr_patch_overwrite).
+// ponytail: O(n) scan over the symbol map; the overwrite fallback is rare, so sorting
+// the addresses is unwarranted until it shows up hot.
+@(private)
+hr_next_symbol_after :: proc(addr: uintptr) -> uintptr {
+	best := max(uintptr)
+	for _, v in _hr_syms {
+		a := uintptr(v)
+		if a > addr && a < best {
+			best = a
+		}
+	}
+	return best
 }
 
 // The exe TLS-block offset of the thread-local named `varname`, memoized in `cache`.

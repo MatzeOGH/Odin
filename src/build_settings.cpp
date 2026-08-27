@@ -2100,6 +2100,14 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		}
 	}
 
+	// -hot-reload compiles builtin collections optimized (-o:2) and user code unoptimized
+	// (-o:none) in the SAME build (see lb_init_module_worker_proc), which requires separate
+	// (per-package) modules. At -o:none that is already the default above, but at -o:speed/
+	// -o:size it is not — so force it on regardless of the global optimization level.
+	if (bc->hot_reload && !is_arch_wasm()) {
+		bc->use_separate_modules = true;
+	}
+
 	if (build_context.use_single_module) {
 		bc->use_separate_modules = false;
 	}

@@ -432,18 +432,72 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       the exe's table and, each reload, patches ONLY procedures whose hash changed (unchanged
       procs — the whole runtime and the loader itself — are skipped, so there is no
       "patch the patcher" hazard and only edited procs relocate). `-hot-reload` now **implies
-      `-debug`** (`src/main.cpp`), which also pins base and reload builds to the same
-      optimization level (`-o:none`) so the hashes match. Verified: a one-proc edit patches
+      `-debug`** (`src/main.cpp`) and compiles all user-editable code at `-o:none` regardless of
+      the global `-o` (see the "Optimized builds" item), so the base and reload hashes match.
+      Verified: a one-proc edit patches
       exactly that proc; a no-op reload prints "no changed procedures"; `mt_test` still
       200/200. **Soundness note:** a change to a string literal's *content* at the same length
       is not detected (the content lives in a separate constant global, not in the referencing
       proc's IR); length changes and all code changes are detected.
-- [ ] **Validate optimized builds** (`-o:speed`/`-o:size`) — cross-TU inlining and
-      COMDAT folding can defeat patching; confirm `noinline` + single module hold up.
-- [ ] **Free the previously mapped block** on the next reload (currently leaks one
-      block per reload); optionally support unpatch / rewind.
-- [ ] **Guard the 14-byte patch** — assert the procedure is ≥14 bytes to its next
-      16-byte-aligned neighbor before overwriting (today relies on 16-byte alignment).
+- [x] **Optimized builds** (`-o:speed`/`-o:size`) — supported. Under `-hot-reload` the per-module
+      optimization split is now **fixed regardless of the global `-o` flag**: builtin collections
+      (`base`/`core`/`vendor`, never hot-patched) compile optimized at `-o:2`, while everything the
+      user can edit — user packages, the default/metadata module, polymorphic/equal modules — is
+      pinned to `-o:none` (noinline + patchable + full-debug). So `-o:speed`/`-o:size` get an
+      optimized standard library but keep user code reloadable, and — because user code compiles
+      identically (`-o:none`) in the base exe and every reload object no matter what `-o` was passed
+      — the change-detection IR hashes always match and the reload never references a `core` proc
+      the base inlined away. Two compiler changes: `src/llvm_backend_general.cpp`
+      (`lb_init_module_worker_proc` — the fixed builtin=`-o:2` / user=`-o:none` split under
+      `-hot-reload`), and `src/build_settings.cpp` (`init_build_context` — force
+      `use_separate_modules` on under `-hot-reload` so the split holds at `-o:speed`/`-o:size`,
+      where it is otherwise off).
+      - **Why this over matching opt levels in the manifest:** an earlier approach let user code
+        follow the global `-o`, which made a base and a reload built with different `-o` diverge
+        (inlining changed which `core` procs had PDB symbols → "unresolved relocation in executable
+        code"). Pinning user code to `-o:none` removes the need to match anything — the ergonomic
+        `-hot-reload-patch` recompile (always `-o:none`) is correct against a base built at ANY
+        `-o`. Relocation/patch behavior at `-o:speed` is now identical to `-o:none` (user IR is the
+        same); only the stdlib is optimized.
+      - **Verified** (`mt_test`, Windows/x64): base `-hot-reload -o:speed` (and `-o:size`) with a
+        reload built with **no** `-o` → **PASS 200/200, probe=1000**; `mt_test`/`free_test`/
+        `rodata_test` still pass at the default `-o:none`.
+- [x] **Free the previously mapped block** — a reload no longer leaks its mapped block(s) +
+      `.pdata` registration. Two paths, both in `core/sys/hot_reload/hot_reload.odin`:
+      - **No-op reload** (change detection finds nothing changed — the common case): the
+        freshly-mapped blocks are unreferenced and no thread is inside them, so they are
+        `RtlDeleteFunctionTable`'d + `VirtualFree`'d immediately before returning. (`mt_test`'s
+        199 no-op reloads previously leaked 199 blocks.)
+      - **Patching reload:** each reload's allocations (object block, trampoline/import-cell
+        "near" pages, `.pdata` registrations) are recorded as a **generation** (process-lifetime,
+        heap-pinned). At the start of the next reload, while the world is already stopped, every
+        older generation is freed **iff** (1) no live exe pointer still references it — a patched
+        proc entry or refreshed `@(rodata)`/`#load` header that still names it (`_hr_owner` maps
+        each such pointer → the serial of the generation it currently references; needed because
+        change detection re-patches only *changed* procs, so an unedited proc keeps its entry
+        pointing into an old block) — **and** (2) no thread has a frame inside it, tested by
+        stack-walking every suspended thread (`RtlLookupFunctionEntry` + `RtlVirtualUnwind`, the
+        standard table-driven x64 walk; conservative — an unwalkable thread keeps the generation).
+        Generations still in use are retried next reload (old frames drain as threads return).
+      - Verified by `examples/hot_reload/free_test` (`run_free_test.ps1`, exit 0 = PASS): 200
+        reloads alternating two distinct objects (so every reload supersedes the prior generation)
+        while 4 workers hammer the hot proc — the process survives, every worker advances (the
+        safety proof that no live block was freed under a thread), and **live generations stay
+        bounded (peak 2)** with freed block address ranges reused instead of growing. `mt_test`
+        still 200/200. **Unpatch/rewind** is still not implemented (out of scope).
+      - **Behavior change (documented under Known limitations):** a raw pointer squirreled away
+        into old hot code/data and dereferenced ≥2 reloads later can now fault (that generation
+        may have been reclaimed) instead of reading leaked-but-valid stale bytes.
+- [x] **Guard the 14-byte patch** — the non-atomic prologue overwrite (`hr_patch_overwrite`)
+      no longer blindly writes `PATCH_LEN` (14) bytes at the entry. Before any write, the
+      resolve-first validation loop refuses a target that lacks a usable 16-byte pad
+      (`!hr_has_patch_pad`) **and** whose gap to the next enumerated PDB symbol
+      (`hr_next_symbol_after`, an O(n) min over `_hr_syms`) is `< PATCH_LEN` — aborting the whole
+      reload with a named message rather than spilling into a neighbor mid-batch. Targets with a
+      pad take the atomic path (write only into their own pad) and are always safe.
+      `hr_patch_overwrite` keeps the same check defensively for any direct caller. Verified:
+      `mt_test` still 200/200 (every proc has its pad, so the guard never trips on the normal
+      path). Loader: `core/sys/hot_reload/hot_reload.odin` only.
 - [x] **Build-identity / staleness check (safety net).** A reload object is now bound to the
       *running* exe. The compiler bakes `__odin_hot_reload_build_id : u64` (external,
       `llvm.used`-kept, PDB-resolvable) into both the exe and every reload object; the base
@@ -549,10 +603,13 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   optimization level is `lbModule.optimization_level`, set in `lb_init_module_worker_proc`.
 - **`-hot-reload` implies `-debug`.** The loader resolves the running exe's symbols from its
   PDB, so a `.pdb` must sit next to the exe; `-hot-reload` now turns on `-debug` automatically
-  (`src/main.cpp`). This also pins base and reload builds to the same optimization level
-  (`-o:none`), which the change-detection content hashes rely on to match. The hot-patchable
-  set is emitted for every eligible procedure and recovered structurally from the
-  patchable-function prefix — see `hr_is_hot_entry`.
+  (`src/main.cpp`). The hot-patchable set is emitted for every eligible procedure and recovered
+  structurally from the patchable-function prefix — see `hr_is_hot_entry`. The global `-o` flag
+  is honored for the **standard library only**: under `-hot-reload`, user-editable code
+  (user packages + the default/metadata module) is always compiled `-o:none` + noinline +
+  patchable regardless of `-o`, while builtin collections compile `-o:2`; so the base and every
+  reload compile user code identically and `-o:speed`/`-o:size` still hot-reload (separate
+  modules are forced on to make the split possible). See the Tier 3 "Optimized builds" item.
 - Multithreaded-safe: a reload suspends the other threads, checks their instruction
   pointers, and publishes each redirect with a single atomic store (see Tier 1). The
   interactive demo still reloads between ticks for clarity; the multithreaded path is
@@ -569,10 +626,14 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 - Reflection from hot code works (`fmt` of basic types, `%v` on a user struct, `typeid`) as
   long as the type already existed in the base build's `type_table`; a brand-new type
   introduced *only* by a hot edit is absent from the frozen `type_table` and won't reflect.
-- Each reload leaks the mapped object block (and any trampoline / import-cell pages), and the
-  loader's PDB symbol map is populated once and kept for the process lifetime. The registered
-  `.pdata` (`RtlAddFunctionTable`) is never paired with `RtlDeleteFunctionTable`, so the
-  function-table registry also grows across reloads (unwinding stays valid, but it is a leak).
+- The mapped object block, its trampoline/import-cell pages, and its `.pdata` registration are
+  now reclaimed (`RtlDeleteFunctionTable` + `VirtualFree`) once superseded and no thread is
+  inside — a no-op reload frees them immediately, a patching reload frees older generations at
+  the next reload (see the Tier 3 "Free the previously mapped block" item). Consequence: a raw
+  pointer saved into old hot code/data and used ≥2 reloads later can fault instead of reading
+  stale bytes. The loader's PDB symbol map is still populated once and kept for the process
+  lifetime (bounded, not per-reload). A generation a thread never leaves, or one an unedited
+  proc's entry keeps pointing into, is deliberately retained (correctness over reclamation).
 - **Stale procedure pointers.** Only direct call sites and the patched hot-proc entries
   redirect to new code. A `proc` value stored in a global/struct/vtable that points at a
   *non-hot* proc which was recompiled is now stale; a stored pointer to a *hot* proc's entry
@@ -586,8 +647,9 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   Tier 1). To get an editable embedded value refreshed on reload, make it `@(rodata)` or `#load`.
 - **`@(rodata)`/`#load` refresh caveats.** (a) The refresh repoints/overwrites the exe's *canonical*
   copy, so a pointer to that data saved into other mutable state before the reload becomes stale
-  (it points at the pre-reload bytes; for `#load` that is the previous mapped block — leaked, so
-  still valid, but old). (b) A **value-type** `@(rodata)` is overwritten in place, so its type/size
+  (it points at the pre-reload bytes; for `#load` that is the previous mapped block, which — since
+  the block-freeing change — may be reclaimed after a later reload, so such a saved pointer can
+  fault rather than read old-but-valid bytes). (b) A **value-type** `@(rodata)` is overwritten in place, so its type/size
   must not change across a reload (the existing type-hash guard rejects a change); variable-size
   data should be a slice/string/`#load`, whose header is repointed instead. (c) Writing through
   such data is a user bug and faults (its pages are re-protected read-only by the W^X pass), the
