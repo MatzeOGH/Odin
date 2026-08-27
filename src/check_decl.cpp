@@ -1341,15 +1341,15 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 	if (ac.set_cold) {
 		e->flags |= EntityFlag_Cold;
 	}
-	if (ac.no_hot_reload) {
-		e->Procedure.no_hot_reload = true;
+	if (ac.no_livepatch) {
+		e->Procedure.no_livepatch = true;
 	}
 
 	// only add patch hooks when needed
-	if ((ac.pre_patch_hook || ac.post_patch_hook) && build_context.hot_reload) {
+	if ((ac.pre_patch_hook || ac.post_patch_hook) && build_context.livepatch) {
 		ac.is_export = true;
 		if (pt->param_count != 1 || pt->result_count != 0) {
-			error(e->token, "a @(pre_patch_hook)/@(post_patch_hook) procedure must take one parameter (a []hot_reload.Type_Change slice) and return nothing");
+			error(e->token, "a @(pre_patch_hook)/@(post_patch_hook) procedure must take one parameter (a []livepatch.Type_Change slice) and return nothing");
 		}
 		if (ac.pre_patch_hook)  e->Procedure.is_pre_patch_hook  = true;
 		if (ac.post_patch_hook) e->Procedure.is_post_patch_hook = true;

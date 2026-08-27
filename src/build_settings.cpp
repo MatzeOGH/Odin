@@ -587,14 +587,14 @@ struct BuildContext {
 	bool   use_single_module;
 	bool   use_separate_modules;
 
-	// BEGIN HOT_RELOAD
-	bool   hot_reload;
-	bool   hot_reload_patch;
-	bool   hot_reload_is_reload;
-	i64    hot_reload_arena_size; // bytes for new globals
-	i64    hot_reload_tls_arena_size; // bytes for new tls 
-	String hot_reload_manifest;
-	// END HOT_RELOAD
+	// BEGIN LIVEPATCH
+	bool   livepatch;
+	bool   livepatch_patch;
+	bool   livepatch_is_reload;
+	i64    livepatch_arena_size; // bytes for new globals
+	i64    livepatch_tls_arena_size; // bytes for new tls 
+	String livepatch_manifest;
+	// END LIVEPATCH
 
 	LTOKind lto_kind;
 	bool   module_per_file;
@@ -2105,7 +2105,7 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	}
 
 	//NOTE(mh): why !is_arch_wasm()?
-	if (bc->hot_reload && !is_arch_wasm()) {
+	if (bc->livepatch && !is_arch_wasm()) {
 		bc->use_separate_modules = true;
 	}
 
@@ -2319,12 +2319,12 @@ gb_internal bool init_build_paths(String init_filename) {
 		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 	}
 
-	if (bc->hot_reload && bc->hot_reload_manifest.len == 0) {
+	if (bc->livepatch && bc->livepatch_manifest.len == 0) {
 		String pkg_dir = bc->build_paths[BuildPath_Main_Package].basename;
-		bc->hot_reload_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-hot-reload.manifest"));
+		bc->livepatch_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-livepatch.manifest"));
 	}
 
-	if (bc->hot_reload_patch && bc->out_filepath.len == 0) {
+	if (bc->livepatch_patch && bc->out_filepath.len == 0) {
 		String pkg_dir  = bc->build_paths[BuildPath_Main_Package].basename;
 		String objs_dir = concatenate_strings(ha, pkg_dir, STR_LIT("/hot_objs"));
 		check_if_exists_directory_otherwise_create(objs_dir);

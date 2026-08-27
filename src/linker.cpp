@@ -307,8 +307,8 @@ try_cross_linking:;
 				link_settings = gb_string_append_fmt(link_settings, " /DEBUG");
 			}
 
-			if (build_context.hot_reload) {
-				// /OPT:NOICF needed for hot reload to work
+			if (build_context.livepatch) {
+				// /OPT:NOICF needed for livepatch to work
 				link_settings = gb_string_append_fmt(link_settings, " /OPT:NOICF");
 			}
 
@@ -330,7 +330,7 @@ try_cross_linking:;
 				lld_lto_flags = gb_string_append_fmt(lld_lto_flags, "/opt:lldltojobs=%d ", build_context.thread_count);
 			}
 
-			char const *opt_ref = build_context.hot_reload ? "/opt:noref" : "/opt:ref";
+			char const *opt_ref = build_context.livepatch ? "/opt:noref" : "/opt:ref";
 
 			switch (build_context.linker_choice) {
 			case Linker_lld:

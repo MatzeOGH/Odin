@@ -2820,8 +2820,8 @@ gb_internal void lb_add_foreign_library_paths(lbGenerator *gen) {
 
 // On a reload build, skip emitting an object for a builtin-collection module or an unchanged
 // user module (both are still in the exe). Minimal-object emission; see tech_design.md §6.
-gb_internal bool lb_hot_reload_skip_object(lbModule *m) {
-	if (!(build_context.hot_reload && build_context.hot_reload_is_reload && build_context.build_mode == BuildMode_Object)) {
+gb_internal bool lb_livepatch_skip_object(lbModule *m) {
+	if (!(build_context.livepatch && build_context.livepatch_is_reload && build_context.build_mode == BuildMode_Object)) {
 		return false;
 	}
 	if (m->pkg == nullptr) {
@@ -2830,7 +2830,7 @@ gb_internal bool lb_hot_reload_skip_object(lbModule *m) {
 	if (lb_path_is_stdlib(m->pkg->fullpath)) {
 		return true; // (1) standard library — resolved from the exe
 	}
-	return !m->hot_reload_changed; // (2) unchanged user package — skip
+	return !m->livepatch_changed; // (2) unchanged user package — skip
 }
 
 gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) {
@@ -2845,7 +2845,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 	if (do_threading) {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			if (lb_is_module_empty(m) || lb_hot_reload_skip_object(m)) {
+			if (lb_is_module_empty(m) || lb_livepatch_skip_object(m)) {
 				continue;
 			}
 
@@ -2867,7 +2867,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 	} else {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			if (lb_is_module_empty(m) || lb_hot_reload_skip_object(m)) {
+			if (lb_is_module_empty(m) || lb_livepatch_skip_object(m)) {
 				continue;
 			}
 
@@ -3094,11 +3094,11 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 
 
 // ---------------------------------------------------------------------------
-// Hot reload: arena for new globals + build-to-build manifest.
+// Livepatch: arena for new globals + build-to-build manifest.
 // See tech_design.md §4 (arena) and §3 (manifest).
 // ---------------------------------------------------------------------------
 
-gb_internal u64 lb_hot_reload_parse_u64(String s) {
+gb_internal u64 lb_livepatch_parse_u64(String s) {
 	u64 v = 0;
 	for (isize i = 0; i < s.len; i++) {
 		u8 c = s[i];
@@ -3109,18 +3109,18 @@ gb_internal u64 lb_hot_reload_parse_u64(String s) {
 }
 
 // The reserved arena new globals are placed into. See tech_design.md §4.
-gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
-	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_global_arena");
+gb_internal LLVMValueRef lb_livepatch_arena(lbModule *m) {
+	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_livepatch_global_arena");
 	if (existing != nullptr) {
 		return existing;
 	}
-	i64 size = build_context.hot_reload_arena_size;
+	i64 size = build_context.livepatch_arena_size;
 	if (size <= 0) {
 		size = 1;
 	}
 	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
-	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_hot_reload_global_arena");
-	if (build_context.hot_reload_is_reload) {
+	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_livepatch_global_arena");
+	if (build_context.livepatch_is_reload) {
 		LLVMSetLinkage(arena, LLVMExternalLinkage); // reference the exe's arena
 	} else {
 		LLVMSetInitializer(arena, LLVMConstNull(arena_t));
@@ -3131,9 +3131,9 @@ gb_internal LLVMValueRef lb_hot_reload_arena(lbModule *m) {
 }
 
 // A constant pointer of `ptr_type` into the arena at byte `offset`.
-gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
-	LLVMValueRef arena = lb_hot_reload_arena(m);
-	i64 size = build_context.hot_reload_arena_size;
+gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
+	LLVMValueRef arena = lb_livepatch_arena(m);
+	i64 size = build_context.livepatch_arena_size;
 	if (size <= 0) {
 		size = 1;
 	}
@@ -3146,17 +3146,17 @@ gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *
 }
 
 // Per-thread reserved storage for new thread-locals across a reload. See tech_design.md §5.
-gb_internal LLVMValueRef lb_hot_reload_tls_arena(lbModule *m) {
-	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_hot_reload_tls_arena");
+gb_internal LLVMValueRef lb_livepatch_tls_arena(lbModule *m) {
+	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_livepatch_tls_arena");
 	if (existing != nullptr) {
 		return existing;
 	}
-	i64 size = build_context.hot_reload_tls_arena_size;
+	i64 size = build_context.livepatch_tls_arena_size;
 	if (size <= 0) {
 		size = 1;
 	}
 	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
-	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_hot_reload_tls_arena");
+	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_livepatch_tls_arena");
 	LLVMSetInitializer(arena, LLVMConstNull(arena_t));
 	LLVMSetLinkage(arena, LLVMInternalLinkage);
 	LLVMSetThreadLocal(arena, true);
@@ -3166,9 +3166,9 @@ gb_internal LLVMValueRef lb_hot_reload_tls_arena(lbModule *m) {
 }
 
 // A constant (thread-local) pointer of `ptr_type` into the TLS arena at byte `offset`.
-gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
-	LLVMValueRef arena = lb_hot_reload_tls_arena(m);
-	i64 size = build_context.hot_reload_tls_arena_size;
+gb_internal LLVMValueRef lb_livepatch_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
+	LLVMValueRef arena = lb_livepatch_tls_arena(m);
+	i64 size = build_context.livepatch_tls_arena_size;
 	if (size <= 0) {
 		size = 1;
 	}
@@ -3180,8 +3180,8 @@ gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Ty
 	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
 }
 
-// HotReloadManifest et al. are defined in llvm_backend.hpp (unity build order).
-gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
+// LivePatchManifest et al. are defined in llvm_backend.hpp (unity build order).
+gb_internal void livepatch_manifest_read(LivePatchManifest *hm) {
 	string_map_init(&hm->orig);
 	string_map_init(&hm->sig);
 	string_map_init(&hm->fhash);
@@ -3191,11 +3191,11 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	hm->build_id = 0;
 	hm->pkg_dir = build_context.build_paths[BuildPath_Main_Package].basename;
 	hm->next_free = 0;
-	hm->arena_size = build_context.hot_reload_arena_size;
+	hm->arena_size = build_context.livepatch_arena_size;
 	hm->tls_next_free = 0;
-	hm->tls_arena_size = build_context.hot_reload_tls_arena_size;
+	hm->tls_arena_size = build_context.livepatch_tls_arena_size;
 
-	if (build_context.hot_reload_manifest.len == 0) {
+	if (build_context.livepatch_manifest.len == 0) {
 		return;
 	}
 	// Only a reload build (-build-mode:obj) reads the baseline; the base exe build writes it
@@ -3203,13 +3203,13 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	if (build_context.build_mode != BuildMode_Object) {
 		return;
 	}
-	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
+	char const *path_c = alloc_cstring(temporary_allocator(), build_context.livepatch_manifest);
 	gbFileContents fc = gb_file_read_contents(permanent_allocator(), true, path_c);
 	if (fc.data == nullptr || fc.size == 0) {
 		return; // manifest missing/empty: the exe was not built yet (build it first)
 	}
 	hm->exists = true;
-	build_context.hot_reload_is_reload = true;
+	build_context.livepatch_is_reload = true;
 
 	String content = make_string(cast(u8 const *)fc.data, cast(isize)fc.size);
 	isize i = 0;
@@ -3238,64 +3238,64 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 
 		String tag = tok(line, &p);
 		if (tag == "arena_size") {
-			hm->arena_size = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
-			build_context.hot_reload_arena_size = hm->arena_size;
+			hm->arena_size = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
+			build_context.livepatch_arena_size = hm->arena_size;
 		} else if (tag == "next_free") {
-			hm->next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			hm->next_free = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
 		} else if (tag == "tls_arena_size") {
-			hm->tls_arena_size = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
-			build_context.hot_reload_tls_arena_size = hm->tls_arena_size;
+			hm->tls_arena_size = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
+			build_context.livepatch_tls_arena_size = hm->tls_arena_size;
 		} else if (tag == "tls_next_free") {
-			hm->tls_next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
+			hm->tls_next_free = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
 		} else if (tag == "build_id") {
-			hm->build_id = lb_hot_reload_parse_u64(tok(line, &p));
+			hm->build_id = lb_livepatch_parse_u64(tok(line, &p));
 		} else if (tag == "pkg_dir") {
 			// Preserve verbatim so a reload rewrite does not drop it. May contain spaces.
 			String pd = rest(line, p);
 			if (pd.len > 0) { hm->pkg_dir = pd; }
 		} else if (tag == "orig") {
-			u64 th = lb_hot_reload_parse_u64(tok(line, &p));
+			u64 th = lb_livepatch_parse_u64(tok(line, &p));
 			String name = rest(line, p);
 			if (name.len > 0) { string_map_set(&hm->orig, name, th); }
 		} else if (tag == "sig") {
-			u64 sh = lb_hot_reload_parse_u64(tok(line, &p));
+			u64 sh = lb_livepatch_parse_u64(tok(line, &p));
 			String name = rest(line, p);
 			if (name.len > 0) { string_map_set(&hm->sig, name, sh); }
 		} else if (tag == "fhash") {
-			u64 ch = lb_hot_reload_parse_u64(tok(line, &p));
+			u64 ch = lb_livepatch_parse_u64(tok(line, &p));
 			String name = rest(line, p);
 			if (name.len > 0) { string_map_set(&hm->fhash, name, ch); }
 		} else if (tag == "new") {
-			i64 off     = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
-			u64 th      = lb_hot_reload_parse_u64(tok(line, &p));
-			i64 flag_p1 = cast(i64)lb_hot_reload_parse_u64(tok(line, &p)); // stored as offset+1 (0 == none)
+			i64 off     = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
+			u64 th      = lb_livepatch_parse_u64(tok(line, &p));
+			i64 flag_p1 = cast(i64)lb_livepatch_parse_u64(tok(line, &p)); // stored as offset+1 (0 == none)
 			String name = rest(line, p);
 			if (name.len > 0) {
-				HotReloadNewEntry ne = {off, th, flag_p1 - 1};
+				LivePatchNewEntry ne = {off, th, flag_p1 - 1};
 				string_map_set(&hm->newg, name, ne);
 			}
 		} else if (tag == "tls_new") {
-			i64 off     = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
-			u64 th      = lb_hot_reload_parse_u64(tok(line, &p));
-			i64 flag_p1 = cast(i64)lb_hot_reload_parse_u64(tok(line, &p)); // per-thread guard offset+1 (0 == none)
+			i64 off     = cast(i64)lb_livepatch_parse_u64(tok(line, &p));
+			u64 th      = lb_livepatch_parse_u64(tok(line, &p));
+			i64 flag_p1 = cast(i64)lb_livepatch_parse_u64(tok(line, &p)); // per-thread guard offset+1 (0 == none)
 			String name = rest(line, p);
 			if (name.len > 0) {
-				HotReloadNewEntry ne = {off, th, flag_p1 - 1};
+				LivePatchNewEntry ne = {off, th, flag_p1 - 1};
 				string_map_set(&hm->tls_newg, name, ne);
 			}
 		}
 	}
 }
 
-gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
-	if (build_context.hot_reload_manifest.len == 0) {
+gb_internal void livepatch_manifest_write(LivePatchManifest *hm) {
+	if (build_context.livepatch_manifest.len == 0) {
 		return;
 	}
 	// Do not persist a rejected build (a bad sig/offsets would make guards sticky). See tech_design.md §3.
 	if (any_errors()) {
 		return;
 	}
-	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
+	char const *path_c = alloc_cstring(temporary_allocator(), build_context.livepatch_manifest);
 	gbFile f = {};
 	if (gb_file_open_mode(&f, gbFileMode_Write, path_c) != gbFileError_None) {
 		return;
@@ -3306,7 +3306,7 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	gb_fprintf(&f, "tls_arena_size %llu\n", cast(unsigned long long)hm->tls_arena_size);
 	gb_fprintf(&f, "tls_next_free %llu\n", cast(unsigned long long)hm->tls_next_free);
 	gb_fprintf(&f, "build_id %llu\n", cast(unsigned long long)hm->build_id);
-	// Base package dir, so a running app can rebuild the patch (hot_reload.build_patch).
+	// Base package dir, so a running app can rebuild the patch (livepatch.build_patch).
 	if (hm->pkg_dir.len > 0) {
 		gb_fprintf(&f, "pkg_dir %.*s\n", LIT(hm->pkg_dir));
 	}
@@ -3323,17 +3323,17 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 		gb_fprintf(&f, "fhash %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));
 	}
 	for (u32 idx = 0; idx < hm->newg.count; idx++) {
-		StringMapEntry<HotReloadNewEntry> const &e = hm->newg.entries[idx];
+		StringMapEntry<LivePatchNewEntry> const &e = hm->newg.entries[idx];
 		gb_fprintf(&f, "new %llu %llu %llu %.*s\n", cast(unsigned long long)e.value.offset, cast(unsigned long long)e.value.type_hash, cast(unsigned long long)(e.value.init_flag_offset + 1), LIT(e.key));
 	}
 	for (u32 idx = 0; idx < hm->tls_newg.count; idx++) {
-		StringMapEntry<HotReloadNewEntry> const &e = hm->tls_newg.entries[idx];
+		StringMapEntry<LivePatchNewEntry> const &e = hm->tls_newg.entries[idx];
 		gb_fprintf(&f, "tls_new %llu %llu %llu %.*s\n", cast(unsigned long long)e.value.offset, cast(unsigned long long)e.value.type_hash, cast(unsigned long long)(e.value.init_flag_offset + 1), LIT(e.key));
 	}
 }
 
 // Append a little-endian u64 to a byte buffer (for the self-contained loader tables).
-gb_internal void lb_hot_reload_put_u64_le(Array<u8> *buf, u64 v) {
+gb_internal void lb_livepatch_put_u64_le(Array<u8> *buf, u64 v) {
 	for (int b = 0; b < 8; b++) {
 		array_add(buf, cast(u8)((v >> (8*b)) & 0xff));
 	}
@@ -3360,7 +3360,7 @@ gb_internal bool lb_is_load_directive_expr(Ast *expr) {
 }
 
 // Build the constant `[]Load_Directory_File` slice for a module-scope `#load_directory(call)`,
-// so a hot-reload global carries a real header the loader can repoint. See tech_design.md §10.
+// so a livepatch global carries a real header the loader can repoint. See tech_design.md §10.
 gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 	TEMPORARY_ALLOCATOR_GUARD();
 	LoadDirectoryCache *cache = map_must_get(&m->info->load_directory_map, call);
@@ -3393,7 +3393,7 @@ gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 
 // Whether a global holds immutable embedded data (@(rodata) or a #load initializer) that the
 // loader refreshes rather than preserves. See tech_design.md §10.
-gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
+gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl) {
 	if (e != nullptr && e->kind == Entity_Variable && e->Variable.is_rodata) {
 		return true;
 	}
@@ -3401,7 +3401,7 @@ gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
 }
 
 // Stable, debug-normalized hash of a proc's emitted IR text, for change detection. See tech_design.md §6.
-gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
+gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 	TEMPORARY_ALLOCATOR_GUARD(); // free the per-proc norm scratch; else it accumulates program-wide
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
@@ -3464,9 +3464,9 @@ gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
 	return h;
 }
 
-// Emit `__odin_hot_reload_func_hashes`, the {name_hash, content_hash} change-detection table
-// over every hot-reloadable proc. See tech_design.md §6.
-gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
+// Emit `__odin_livepatch_func_hashes`, the {name_hash, content_hash} change-detection table
+// over every livepatchable proc. See tech_design.md §6.
+gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
 	LLVMTypeRef u64t = lb_type(m, t_u64);
@@ -3474,7 +3474,7 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	LLVMTypeRef entry_field_types[2] = { u64t, u64t }; // { name_hash, content_hash }
 	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 2, false);
 
-	HotReloadManifest &hm = gen->hot_reload_manifest;
+	LivePatchManifest &hm = gen->livepatch_manifest;
 	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
 	// Gather hot procs from every module (they live in per-package modules); the table is
 	// still defined in default_module.
@@ -3482,23 +3482,23 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	for (auto const &entry : gen->modules) {
 		lbModule *mod = entry.value;
 		for (lbProcedure *p : mod->generated_procedures) {
-			if (lb_proc_is_hot_reloadable(p)) {
+			if (lb_proc_is_livepatchable(p)) {
 				array_add(&hot_procs, p);
 			}
 		}
 	}
 	for (lbProcedure *p : hot_procs) {
 		u64 name_hash    = fnv64a(p->name.text, p->name.len);
-		u64 content_hash = lb_hot_reload_proc_content_hash(p);
+		u64 content_hash = lb_livepatch_proc_content_hash(p);
 
 		// Minimal object emission: mark this proc's module changed if its hash differs from the
 		// baseline (read before the overwrite below). See tech_design.md §6.
 		if (!hm.exists) {
-			p->module->hot_reload_changed = true; // base build: no baseline, treat as changed
+			p->module->livepatch_changed = true; // base build: no baseline, treat as changed
 		} else {
 			u64 *base = string_map_get(&hm.fhash, p->name);
 			if (base == nullptr || *base != content_hash) {
-				p->module->hot_reload_changed = true;
+				p->module->livepatch_changed = true;
 			}
 		}
 
@@ -3512,7 +3512,7 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 				u64 *prev = string_map_get(&hm.sig, p->name);
 				if (prev != nullptr && *prev != sig_hash) {
 					Token tok = (p->entity != nullptr) ? p->entity->token : empty_token;
-					error(tok, "hot-reload: procedure '%.*s' changed its signature (parameter/return types); the frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
+					error(tok, "livepatch: procedure '%.*s' changed its signature (parameter/return types); the frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
 				}
 			}
 			string_map_set(&hm.sig, p->name, sig_hash);
@@ -3532,18 +3532,18 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 	LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entries.count, false), arr };
 	LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
 
-	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_hot_reload_func_hashes");
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_livepatch_func_hashes");
 	LLVMSetInitializer(tbl, tbl_val);
 	LLVMSetGlobalConstant(tbl, true);
 	LLVMSetLinkage(tbl, LLVMExternalLinkage); // public: PDB-resolvable baseline in the exe
 	lb_append_to_used(m, tbl);                // survive DCE; the loader reads it by name
 }
 
-// Emit `__odin_hot_reload_build_id : u64`, the layout fingerprint the loader checks to refuse a
+// Emit `__odin_livepatch_build_id : u64`, the layout fingerprint the loader checks to refuse a
 // stale object (F6). Call after emit_func_hashes so `sig` is complete. See tech_design.md §6.
-gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
+gb_internal void lb_livepatch_emit_build_id(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
-	HotReloadManifest &hm = gen->hot_reload_manifest;
+	LivePatchManifest &hm = gen->livepatch_manifest;
 
 	if (!hm.exists) {
 		// Base build: derive the id from the layout, folded commutatively (order-independent).
@@ -3563,7 +3563,7 @@ gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 	// Reload build: hm.build_id already holds the exe's value from the manifest.
 
 	LLVMTypeRef u64t = lb_type(m, t_u64);
-	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_hot_reload_build_id");
+	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_livepatch_build_id");
 	LLVMSetInitializer(g, LLVMConstInt(u64t, hm.build_id, false));
 	LLVMSetGlobalConstant(g, true);
 	LLVMSetLinkage(g, LLVMExternalLinkage); // public: PDB-resolvable in the exe, defined in the object
@@ -3572,27 +3572,27 @@ gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 
 // Emit the support symbols the loader resolves by name (arena, TLS arena, TLS accessors). See
 // tech_design.md §5, §13.
-gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
+gb_internal void lb_livepatch_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
 	// Reserve the per-thread TLS arena and record it for an accessor. See tech_design.md §5.
-	if (build_context.hot_reload_tls_arena_size > 0) {
-		LLVMValueRef tls_arena = lb_hot_reload_tls_arena(m);
-		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0, m};
-		array_add(&gen->hot_reload_tls_syms, s);
+	if (build_context.livepatch_tls_arena_size > 0) {
+		LLVMValueRef tls_arena = lb_livepatch_tls_arena(m);
+		lbLivePatchStaticSym s = {str_lit("__odin_livepatch_tls_arena"), tls_arena, 0, m};
+		array_add(&gen->livepatch_tls_syms, s);
 	}
 
-	// Emit a `__odin_hrtls$<link-name>() -> rawptr { return &var }` accessor for each thread-local
+	// Emit a `__odin_lptls$<link-name>() -> rawptr { return &var }` accessor for each thread-local
 	// so the loader can resolve SECREL references to the exe's TLS block. See tech_design.md §5.
 	{
-		for (lbHotReloadStaticSym const &s : gen->hot_reload_tls_syms) {
+		for (lbLivePatchStaticSym const &s : gen->livepatch_tls_syms) {
 			if (s.name.len == 0 || s.value == nullptr) {
 				continue;
 			}
 			// Emit into the module that defines the thread-local (LLVM forbids cross-module refs).
 			lbModule *am = (s.module != nullptr) ? s.module : m;
 			LLVMTypeRef acc_ty = LLVMFunctionType(lb_type(am, t_rawptr), nullptr, 0, false);
-			char const *acc_name = gb_bprintf("__odin_hrtls$%.*s", LIT(s.name));
+			char const *acc_name = gb_bprintf("__odin_lptls$%.*s", LIT(s.name));
 			LLVMValueRef acc = LLVMAddFunction(am->mod, acc_name, acc_ty);
 			LLVMSetLinkage(acc, LLVMExternalLinkage); // public: found via the exe's PDB
 			LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(am->ctx, acc, "entry");
@@ -3606,15 +3606,15 @@ gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	}
 
 	// Reserve the new-global arena and force-keep it so reloads can resolve it by name.
-	if (build_context.hot_reload_arena_size > 0) {
-		LLVMValueRef arena = lb_hot_reload_arena(m);
+	if (build_context.livepatch_arena_size > 0) {
+		LLVMValueRef arena = lb_livepatch_arena(m);
 		lb_append_to_used(m, arena);
 	}
 }
 
 // Emit a patch-hook name table (the exported symbol name of each @(pre/post_patch_hook)). The
 // loader resolves each name itself: pre against the exe, post against the object. See tech_design.md §11.
-gb_internal void lb_hot_reload_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
+gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
 	lbModule *m = &gen->default_module;
 	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
 	LLVMTypeRef i64t = lb_type(m, t_i64);
@@ -3978,16 +3978,16 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	auto global_variables = array_make<lbGlobalVariable>(permanent_allocator(), 0, global_variable_max_count);
 
-	// Under -hot-reload, load the manifest to tell original globals from new ones. These
+	// Under -livepatch, load the manifest to tell original globals from new ones. These
 	// generator-scoped lists are also filled by lb_build_static_variables (thread pool), and the
 	// manifest/init table are written after all procedures. See tech_design.md §3, §4.
-	HotReloadManifest &hot_reload_manifest = gen->hot_reload_manifest;
-	Array<HotReloadInitEntry> &hot_reload_inits = gen->hot_reload_inits;
-	if (build_context.hot_reload) {
-		hot_reload_inits = array_make<HotReloadInitEntry>(heap_allocator(), 0, 16);
-		gen->hot_reload_tls_syms = array_make<lbHotReloadStaticSym>(heap_allocator(), 0, 16);
-		gen->hot_reload_refresh_syms = array_make<lbHotReloadRefreshSym>(heap_allocator(), 0, 16);
-		hot_reload_manifest_read(&hot_reload_manifest);
+	LivePatchManifest &livepatch_manifest = gen->livepatch_manifest;
+	Array<LivePatchInitEntry> &livepatch_inits = gen->livepatch_inits;
+	if (build_context.livepatch) {
+		livepatch_inits = array_make<LivePatchInitEntry>(heap_allocator(), 0, 16);
+		gen->livepatch_tls_syms = array_make<lbLivePatchStaticSym>(heap_allocator(), 0, 16);
+		gen->livepatch_refresh_syms = array_make<lbLivePatchRefreshSym>(heap_allocator(), 0, 16);
+		livepatch_manifest_read(&livepatch_manifest);
 	}
 
 	for (DeclInfo *d : info->variable_init_order) {
@@ -4026,48 +4026,48 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lbGlobalVariable var = {};
 		var.decl = decl;
 
-		if (build_context.hot_reload && !is_foreign) {
-			bool is_refresh = lb_is_hot_reload_refresh_global(e, decl);
+		if (build_context.livepatch && !is_foreign) {
+			bool is_refresh = lb_is_livepatch_refresh_global(e, decl);
 			if (is_refresh) {
 				// Immutable embedded data (@(rodata)/#load): normal global, recorded for the
 				// loader to repoint. See tech_design.md §10.
-				lbHotReloadRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
-				array_add(&gen->hot_reload_refresh_syms, rs);
+				lbLivePatchRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
+				array_add(&gen->livepatch_refresh_syms, rs);
 			}
-			if (hot_reload_manifest.exists) {
+			if (livepatch_manifest.exists) {
 				u64 th = type_hash_canonical_type(e->type);
-				u64 *orig_th = string_map_get(&hot_reload_manifest.orig, name);
+				u64 *orig_th = string_map_get(&livepatch_manifest.orig, name);
 				if (orig_th != nullptr) {
 					// Original global: emit normally below; the loader preserves/repoints it.
 					if (*orig_th != th) {
-						error(e->token, "hot-reload: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
+						error(e->token, "livepatch: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
 					}
 				} else if (is_refresh) {
 					// New refresh global: emit object-local below, resolved fresh each reload.
 				} else if (e->Variable.thread_local_model.len != 0) {
 					// New thread-local -> per-thread TLS arena. See tech_design.md §5.
 					i64 offset = 0;
-					HotReloadNewEntry *ne = string_map_get(&hot_reload_manifest.tls_newg, name);
+					LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.tls_newg, name);
 					if (ne != nullptr) {
 						offset = ne->offset;
 						if (ne->type_hash != th) {
-							error(e->token, "hot-reload: new thread-local '%.*s' changed type/layout across a reload; its TLS arena storage cannot be reinterpreted safely", LIT(name));
+							error(e->token, "livepatch: new thread-local '%.*s' changed type/layout across a reload; its TLS arena storage cannot be reinterpreted safely", LIT(name));
 						}
 					} else {
 						i64 al = gb_max(type_align_of(e->type), 1);
 						i64 sz = gb_max(type_size_of(e->type), 1);
-						offset = align_formula(hot_reload_manifest.tls_next_free, al);
-						hot_reload_manifest.tls_next_free = offset + sz;
-						if (hot_reload_manifest.tls_next_free > hot_reload_manifest.tls_arena_size) {
-							error(e->token, "hot-reload: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-tls-arena-size", cast(long long)hot_reload_manifest.tls_next_free, cast(long long)hot_reload_manifest.tls_arena_size);
+						offset = align_formula(livepatch_manifest.tls_next_free, al);
+						livepatch_manifest.tls_next_free = offset + sz;
+						if (livepatch_manifest.tls_next_free > livepatch_manifest.tls_arena_size) {
+							error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)livepatch_manifest.tls_next_free, cast(long long)livepatch_manifest.tls_arena_size);
 						}
-						HotReloadNewEntry added = {offset, th, -1};
-						string_map_set(&hot_reload_manifest.tls_newg, name, added);
+						LivePatchNewEntry added = {offset, th, -1};
+						string_map_set(&livepatch_manifest.tls_newg, name, added);
 					}
 
 					lbValue g = {};
 					g.type  = alloc_type_pointer(e->type);
-					g.value = lb_hot_reload_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
+					g.value = lb_livepatch_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
 					var.is_initialized = true;
 					var.var = g;
 					array_add(&global_variables, var);
@@ -4100,49 +4100,49 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 						}
 					}
 					if (runtime_init) {
-						error(e->token, "hot-reload: new global '%.*s' has a non-constant initializer; only compile-time constant initializers are supported for a global introduced across a reload (runtime initializers and new @(init) are not yet supported)", LIT(name));
+						error(e->token, "livepatch: new global '%.*s' has a non-constant initializer; only compile-time constant initializers are supported for a global introduced across a reload (runtime initializers and new @(init) are not yet supported)", LIT(name));
 					}
 
 					i64 offset   = 0;
 					i64 flag_off = -1;
-					HotReloadNewEntry *ne = string_map_get(&hot_reload_manifest.newg, name);
+					LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.newg, name);
 					if (ne != nullptr) {
 						offset   = ne->offset;
 						flag_off = ne->init_flag_offset;
 						if (ne->type_hash != th) {
-							error(e->token, "hot-reload: new global '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
+							error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
 						}
 					} else {
 						i64 al = gb_max(type_align_of(e->type), 1);
 						i64 sz = gb_max(type_size_of(e->type), 1);
-						offset = align_formula(hot_reload_manifest.next_free, al);
-						hot_reload_manifest.next_free = offset + sz;
+						offset = align_formula(livepatch_manifest.next_free, al);
+						livepatch_manifest.next_free = offset + sz;
 						if (has_const_init) {
 							// One byte, gating the once-only copy in the loader.
-							flag_off = hot_reload_manifest.next_free;
-							hot_reload_manifest.next_free = flag_off + 1;
+							flag_off = livepatch_manifest.next_free;
+							livepatch_manifest.next_free = flag_off + 1;
 						}
-						if (hot_reload_manifest.next_free > hot_reload_manifest.arena_size) {
-							error(e->token, "hot-reload: new-global arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -hot-reload-arena-size", cast(long long)hot_reload_manifest.next_free, cast(long long)hot_reload_manifest.arena_size);
+						if (livepatch_manifest.next_free > livepatch_manifest.arena_size) {
+							error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-arena-size", cast(long long)livepatch_manifest.next_free, cast(long long)livepatch_manifest.arena_size);
 						}
-						HotReloadNewEntry added = {offset, th, flag_off};
-						string_map_set(&hot_reload_manifest.newg, name, added);
+						LivePatchNewEntry added = {offset, th, flag_off};
+						string_map_set(&livepatch_manifest.newg, name, added);
 
 						// Only the introducing build emits the constant + descriptor.
 						if (has_const_init) {
-							char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)hot_reload_inits.count);
+							char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)livepatch_inits.count);
 							LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), blob_name);
 							LLVMSetInitializer(blob, init.value);
 							LLVMSetGlobalConstant(blob, true);
 							LLVMSetLinkage(blob, LLVMPrivateLinkage);
-							HotReloadInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
-							array_add(&hot_reload_inits, ie);
+							LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
+							array_add(&livepatch_inits, ie);
 						}
 					}
 
 					lbValue g = {};
 					g.type  = alloc_type_pointer(e->type);
-					g.value = lb_hot_reload_arena_ptr(m, offset, alloc_type_pointer(e->type));
+					g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
 					var.is_initialized = true;
 					var.var = g;
 					array_add(&global_variables, var);
@@ -4151,7 +4151,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 					continue;
 				}
 			} else {
-				string_map_set(&hot_reload_manifest.orig, name, type_hash_canonical_type(e->type)); // base build: record as original
+				string_map_set(&livepatch_manifest.orig, name, type_hash_canonical_type(e->type)); // base build: record as original
 			}
 		}
 
@@ -4161,7 +4161,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 		if (decl->init_expr != nullptr) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
-			if (build_context.hot_reload && lb_call_basic_directive_name(decl->init_expr) == "load_directory") {
+			if (build_context.livepatch && lb_call_basic_directive_name(decl->init_expr) == "load_directory") {
 				// Bake the #load_directory const slice so the object carries a repointable header. See tech_design.md §10.
 				lbValue init = lb_const_load_directory_slice(m, unparen_expr(decl->init_expr));
 				LLVMDeleteGlobal(g.value);
@@ -4229,11 +4229,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, g.value);
 		}
 
-		// Hot reload: record the raw thread_local global for a later TLS accessor thunk. See
+		// Livepatch: record the raw thread_local global for a later TLS accessor thunk. See
 		// tech_design.md §5. `g.value` is still the raw global here, before the cast below.
-		if (build_context.hot_reload && !is_foreign && e->Variable.thread_local_model.len != 0) {
-			lbHotReloadStaticSym s = {name, g.value, type_hash_canonical_type(e->type), m};
-			array_add(&gen->hot_reload_tls_syms, s);
+		if (build_context.livepatch && !is_foreign && e->Variable.thread_local_model.len != 0) {
+			lbLivePatchStaticSym s = {name, g.value, type_hash_canonical_type(e->type), m};
+			array_add(&gen->livepatch_tls_syms, s);
 		}
 
 		if (m->debug_builder) {
@@ -4249,15 +4249,15 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 				u32 align_in_bits = cast(u32)(8*type_align_of(e->type));
 
-				// Under -hot-reload use the link name as the debug name so a reloaded global
+				// Under -livepatch use the link name as the debug name so a reloaded global
 				// resolves to the exe's copy via the PDB. See tech_design.md §9.
-				String dbg_name = build_context.hot_reload ? name : global_name;
-				char const *link_name = build_context.hot_reload ? cast(char const *)name.text : "";
-				isize       link_len  = build_context.hot_reload ? name.len                  : 0;
+				String dbg_name = build_context.livepatch ? name : global_name;
+				char const *link_name = build_context.livepatch ? cast(char const *)name.text : "";
+				isize       link_len  = build_context.livepatch ? name.len                  : 0;
 				LLVMMetadataRef global_variable_metadata = LLVMDIBuilderCreateGlobalVariableExpression(
 					m->debug_builder, llvm_scope,
 					cast(char const *)dbg_name.text, dbg_name.len,
-					link_name, link_len, // linkage name (PDB-resolvable under -hot-reload)
+					link_name, link_len, // linkage name (PDB-resolvable under -livepatch)
 					llvm_file, e->token.pos.line,
 					lb_debug_type(m, e->type),
 					local_to_unit,
@@ -4357,27 +4357,27 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_finalize_objc_names(gen, gen->objc_names);
 	}
 
-	if (build_context.hot_reload) {
-		TIME_SECTION("LLVM Hot Reload Support Symbols");
-		lb_hot_reload_emit_support(gen);
+	if (build_context.livepatch) {
+		TIME_SECTION("LLVM Livepatch Support Symbols");
+		lb_livepatch_emit_support(gen);
 
 		// Patch-hook name tables (§11). Change-detection hashes (§6). Build-id (§6). All after
 		// procedure generation so every proc/static is included.
-		lb_hot_reload_emit_patch_hook_table(gen, info, true,  "__odin_hot_reload_pre_patch_hooks");
-		lb_hot_reload_emit_patch_hook_table(gen, info, false, "__odin_hot_reload_post_patch_hooks");
-		lb_hot_reload_emit_func_hashes(gen);
-		lb_hot_reload_emit_build_id(gen); // after func hashes: needs the complete `sig` map
+		lb_livepatch_emit_patch_hook_table(gen, info, true,  "__odin_livepatch_pre_patch_hooks");
+		lb_livepatch_emit_patch_hook_table(gen, info, false, "__odin_livepatch_post_patch_hooks");
+		lb_livepatch_emit_func_hashes(gen);
+		lb_livepatch_emit_build_id(gen); // after func hashes: needs the complete `sig` map
 
 		// Once-only init table for new globals with const initializers. See tech_design.md §4, §13.
-		if (hot_reload_inits.count > 0) {
+		if (livepatch_inits.count > 0) {
 			lbModule *m = &gen->default_module;
 			LLVMTypeRef i64t = lb_type(m, t_i64);
 			LLVMTypeRef ptrt = lb_type(m, t_rawptr);
 			LLVMTypeRef entry_field_types[4] = { i64t, i64t, i64t, ptrt };
 			LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 4, false);
 
-			auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, hot_reload_inits.count);
-			for (HotReloadInitEntry const &ie : hot_reload_inits) {
+			auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, livepatch_inits.count);
+			for (LivePatchInitEntry const &ie : livepatch_inits) {
 				LLVMValueRef fields[4] = {};
 				fields[0] = LLVMConstInt(i64t, cast(u64)ie.arena_offset, false);
 				fields[1] = LLVMConstInt(i64t, cast(u64)ie.flag_offset, false);
@@ -4393,7 +4393,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
 			LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
 
-			LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_hot_reload_new_global_inits");
+			LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_livepatch_new_global_inits");
 			LLVMSetInitializer(tbl, tbl_val);
 			LLVMSetGlobalConstant(tbl, true);
 			LLVMSetLinkage(tbl, LLVMInternalLinkage);
@@ -4402,19 +4402,19 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 		// Refresh table for @(rodata)/#load globals: a self-contained blob [count]{size,name_len,name}.
 		// See tech_design.md §10, §13.
-		if (gen->hot_reload_refresh_syms.count > 0) {
+		if (gen->livepatch_refresh_syms.count > 0) {
 			lbModule *m = &gen->default_module;
 			auto buf = array_make<u8>(heap_allocator(), 0, 256);
-			lb_hot_reload_put_u64_le(&buf, cast(u64)gen->hot_reload_refresh_syms.count);
-			for (lbHotReloadRefreshSym const &rs : gen->hot_reload_refresh_syms) {
-				lb_hot_reload_put_u64_le(&buf, cast(u64)rs.size);
-				lb_hot_reload_put_u64_le(&buf, cast(u64)rs.name.len);
+			lb_livepatch_put_u64_le(&buf, cast(u64)gen->livepatch_refresh_syms.count);
+			for (lbLivePatchRefreshSym const &rs : gen->livepatch_refresh_syms) {
+				lb_livepatch_put_u64_le(&buf, cast(u64)rs.size);
+				lb_livepatch_put_u64_le(&buf, cast(u64)rs.name.len);
 				for (isize i = 0; i < rs.name.len; i++) {
 					array_add(&buf, rs.name.text[i]);
 				}
 			}
 			LLVMValueRef blob = LLVMConstStringInContext(m->ctx, cast(char const *)buf.data, cast(unsigned)buf.count, true);
-			LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_hot_reload_refresh_syms");
+			LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_livepatch_refresh_syms");
 			LLVMSetInitializer(tbl, blob);
 			LLVMSetGlobalConstant(tbl, true);
 			LLVMSetLinkage(tbl, LLVMInternalLinkage);
@@ -4424,9 +4424,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		}
 
 		// Persist the manifest (originals + assigned arena offsets). See tech_design.md §3.
-		hot_reload_manifest_write(&hot_reload_manifest);
-		array_free(&hot_reload_inits);
-		array_free(&gen->hot_reload_refresh_syms);
+		livepatch_manifest_write(&livepatch_manifest);
+		array_free(&livepatch_inits);
+		array_free(&gen->livepatch_refresh_syms);
 	}
 
 	if (build_context.ODIN_DEBUG) {

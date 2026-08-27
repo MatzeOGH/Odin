@@ -95,7 +95,7 @@ gb_internal lbValue lb_type_info(lbProcedure *p, Type *type) {
 	type = default_type(type);
 	lbModule *m = p->module;
 
-	if (build_context.hot_reload) {
+	if (build_context.livepatch) {
 		// Resolve through the exe's type_table by build-stable typeid, not a build-local index,
 		// so reflection in hot code lands on the exe's Type_Info. See tech_design.md §9.
 		auto args = array_make<lbValue>(permanent_allocator(), 1);
@@ -1155,16 +1155,16 @@ gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup typ
 	// force it to be constant
 	LLVMSetGlobalConstant(global_type_table.value, true);
 
-	if (build_context.hot_reload) {
+	if (build_context.livepatch) {
 		Type *slice_type = type_deref(global_type_table.type);
-		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_hot_reload_type_infos");
+		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_livepatch_type_infos");
 		LLVMSetInitializer(tbl, slice);
 		LLVMSetGlobalConstant(tbl, true);
 		LLVMSetLinkage(tbl, LLVMExternalLinkage);
 		lb_append_to_used(m, tbl);
 		
 		LLVMTypeRef ref_ty = LLVMPointerType(lb_type(m, slice_type), 0);
-		LLVMValueRef ref = LLVMAddGlobal(m->mod, ref_ty, "__odin_hot_reload_type_table_ref");
+		LLVMValueRef ref = LLVMAddGlobal(m->mod, ref_ty, "__odin_livepatch_type_table_ref");
 		LLVMSetInitializer(ref, global_type_table.value);
 		LLVMSetGlobalConstant(ref, true);
 		LLVMSetLinkage(ref, LLVMExternalLinkage);

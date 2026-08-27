@@ -110,17 +110,17 @@ gb_internal bool lb_path_is_stdlib(String fullpath) {
 	return false;
 }
 
-// Whether `p` is auto hot-patchable under -hot-reload. Same predicate is used to stamp the
+// Whether `p` is auto hot-patchable under -livepatch. Same predicate is used to stamp the
 // patchable attributes and to emit the change-detection hashes. See tech_design.md §7.
-gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
-	if (!build_context.hot_reload) {
+gb_internal bool lb_proc_is_livepatchable(lbProcedure *p) {
+	if (!build_context.livepatch) {
 		return false;
 	}
 	if (p == nullptr || p->body == nullptr || p->is_foreign) {
 		return false;
 	}
 	Entity *e = p->entity;
-	if (e == nullptr || e->kind != Entity_Procedure || e->Procedure.no_hot_reload) {
+	if (e == nullptr || e->kind != Entity_Procedure || e->Procedure.no_livepatch) {
 		return false;
 	}
 	if (p->module != nullptr && p->module->info != nullptr && e == p->module->info->entry_point) {
@@ -216,8 +216,8 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	// map_init(&p->selector_values,  0);
 	// map_init(&p->selector_addr,    0);
 	// map_init(&p->tuple_fix_map,    0);
-	if (build_context.hot_reload) {
-		string_map_init(&p->hot_reload_static_counts, 8);
+	if (build_context.livepatch) {
+		string_map_init(&p->livepatch_static_counts, 8);
 	}
 
 	if (p->entity != nullptr && p->entity->Procedure.uses_branch_location) {
@@ -328,9 +328,9 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "cold");
 	}
 
-	// -hot-reload: make every eligible proc noinline + patchable, with a 16-byte prologue
+	// -livepatch: make every eligible proc noinline + patchable, with a 16-byte prologue
 	// pad the loader parks its jump in. See tech_design.md §7.
-	if (lb_proc_is_hot_reloadable(p)) {
+	if (lb_proc_is_livepatchable(p)) {
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 		lb_add_attribute_to_proc_with_string(m, p->value,
 			make_string_c("patchable-function"), make_string_c("prologue-short-redirect"));
@@ -4811,7 +4811,7 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 			LLVMSetInitializer(global_data, array);
 			LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
 			LLVMSetLinkage(global_data, LLVMInternalLinkage);
-			if (build_context.hot_reload) {
+			if (build_context.livepatch) {
 				lb_set_odin_rtti_section(global_data);
 			}
 

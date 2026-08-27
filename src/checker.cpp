@@ -1361,7 +1361,7 @@ gb_internal void init_universal(void) {
 	add_global_bool_constant("ODIN_DEFAULT_TO_PANIC_ALLOCATOR", bc->ODIN_DEFAULT_TO_PANIC_ALLOCATOR);
 	add_global_bool_constant("ODIN_NO_CRT",                     bc->no_crt);
 	add_global_bool_constant("ODIN_USE_SEPARATE_MODULES",       bc->use_separate_modules);
-	add_global_bool_constant("ODIN_HOT_RELOAD",                 bc->hot_reload);
+	add_global_bool_constant("ODIN_LIVEPATCH",                 bc->livepatch);
 	add_global_bool_constant("ODIN_TEST",                       bc->command_kind == Command_test);
 	add_global_bool_constant("ODIN_NO_ENTRY_POINT",             bc->no_entry_point);
 	add_global_bool_constant("ODIN_FOREIGN_ERROR_PROCEDURES",   bc->ODIN_FOREIGN_ERROR_PROCEDURES);
@@ -3224,8 +3224,8 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 
 	thread_pool_wait();
 
-	if (build_context.hot_reload && !build_context.no_rtti) {
-		// emit type_info for hot reload
+	if (build_context.livepatch && !build_context.no_rtti) {
+		// emit type_info for livepatch
 		for (Entity *e : c->info.entities) {
 			if (e == nullptr || e->type == nullptr) {
 				continue;
@@ -4144,13 +4144,13 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 			}
 		}
 		return true;
-	} else if (name == "no_hot_reload") {
+	} else if (name == "no_livepatch") {
 		if (value == nullptr) {
-			ac->no_hot_reload = true;
+			ac->no_livepatch = true;
 		} else {
 			ExactValue ev = check_decl_attribute_value(c, value);
 			if (ev.kind == ExactValue_Bool) {
-				ac->no_hot_reload = ev.value_bool;
+				ac->no_livepatch = ev.value_bool;
 			} else {
 				error(elem, "Expected a boolean value for '%.*s' or no value whatsoever", LIT(name));
 			}

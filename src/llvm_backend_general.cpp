@@ -57,7 +57,7 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	m->info = &c->info;
 
 	// NOTE(mh): do we fix optimization_level? Should this be taken from the cli? 
-	if (build_context.hot_reload) {
+	if (build_context.livepatch) {
 		bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
 		m->optimization_level = is_builtin ? 2 : -1; // -1 == -o:none
 	} else {
@@ -409,7 +409,7 @@ gb_internal void lb_make_global_private_const(LLVMValueRef global_data) {
 	LLVMSetLinkage(global_data, LLVMLinkerPrivateLinkage);
 	LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
 	LLVMSetGlobalConstant(global_data, true);
-	if (build_context.hot_reload) {
+	if (build_context.livepatch) {
 		// Route every compiler-generated private constant (string/byte-slice/array
 		// backings, RTTI, etc.) into the `.odinti` section.
 		lb_set_odin_rtti_section(global_data);
@@ -3823,20 +3823,20 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 			String name = lb_get_entity_name(other_module, e);
 			
 			// add new globals
-			if (build_context.hot_reload) {
-				HotReloadManifest &hm = m->gen->hot_reload_manifest;
+			if (build_context.livepatch) {
+				LivePatchManifest &hm = m->gen->livepatch_manifest;
 				if (hm.exists) {
-					if (HotReloadNewEntry *ne = string_map_get(&hm.newg, name)) {
+					if (LivePatchNewEntry *ne = string_map_get(&hm.newg, name)) {
 						lbValue g = {};
 						g.type  = alloc_type_pointer(e->type);
-						g.value = lb_hot_reload_arena_ptr(m, ne->offset, g.type);
+						g.value = lb_livepatch_arena_ptr(m, ne->offset, g.type);
 						lb_add_entity(m, e, g);
 						return g;
 					}
-					if (HotReloadNewEntry *ne = string_map_get(&hm.tls_newg, name)) {
+					if (LivePatchNewEntry *ne = string_map_get(&hm.tls_newg, name)) {
 						lbValue g = {};
 						g.type  = alloc_type_pointer(e->type);
-						g.value = lb_hot_reload_tls_arena_ptr(m, ne->offset, g.type);
+						g.value = lb_livepatch_tls_arena_ptr(m, ne->offset, g.type);
 						lb_add_entity(m, e, g);
 						return g;
 					}

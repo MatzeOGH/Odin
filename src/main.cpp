@@ -405,11 +405,11 @@ enum BuildFlagKind {
 	BuildFlag_Linker,
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
-	BuildFlag_HotReload,
-	BuildFlag_HotReloadPatch,
-	BuildFlag_HotReloadArenaSize,
-	BuildFlag_HotReloadTlsArenaSize,
-	BuildFlag_HotReloadManifest,
+	BuildFlag_LivePatch,
+	BuildFlag_LivePatchPatch,
+	BuildFlag_LivePatchArenaSize,
+	BuildFlag_LivePatchTlsArenaSize,
+	BuildFlag_LivePatchManifest,
 	BuildFlag_NoThreadedChecker,
 	BuildFlag_ShowDebugMessages,
 	BuildFlag_DidYouMeanLimit,
@@ -671,11 +671,11 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_Linker,                  str_lit("linker"),                    BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
-	add_flag(&build_flags, BuildFlag_HotReload,               str_lit("hot-reload"),               BuildFlagParam_None,    Command__does_build);
-	add_flag(&build_flags, BuildFlag_HotReloadPatch,          str_lit("hot-reload-patch"),          BuildFlagParam_None,    Command__does_build);
-	add_flag(&build_flags, BuildFlag_HotReloadArenaSize,      str_lit("hot-reload-arena-size"),     BuildFlagParam_Integer, Command__does_build);
-	add_flag(&build_flags, BuildFlag_HotReloadTlsArenaSize,   str_lit("hot-reload-tls-arena-size"), BuildFlagParam_Integer, Command__does_build);
-	add_flag(&build_flags, BuildFlag_HotReloadManifest,       str_lit("hot-reload-manifest"),       BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatch,               str_lit("livepatch"),               BuildFlagParam_None,    Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatchPatch,          str_lit("livepatch-patch"),          BuildFlagParam_None,    Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatchArenaSize,      str_lit("livepatch-arena-size"),     BuildFlagParam_Integer, Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatchTlsArenaSize,   str_lit("livepatch-tls-arena-size"), BuildFlagParam_Integer, Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatchManifest,       str_lit("livepatch-manifest"),       BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ShowDebugMessages,       str_lit("show-debug-messages"),       BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_DidYouMeanLimit,         str_lit("did-you-mean-limit"),        BuildFlagParam_Integer, Command__does_check);
@@ -1424,29 +1424,29 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							}
 							build_context.use_single_module = true;
 							break;
-						case BuildFlag_HotReload:
-							build_context.hot_reload = true;
+						case BuildFlag_LivePatch:
+							build_context.livepatch = true;
 							build_context.ODIN_DEBUG = true;
-							if (build_context.hot_reload_arena_size == 0) {
-								build_context.hot_reload_arena_size = 256*1024;
+							if (build_context.livepatch_arena_size == 0) {
+								build_context.livepatch_arena_size = 256*1024;
 							}
-							if (build_context.hot_reload_tls_arena_size == 0) {
-								build_context.hot_reload_tls_arena_size = 4*1024;
+							if (build_context.livepatch_tls_arena_size == 0) {
+								build_context.livepatch_tls_arena_size = 4*1024;
 							}
 							break;
-						case BuildFlag_HotReloadPatch:
-							build_context.hot_reload = true;
-							build_context.hot_reload_patch = true;
+						case BuildFlag_LivePatchPatch:
+							build_context.livepatch = true;
+							build_context.livepatch_patch = true;
 							build_context.ODIN_DEBUG = true;
 							build_context.build_mode = BuildMode_Object;
-							if (build_context.hot_reload_arena_size == 0) {
-								build_context.hot_reload_arena_size = 256*1024;
+							if (build_context.livepatch_arena_size == 0) {
+								build_context.livepatch_arena_size = 256*1024;
 							}
-							if (build_context.hot_reload_tls_arena_size == 0) {
-								build_context.hot_reload_tls_arena_size = 4*1024;
+							if (build_context.livepatch_tls_arena_size == 0) {
+								build_context.livepatch_tls_arena_size = 4*1024;
 							}
 							break;
-						case BuildFlag_HotReloadArenaSize:
+						case BuildFlag_LivePatchArenaSize:
 							{
 								GB_ASSERT(value.kind == ExactValue_Integer);
 								i64 size = big_int_to_i64(&value.value_integer);
@@ -1454,11 +1454,11 @@ gb_internal bool parse_build_flags(Array<String> args) {
 									gb_printf_err("%.*s expected a non-negative number, got %.*s\n", LIT(name), LIT(param));
 									bad_flags = true;
 								} else {
-									build_context.hot_reload_arena_size = size;
+									build_context.livepatch_arena_size = size;
 								}
 							}
 							break;
-						case BuildFlag_HotReloadTlsArenaSize:
+						case BuildFlag_LivePatchTlsArenaSize:
 							{
 								GB_ASSERT(value.kind == ExactValue_Integer);
 								i64 size = big_int_to_i64(&value.value_integer);
@@ -1466,13 +1466,13 @@ gb_internal bool parse_build_flags(Array<String> args) {
 									gb_printf_err("%.*s expected a non-negative number, got %.*s\n", LIT(name), LIT(param));
 									bad_flags = true;
 								} else {
-									build_context.hot_reload_tls_arena_size = size;
+									build_context.livepatch_tls_arena_size = size;
 								}
 							}
 							break;
-						case BuildFlag_HotReloadManifest:
+						case BuildFlag_LivePatchManifest:
 							GB_ASSERT(value.kind == ExactValue_String);
-							build_context.hot_reload_manifest = value.value_string;
+							build_context.livepatch_manifest = value.value_string;
 							break;
 						case BuildFlag_NoThreadedChecker:
 							build_context.no_threaded_checker = true;
@@ -2045,16 +2045,16 @@ gb_internal bool parse_build_flags(Array<String> args) {
 		bad_flags = true;
 	}
 
-	if (build_context.hot_reload) {
+	if (build_context.livepatch) {
 		bool is_reload_output = build_context.build_mode == BuildMode_Object ||
 		                        build_context.build_mode == BuildMode_Assembly ||
 		                        build_context.build_mode == BuildMode_LLVM_IR;
 		if (!is_reload_output && build_context.build_mode != BuildMode_Executable) {
-			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe) reload objects use -build-mode:obj\n");
+			gb_printf_err("-livepatch host must be an executable (-build-mode:exe) reload objects use -build-mode:obj\n");
 			bad_flags = true;
 		}
-		if (build_context.hot_reload_patch && build_context.build_mode != BuildMode_Object) {
-			gb_printf_err("-hot-reload-patch and -build-mode must not be used at the same time\n");
+		if (build_context.livepatch_patch && build_context.build_mode != BuildMode_Object) {
+			gb_printf_err("-livepatch-patch and -build-mode must not be used at the same time\n");
 			bad_flags = true;
 		}
 	}
@@ -3388,21 +3388,21 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "This is the default behaviour for '-o:speed' or '-o:size'.");
 		}
 
-		if (print_flag("-hot-reload")) {
+		if (print_flag("-livepatch")) {
 			print_usage_line(2, "Builds an executable that supports in-process patching (Windows/x64).");
 			print_usage_line(2, "Implies: -debug /OPT:NOREF,NOICF");
 		}
-		if (print_flag("-hot-reload-patch")) {
-			print_usage_line(2, "Builds the reload PATCH object for an already-running -hot-reload executable.");
-			print_usage_line(2, "'odin build <pkg> -hot-reload-patch'.");
+		if (print_flag("-livepatch-patch")) {
+			print_usage_line(2, "Builds the reload PATCH object for an already-running -livepatch executable.");
+			print_usage_line(2, "'odin build <pkg> -livepatch-patch'.");
 		}
-		if (print_flag("-hot-reload-manifest:<filepath>")) {
-			print_usage_line(2, "Overrides the hot-reload manifest path (default: <package>/odin-hot-reload.manifest).");
+		if (print_flag("-livepatch-manifest:<filepath>")) {
+			print_usage_line(2, "Overrides the livepatch manifest path (default: <package>/odin-livepatch.manifest).");
 		}
-		if (print_flag("-hot-reload-arena-size:<integer>")) {
+		if (print_flag("-livepatch-arena-size:<integer>")) {
 			print_usage_line(2, "Bytes reserved in the exe for globals introduced by a reload (default: 262144).");
 		}
-		if (print_flag("-hot-reload-tls-arena-size:<integer>")) {
+		if (print_flag("-livepatch-tls-arena-size:<integer>")) {
 			print_usage_line(2, "Per-thread bytes reserved for thread-locals introduced by a reload (default: 4096).");
 		}
 

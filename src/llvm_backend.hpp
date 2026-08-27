@@ -124,7 +124,7 @@ struct lbModule {
 	AstFile *file;   // possibly associated
 	char const *module_name;
 	int optimization_level;
-	bool hot_reload_changed;
+	bool livepatch_changed;
 
 	PtrMap<u64/*type hash*/, LLVMTypeRef>  types;                  // mutex: types_mutex
 	PtrMap<void *, lbStructFieldRemapping> struct_field_remapping; // Key: LLVMTypeRef or Type *, mutex: types_mutex
@@ -200,13 +200,13 @@ struct lbObjCGlobal {
 	Type *    class_impl_type;  // This is set when the class has the objc_implement attribute set to true.
 };
 
-struct HotReloadNewEntry {
+struct LivePatchNewEntry {
 	i64 offset;
 	u64 type_hash;
 	i64 init_flag_offset;
 };
 
-struct HotReloadManifest {
+struct LivePatchManifest {
 	bool exists;
 	i64  arena_size;
 	i64  next_free;
@@ -217,12 +217,12 @@ struct HotReloadManifest {
 	StringMap<u64> orig;
 	StringMap<u64> sig;
 	StringMap<u64> fhash;
-	StringMap<HotReloadNewEntry> newg;
-	StringMap<HotReloadNewEntry> tls_newg;
+	StringMap<LivePatchNewEntry> newg;
+	StringMap<LivePatchNewEntry> tls_newg;
 };
 
 
-struct HotReloadInitEntry {
+struct LivePatchInitEntry {
 	i64 arena_offset;
 	i64 flag_offset;
 	i64 size;
@@ -230,14 +230,14 @@ struct HotReloadInitEntry {
 };
 
 
-struct lbHotReloadStaticSym {
+struct lbLivePatchStaticSym {
 	String name;
 	LLVMValueRef value;
 	u64 type_hash;
 	lbModule * module;
 };
 
-struct lbHotReloadRefreshSym {
+struct lbLivePatchRefreshSym {
 	String name;
 	i64    size;
 };
@@ -263,15 +263,15 @@ struct lbGenerator : LinkerData {
 	MPSCQueue<lbObjCGlobal> objc_ivars;
 	MPSCQueue<String> raddebug_section_strings;
 
-	HotReloadManifest  hot_reload_manifest;
-	Array<HotReloadInitEntry> hot_reload_inits;
-	Array<lbHotReloadStaticSym> hot_reload_tls_syms;
-	Array<lbHotReloadRefreshSym> hot_reload_refresh_syms;
-	BlockingMutex hot_reload_mutex;
+	LivePatchManifest  livepatch_manifest;
+	Array<LivePatchInitEntry> livepatch_inits;
+	Array<lbLivePatchStaticSym> livepatch_tls_syms;
+	Array<lbLivePatchRefreshSym> livepatch_refresh_syms;
+	BlockingMutex livepatch_mutex;
 };
 
-gb_internal LLVMValueRef lb_hot_reload_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
-gb_internal LLVMValueRef lb_hot_reload_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+gb_internal LLVMValueRef lb_livepatch_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal bool lb_is_load_directive_expr(Ast *expr);
 gb_internal String lb_call_basic_directive_name(Ast *expr);
 
@@ -436,7 +436,7 @@ struct lbProcedure {
 
 	Type *internal_gen_type; // map_set, map_get, etc.
 
-	StringMap<u32> hot_reload_static_counts;
+	StringMap<u32> livepatch_static_counts;
 };
 
 
