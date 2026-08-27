@@ -340,10 +340,22 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       Odin procs/globals still applies; `/OPT:NOREF` only keeps linker-visible library members.
       `/WHOLEARCHIVE:<lib>` is still needed to pull a member the base never touched at all.)
 - [x] **No `@(hot_reload)` attribute (tagless, Live++-style)** — the user no longer tags
-      procedures. Under `-hot-reload` EVERY eligible procedure is made hot-patchable
-      automatically (`lb_proc_is_hot_reloadable` in `src/llvm_backend_proc.cpp` gates the
-      `noinline` + patchable-prologue emission; eligible = has a body, not foreign, not the
-      entry point, not force-inlined, normal prologue, and not `@(no_hot_reload)`). The
+      procedures. Under `-hot-reload` every eligible procedure **in the user's own packages** is
+      made hot-patchable automatically (`lb_proc_is_hot_reloadable` in `src/llvm_backend_proc.cpp`
+      gates the `noinline` + patchable-prologue emission; eligible = has a body, not foreign, not
+      the entry point, not force-inlined, normal prologue, not `@(no_hot_reload)`, **and not in the
+      bundled `core`/`base`/`vendor` collections**). The
+      **collection exclusion is essential for compile memory**: making EVERY proc in the program
+      `noinline` + patchable + full-debug + content-hashed defeats inlining of the entire standard
+      library (a program using `fmt` transitively pulls in thousands of `core` procedures) and
+      keeps each as a standalone function with full CodeView debug info — a multi-GB compile spike
+      that OOMs on any `fmt`-using program. Those procs are almost never edited during a reload
+      session; only the user's code is (a user-defined `-collection` stays hot-reloadable — the
+      exclusion is by collection path, `lb_path_under_collection`). A second memory fix: the
+      per-proc content-hash (`lb_hot_reload_proc_content_hash`) now frees its normalized-IR scratch
+      per procedure via `TEMPORARY_ALLOCATOR_GUARD` (it previously accumulated the whole program's
+      normalized IR in the temp allocator). Together these restore compile memory to roughly the
+      plain single-module+`-debug` level (mt_test: ~335 MB vs an un-scoped OOM). The
       `@(hot_reload)` attribute is REMOVED; `@(no_hot_reload)` opts a specific proc out (keeps
       it inlinable/optimized and unpatched). No forced `@(export)` — the PDB resolves mangled
       link names. **Change detection** keeps this cheap and safe: the compiler emits a
@@ -418,6 +430,11 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 ## Known limitations (current, by design of the PoC)
 
 - Windows / x64 / COFF only.
+- **Only the user's own packages are hot-patchable; `core`/`base`/`vendor` are excluded.** Editing
+  a `core`/`vendor` procedure and reloading will NOT patch it (it stays inlined/optimized) — rebuild
+  the base exe for standard-library changes. This is deliberate: auto-tagging every standard-library
+  procedure as hot-patchable OOMs the compiler on any `fmt`-using program (see the tagless item under
+  Tier 3). A user-defined `-collection` is treated as user code and stays hot-patchable.
 - **`-hot-reload` implies `-debug`.** The loader resolves the running exe's symbols from its
   PDB, so a `.pdb` must sit next to the exe; `-hot-reload` now turns on `-debug` automatically
   (`src/main.cpp`). This also pins base and reload builds to the same optimization level

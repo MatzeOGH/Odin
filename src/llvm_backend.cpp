@@ -3389,6 +3389,11 @@ gb_internal bool lb_is_hot_reload_refresh_global(Entity *e, DeclInfo *decl) {
 }
 
 gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
+	// Free the normalized-IR scratch (`norm` below) per procedure. Without this, the
+	// whole program's normalized IR text accumulates in the temporary allocator (this
+	// runs for EVERY hot-reloadable proc under -hot-reload / single-module), spiking
+	// compile memory in proportion to total program size.
+	TEMPORARY_ALLOCATOR_GUARD();
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
 		return 0;

@@ -70,12 +70,40 @@ gb_internal void lb_mem_copy_non_overlapping(lbProcedure *p, lbValue dst, lbValu
 }
 
 
+// True iff `fullpath` (a package directory) is at or under the root of the bundled
+// collection named `coll_name` (e.g. "core"). Requires a path-separator boundary right
+// after the root so ".../core" does not match a sibling ".../core_extra".
+gb_internal bool lb_path_under_collection(String fullpath, String coll_name) {
+	String coll_path = {};
+	if (!find_library_collection_path(coll_name, &coll_path)) {
+		return false;
+	}
+	if (coll_path.len == 0 || fullpath.len < coll_path.len) {
+		return false;
+	}
+	if (!string_starts_with(fullpath, coll_path)) {
+		return false;
+	}
+	if (fullpath.len == coll_path.len) {
+		return true;
+	}
+	u8 c = fullpath.text[coll_path.len];
+	return c == '/' || c == '\\';
+}
+
 // Tagless hot reload: whether procedure `p` is made hot-patchable automatically under
 // -hot-reload. Eligible = has a body, not foreign, not the program entry point, not opted
 // out via @(no_hot_reload), not force-inlined (mutually exclusive with noinline and no
-// out-of-line body to patch), and has a normal prologue (exclude naked / inline-asm). Used
+// out-of-line body to patch), has a normal prologue (exclude naked / inline-asm), and lives
+// in one of the USER's own packages (not the bundled core/base/vendor collections). Used
 // both when stamping the patchable attributes and when emitting the change-detection hashes,
 // so the two sets stay identical.
+//
+// Excluding core/base/vendor is essential for compile memory: making EVERY procedure in the
+// program noinline + patchable + full-debug + content-hashed defeats inlining of the entire
+// standard library (a program using `fmt` pulls in thousands of core procedures) and keeps
+// each as a standalone function with full CodeView debug info — a multi-GB compile spike.
+// Those procedures are almost never edited during a hot-reload session; the user's code is.
 gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
 	if (!build_context.hot_reload) {
 		return false;
@@ -98,6 +126,18 @@ gb_internal bool lb_proc_is_hot_reloadable(lbProcedure *p) {
 		return false;
 	}
 	if (pt->Proc.calling_convention == ProcCC_Naked || pt->Proc.calling_convention == ProcCC_InlineAsm) {
+		return false;
+	}
+	// Only the user's own packages are auto hot-patchable; skip the bundled standard-library
+	// collections (see the note above). A package from a user-defined -collection is NOT one
+	// of these three, so it stays hot-reloadable.
+	AstPackage *pkg = e->pkg;
+	if (pkg == nullptr) {
+		return false;
+	}
+	if (lb_path_under_collection(pkg->fullpath, str_lit("core"))   ||
+	    lb_path_under_collection(pkg->fullpath, str_lit("base"))   ||
+	    lb_path_under_collection(pkg->fullpath, str_lit("vendor"))) {
 		return false;
 	}
 	return true;
