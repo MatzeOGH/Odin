@@ -1425,29 +1425,25 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							build_context.use_single_module = true;
 							break;
 						case BuildFlag_HotReload:
-							// Build a host exe that supports in-process hot reload. Implies -debug
-							// (loader needs the PDB) and separate modules. See tech_design.md §2.
 							build_context.hot_reload = true;
 							build_context.ODIN_DEBUG = true;
 							if (build_context.hot_reload_arena_size == 0) {
-								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
+								build_context.hot_reload_arena_size = 256*1024;
 							}
 							if (build_context.hot_reload_tls_arena_size == 0) {
-								build_context.hot_reload_tls_arena_size = 4*1024; // default per-thread new-thread-local arena
+								build_context.hot_reload_tls_arena_size = 4*1024;
 							}
 							break;
 						case BuildFlag_HotReloadPatch:
-							// Build the reload patch object for a running host: implies -hot-reload +
-							// -build-mode:obj + a default -out into hot_objs/. See tech_design.md §2.
 							build_context.hot_reload = true;
 							build_context.hot_reload_patch = true;
 							build_context.ODIN_DEBUG = true;
 							build_context.build_mode = BuildMode_Object;
 							if (build_context.hot_reload_arena_size == 0) {
-								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
+								build_context.hot_reload_arena_size = 256*1024;
 							}
 							if (build_context.hot_reload_tls_arena_size == 0) {
-								build_context.hot_reload_tls_arena_size = 4*1024; // default per-thread new-thread-local arena
+								build_context.hot_reload_tls_arena_size = 4*1024;
 							}
 							break;
 						case BuildFlag_HotReloadArenaSize:
@@ -2050,16 +2046,15 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	}
 
 	if (build_context.hot_reload) {
-		// The host must be an executable; reload objects (obj/asm/llvm) are exempt. See tech_design.md §2.
 		bool is_reload_output = build_context.build_mode == BuildMode_Object ||
 		                        build_context.build_mode == BuildMode_Assembly ||
 		                        build_context.build_mode == BuildMode_LLVM_IR;
 		if (!is_reload_output && build_context.build_mode != BuildMode_Executable) {
-			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe); reload objects use -build-mode:obj\n");
+			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe) reload objects use -build-mode:obj\n");
 			bad_flags = true;
 		}
 		if (build_context.hot_reload_patch && build_context.build_mode != BuildMode_Object) {
-			gb_printf_err("-hot-reload-patch builds a reload object; it conflicts with -build-mode (drop one)\n");
+			gb_printf_err("-hot-reload-patch and -build-mode must not be used at the same time\n");
 			bad_flags = true;
 		}
 	}
@@ -3394,25 +3389,15 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		}
 
 		if (print_flag("-hot-reload")) {
-			print_usage_line(2, "Builds an executable that supports Live++-style in-process hot reload (Windows/x64).");
-			print_usage_line(2, "Implies -debug (the loader resolves the running exe's symbols from its PDB) and");
-			print_usage_line(2, "auto-adds /OPT:NOREF,NOICF; every eligible procedure is made hot-patchable.");
-			print_usage_line(2, "Recompile a running exe's code with -hot-reload-patch, then call");
-			print_usage_line(2, "core:sys/hot_reload's apply_dir() from the process.");
+			print_usage_line(2, "Builds an executable that supports in-process patching (Windows/x64).");
+			print_usage_line(2, "Implies: -debug /OPT:NOREF,NOICF");
 		}
 		if (print_flag("-hot-reload-patch")) {
 			print_usage_line(2, "Builds the reload PATCH object for an already-running -hot-reload executable.");
-			print_usage_line(2, "This is the whole \"recompile\" step: implies -hot-reload plus -build-mode:obj, and");
-			print_usage_line(2, "when no -out is given, emits into <package>/hot_objs/ (created, and stale *.obj");
-			print_usage_line(2, "cleared) using the default manifest — so the command is just");
-			print_usage_line(2, "'odin build <pkg> -hot-reload-patch'. Load it with apply_dir(\"hot_objs\").");
-			print_usage_line(2, "Do NOT rebuild the executable to reload code; that restarts the process.");
+			print_usage_line(2, "'odin build <pkg> -hot-reload-patch'.");
 		}
 		if (print_flag("-hot-reload-manifest:<filepath>")) {
 			print_usage_line(2, "Overrides the hot-reload manifest path (default: <package>/odin-hot-reload.manifest).");
-			print_usage_line(2, "The manifest pins new-global arena offsets and the change-detection baseline so");
-			print_usage_line(2, "the host build and its -hot-reload-patch builds line up. Pass the SAME path to");
-			print_usage_line(2, "both; needed only when they build from different directories.");
 		}
 		if (print_flag("-hot-reload-arena-size:<integer>")) {
 			print_usage_line(2, "Bytes reserved in the exe for globals introduced by a reload (default: 262144).");
@@ -3918,7 +3903,7 @@ int main(int arg_count, char const **arg_ptr) {
 
 	auto const &add_collection = [](String const &name) {
 		bool ok = false;
-		add_library_collection(name, get_fullpath_relative(heap_allocator(), odin_root_dir(), name, &ok), /*builtin*/true);
+		add_library_collection(name, get_fullpath_relative(heap_allocator(), odin_root_dir(), name, &ok), true);
 		if (!ok) {
 			compiler_error("Cannot find the library collection '%.*s'. Is the ODIN_ROOT set up correctly?", LIT(name));
 		}

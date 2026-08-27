@@ -3224,8 +3224,7 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 	thread_pool_wait();
 
 	if (build_context.hot_reload && !build_context.no_rtti) {
-		// Hot reload: emit type_info for every entity's type so hot-code reflection over any
-		// type resolves against the exe's complete type_table. See tech_design.md §9.
+		// emit type_info for hot reload
 		for (Entity *e : c->info.entities) {
 			if (e == nullptr || e->type == nullptr) {
 				continue;
@@ -4145,7 +4144,6 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 		}
 		return true;
 	} else if (name == "no_hot_reload") {
-		// Opt a procedure out of auto hot-patchability. See tech_design.md §7.
 		if (value == nullptr) {
 			ac->no_hot_reload = true;
 		} else {

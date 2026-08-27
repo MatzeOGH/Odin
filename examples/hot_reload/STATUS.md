@@ -3,6 +3,11 @@
 Live++-style in-process hot reload for the Odin compiler. Windows / x64.
 Status as of this branch. See `README.md` for how to run it and how it works.
 
+## NEW TODOs
+
+- [ ] Odin has a concept of LibraryCollections, it should be possible to disable an enable hot reload selectifly for them
+
+
 ## Done
 
 - [x] **Separate modules + per-module optimization + multi-object incremental reload.**

@@ -123,8 +123,8 @@ struct lbModule {
 	AstPackage *pkg; // possibly associated
 	AstFile *file;   // possibly associated
 	char const *module_name;
-	int optimization_level;  // per-module opt level (hot-reload splits builtin/user; §8)
-	bool hot_reload_changed; // reload build: a proc changed, so re-emit this module's object (§6)
+	int optimization_level;
+	bool hot_reload_changed;
 
 	PtrMap<u64/*type hash*/, LLVMTypeRef>  types;                  // mutex: types_mutex
 	PtrMap<void *, lbStructFieldRemapping> struct_field_remapping; // Key: LLVMTypeRef or Type *, mutex: types_mutex
@@ -200,46 +200,43 @@ struct lbObjCGlobal {
 	Type *    class_impl_type;  // This is set when the class has the objc_implement attribute set to true.
 };
 
-// Hot reload manifest + new-global arena bookkeeping. Defined here (not llvm_backend.cpp) for
-// unity-build order. See tech_design.md §3, §4.
 struct HotReloadNewEntry {
 	i64 offset;
 	u64 type_hash;
-	i64 init_flag_offset; // arena byte offset of the once-only init guard; -1 if the global has no constant initializer
+	i64 init_flag_offset; // arena byte offset of the once-only init guard
 };
 
 struct HotReloadManifest {
-	bool exists;    // an existing manifest was read => this is a reload object build
+	bool exists;
 	i64  arena_size;
 	i64  next_free;
-	i64  tls_arena_size;     // per-thread bytes reserved for new thread-locals
-	i64  tls_next_free;      // bump pointer into the TLS arena
-	u64  build_id;           // fingerprint of the exe's layout; loader refuses a mismatched object (F6, §6)
-	String pkg_dir;          // base-build main-package dir; lets a running app rebuild the patch
-	StringMap<u64>               orig;    // link name -> canonical type hash (from the exe build)
-	StringMap<u64>               sig;     // hot proc link name -> signature hash; reload rejects a changed ABI (F8, §6)
-	StringMap<u64>               fhash;   // hot proc link name -> content hash of the previous build (§6)
-	StringMap<HotReloadNewEntry> newg;    // link name -> {arena offset, canonical type hash, init-flag offset}
-	StringMap<HotReloadNewEntry> tls_newg; // new thread-local link name -> {TLS arena offset, type hash, per-thread guard offset}
+	i64  tls_arena_size;
+	i64  tls_next_free;
+	u64  build_id;
+	String pkg_dir;
+	StringMap<u64> orig;
+	StringMap<u64> sig;
+	StringMap<u64> fhash;
+	StringMap<HotReloadNewEntry> newg;
+	StringMap<HotReloadNewEntry> tls_newg;
 };
 
-// A new global's const initializer; the loader copies it into the arena once. See tech_design.md §4.
+
 struct HotReloadInitEntry {
-	i64          arena_offset;
-	i64          flag_offset;
-	i64          size;
+	i64 arena_offset;
+	i64 flag_offset;
+	i64 size;
 	LLVMValueRef blob;
 };
 
-// A thread-local for which a per-variable accessor thunk is emitted. See tech_design.md §5.
+
 struct lbHotReloadStaticSym {
-	String       name;
+	String name;
 	LLVMValueRef value;
-	u64          type_hash;
-	lbModule *   module; // module that defines `value` (accessor must be emitted there)
+	u64 type_hash;
+	lbModule * module;
 };
 
-// An immutable-data global (@(rodata)/#load) the loader repoints on reload. See tech_design.md §10.
 struct lbHotReloadRefreshSym {
 	String name;
 	i64    size;

@@ -308,7 +308,7 @@ try_cross_linking:;
 			}
 
 			if (build_context.hot_reload) {
-				// /OPT:NOICF: no function folding, so procs patch independently. See tech_design.md §12.
+				// /OPT:NOICF needed for hot reload to work
 				link_settings = gb_string_append_fmt(link_settings, " /OPT:NOICF");
 			}
 
@@ -330,8 +330,6 @@ try_cross_linking:;
 				lld_lto_flags = gb_string_append_fmt(lld_lto_flags, "/opt:lldltojobs=%d ", build_context.thread_count);
 			}
 
-			// Under -hot-reload use /opt:noref so unreferenced static-library members stay in
-			// the image for a reload to call via the PDB. See tech_design.md §12.
 			char const *opt_ref = build_context.hot_reload ? "/opt:noref" : "/opt:ref";
 
 			switch (build_context.linker_choice) {

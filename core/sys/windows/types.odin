@@ -106,8 +106,6 @@ LONG64  :: i64
 DWORD64  :: u64
 PDWORD64 :: ^DWORD64
 
-// An entry of the x64 exception/unwind function table (`.pdata`). Each field is an
-// RVA relative to the base address passed to `RtlAddFunctionTable`.
 RUNTIME_FUNCTION :: struct {
 	BeginAddress:      DWORD,
 	EndAddress:        DWORD,

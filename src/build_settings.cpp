@@ -586,12 +586,16 @@ struct BuildContext {
 
 	bool   use_single_module;
 	bool   use_separate_modules;
-	bool   hot_reload; // emit hot-reload support symbols (PDB-resolved) for in-process hot reload
-	bool   hot_reload_patch;        // set by -hot-reload-patch: this build is a reload patch object (auto obj-mode + auto hot_objs/ out dir)
-	bool   hot_reload_is_reload;    // true when an existing manifest was found => this build patches a running exe
-	i64    hot_reload_arena_size;   // bytes reserved for new globals introduced across a reload
-	i64    hot_reload_tls_arena_size; // per-thread bytes reserved for new thread-locals introduced across a reload
-	String hot_reload_manifest;     // path to the manifest that pins new-global arena offsets across builds
+
+	// BEGIN HOT_RELOAD
+	bool   hot_reload;
+	bool   hot_reload_patch;
+	bool   hot_reload_is_reload;
+	i64    hot_reload_arena_size; // bytes for new globals
+	i64    hot_reload_tls_arena_size; // bytes for new tls 
+	String hot_reload_manifest;
+	// END HOT_RELOAD
+
 	LTOKind lto_kind;
 	bool   module_per_file;
 	bool   cached;
@@ -1061,7 +1065,7 @@ gb_internal bool is_excluded_target_filename(String name) {
 struct LibraryCollections {
 	String name;
 	String path;
-	bool   builtin; // true for Odin's shipped collections (base/core/vendor), false for user -collection
+	bool   builtin; // true for odins own packages
 };
 
 gb_global Array<LibraryCollections> library_collections = {0};
@@ -2100,7 +2104,7 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		}
 	}
 
-	// -hot-reload needs separate modules for its per-module opt split. See tech_design.md §8.
+	//NOTE(mh): why !is_arch_wasm()?
 	if (bc->hot_reload && !is_arch_wasm()) {
 		bc->use_separate_modules = true;
 	}
@@ -2292,8 +2296,7 @@ gb_internal String infer_object_extension_from_build_context() {
 	return output_extension;
 }
 
-// Defined later in the unity build (cached.cpp); forward-declared here for the
-// -hot-reload-patch out-dir default below.
+// NOTE(mh): isn't there a already integrated function?
 gb_internal bool check_if_exists_directory_otherwise_create(String const &str);
 
 // NOTE(Jeroen): Set/create the output and other paths and report an error as appropriate.
@@ -2316,15 +2319,11 @@ gb_internal bool init_build_paths(String init_filename) {
 		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 	}
 
-	// -hot-reload: default the manifest to <pkg>/odin-hot-reload.manifest. See tech_design.md §3.
 	if (bc->hot_reload && bc->hot_reload_manifest.len == 0) {
 		String pkg_dir = bc->build_paths[BuildPath_Main_Package].basename;
 		bc->hot_reload_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-hot-reload.manifest"));
 	}
 
-	// -hot-reload-patch: with no -out, default the object into <pkg>/hot_objs/ and clear stale
-	// *.obj so a reload maps only the current set. See tech_design.md §2 (and §14: this side
-	// effect in path init is a known smell).
 	if (bc->hot_reload_patch && bc->out_filepath.len == 0) {
 		String pkg_dir  = bc->build_paths[BuildPath_Main_Package].basename;
 		String objs_dir = concatenate_strings(ha, pkg_dir, STR_LIT("/hot_objs"));

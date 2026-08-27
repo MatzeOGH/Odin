@@ -1342,14 +1342,14 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 		e->flags |= EntityFlag_Cold;
 	}
 	if (ac.no_hot_reload) {
-		e->Procedure.no_hot_reload = true; // opt out of auto hot-patchability; tech_design.md §7
+		e->Procedure.no_hot_reload = true;
 	}
+
+	//NOTE(mh): What happens when the callbacks are not declared? hot reload should be as unintrusive as possible
 	if (ac.pre_patch_hook || ac.post_patch_hook) {
 		if (!build_context.hot_reload) {
 			error(e->token, "@(pre_patch_hook)/@(post_patch_hook) require building with -hot-reload");
 		}
-		// Loader calls these by exported symbol; force a stable name and check the shape
-		// proc(changed: []hot_reload.Type_Change) loosely. See tech_design.md §11.
 		ac.is_export = true;
 		if (pt->param_count != 1 || pt->result_count != 0) {
 			error(e->token, "a @(pre_patch_hook)/@(post_patch_hook) procedure must take one parameter (a []hot_reload.Type_Change slice) and return nothing");
