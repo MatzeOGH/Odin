@@ -406,6 +406,7 @@ enum BuildFlagKind {
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
 	BuildFlag_HotReload,
+	BuildFlag_HotReloadPatch,
 	BuildFlag_HotReloadArenaSize,
 	BuildFlag_HotReloadTlsArenaSize,
 	BuildFlag_HotReloadManifest,
@@ -671,6 +672,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_HotReload,               str_lit("hot-reload"),               BuildFlagParam_None,    Command__does_build);
+	add_flag(&build_flags, BuildFlag_HotReloadPatch,          str_lit("hot-reload-patch"),          BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_HotReloadArenaSize,      str_lit("hot-reload-arena-size"),     BuildFlagParam_Integer, Command__does_build);
 	add_flag(&build_flags, BuildFlag_HotReloadTlsArenaSize,   str_lit("hot-reload-tls-arena-size"), BuildFlagParam_Integer, Command__does_build);
 	add_flag(&build_flags, BuildFlag_HotReloadManifest,       str_lit("hot-reload-manifest"),       BuildFlagParam_String,  Command__does_build);
@@ -1444,6 +1446,25 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								build_context.hot_reload_tls_arena_size = 4*1024; // default per-thread new-thread-local arena
 							}
 							break;
+						case BuildFlag_HotReloadPatch:
+							// Build the reload PATCH object for an already-running -hot-reload host.
+							// This is the whole "recompile" step: it implies everything -hot-reload
+							// implies (see above) PLUS -build-mode:obj, and it auto-defaults -out to
+							// <main-package-dir>/hot_objs/hot.obj (created + cleaned; see
+							// init_build_paths). So the recompile command is just
+							// `odin build <pkg> -hot-reload-patch` — no -build-mode, -out, manifest, or
+							// linker flags to hand-align with the host build.
+							build_context.hot_reload = true;
+							build_context.hot_reload_patch = true;
+							build_context.ODIN_DEBUG = true;
+							build_context.build_mode = BuildMode_Object;
+							if (build_context.hot_reload_arena_size == 0) {
+								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
+							}
+							if (build_context.hot_reload_tls_arena_size == 0) {
+								build_context.hot_reload_tls_arena_size = 4*1024; // default per-thread new-thread-local arena
+							}
+							break;
 						case BuildFlag_HotReloadArenaSize:
 							{
 								GB_ASSERT(value.kind == ExactValue_Integer);
@@ -2056,6 +2077,12 @@ gb_internal bool parse_build_flags(Array<String> args) {
 			// be an executable. A DLL/static-lib host would be enumerated/patched against
 			// the wrong image. (Multiple-module / DLL hosts are future work.)
 			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe); reload objects use -build-mode:obj\n");
+			bad_flags = true;
+		}
+		// -hot-reload-patch sets -build-mode:obj itself; a later explicit -build-mode that
+		// flips it away is a contradiction (the patch must be an object), so reject it clearly.
+		if (build_context.hot_reload_patch && build_context.build_mode != BuildMode_Object) {
+			gb_printf_err("-hot-reload-patch builds a reload object; it conflicts with -build-mode (drop one)\n");
 			bad_flags = true;
 		}
 		// Note: -hot-reload implies -debug (set in the flag handler) so a PDB exists next
@@ -3389,6 +3416,34 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		if (print_flag("-use-single-module")) {
 			print_usage_line(2, "The backend generates only a single build unit.");
 			print_usage_line(2, "This is the default behaviour for '-o:speed' or '-o:size'.");
+		}
+
+		if (print_flag("-hot-reload")) {
+			print_usage_line(2, "Builds an executable that supports Live++-style in-process hot reload (Windows/x64).");
+			print_usage_line(2, "Implies -debug (the loader resolves the running exe's symbols from its PDB) and");
+			print_usage_line(2, "auto-adds /OPT:NOREF,NOICF; every eligible procedure is made hot-patchable.");
+			print_usage_line(2, "Recompile a running exe's code with -hot-reload-patch, then call");
+			print_usage_line(2, "core:sys/hot_reload's apply_dir() from the process.");
+		}
+		if (print_flag("-hot-reload-patch")) {
+			print_usage_line(2, "Builds the reload PATCH object for an already-running -hot-reload executable.");
+			print_usage_line(2, "This is the whole \"recompile\" step: implies -hot-reload plus -build-mode:obj, and");
+			print_usage_line(2, "when no -out is given, emits into <package>/hot_objs/ (created, and stale *.obj");
+			print_usage_line(2, "cleared) using the default manifest — so the command is just");
+			print_usage_line(2, "'odin build <pkg> -hot-reload-patch'. Load it with apply_dir(\"hot_objs\").");
+			print_usage_line(2, "Do NOT rebuild the executable to reload code; that restarts the process.");
+		}
+		if (print_flag("-hot-reload-manifest:<filepath>")) {
+			print_usage_line(2, "Overrides the hot-reload manifest path (default: <package>/odin-hot-reload.manifest).");
+			print_usage_line(2, "The manifest pins new-global arena offsets and the change-detection baseline so");
+			print_usage_line(2, "the host build and its -hot-reload-patch builds line up. Pass the SAME path to");
+			print_usage_line(2, "both; needed only when they build from different directories.");
+		}
+		if (print_flag("-hot-reload-arena-size:<integer>")) {
+			print_usage_line(2, "Bytes reserved in the exe for globals introduced by a reload (default: 262144).");
+		}
+		if (print_flag("-hot-reload-tls-arena-size:<integer>")) {
+			print_usage_line(2, "Per-thread bytes reserved for thread-locals introduced by a reload (default: 4096).");
 		}
 
 	}

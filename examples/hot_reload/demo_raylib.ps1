@@ -33,8 +33,10 @@ $manifest = Join-Path $work 'hot.manifest'
 New-Item -ItemType Directory -Force $work | Out-Null
 Remove-Item $manifest -ErrorAction SilentlyContinue   # start from a clean manifest
 
-Write-Host '==> building demo .exe from current source (links raylib.lib; /OPT:NOREF,NOICF keeps unreferenced raylib functions)'
-& $odin build $here -out:(Join-Path $work 'hot_reload.exe') -debug -hot-reload -hot-reload-manifest:$manifest -extra-linker-flags:"/OPT:NOREF,NOICF"
+Write-Host '==> building demo .exe from current source (links raylib.lib; -hot-reload auto-adds /OPT:NOREF,NOICF to keep unreferenced raylib functions)'
+# -hot-reload implies -debug and auto-adds /OPT:NOREF,NOICF, so neither is passed here.
+# (Add -extra-linker-flags:"/WHOLEARCHIVE:raylib.lib" only to reach a member the base never pulls.)
+& $odin build $here -out:(Join-Path $work 'hot_reload.exe') -hot-reload -hot-reload-manifest:$manifest
 if ($LASTEXITCODE -ne 0) { throw 'exe build failed' }
 if (-not (Test-Path (Join-Path $work 'hot_reload.pdb'))) { throw 'no PDB produced next to the exe (need -debug)' }
 

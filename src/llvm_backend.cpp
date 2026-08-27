@@ -3218,6 +3218,7 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	string_map_init(&hm->tls_newg);
 	hm->exists = false;
 	hm->build_id = 0;
+	hm->pkg_dir = build_context.build_paths[BuildPath_Main_Package].basename;
 	hm->next_free = 0;
 	hm->arena_size = build_context.hot_reload_arena_size;
 	hm->tls_next_free = 0;
@@ -3282,6 +3283,11 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 			hm->tls_next_free = cast(i64)lb_hot_reload_parse_u64(tok(line, &p));
 		} else if (tag == "build_id") {
 			hm->build_id = lb_hot_reload_parse_u64(tok(line, &p));
+		} else if (tag == "pkg_dir") {
+			// Recorded by the base (exe) build; preserve it verbatim so it is not dropped
+			// when a reload (obj) build rewrites the manifest. May contain spaces.
+			String pd = rest(line, p);
+			if (pd.len > 0) { hm->pkg_dir = pd; }
 		} else if (tag == "orig") {
 			u64 th = lb_hot_reload_parse_u64(tok(line, &p));
 			String name = rest(line, p);
@@ -3337,6 +3343,11 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 	gb_fprintf(&f, "tls_arena_size %llu\n", cast(unsigned long long)hm->tls_arena_size);
 	gb_fprintf(&f, "tls_next_free %llu\n", cast(unsigned long long)hm->tls_next_free);
 	gb_fprintf(&f, "build_id %llu\n", cast(unsigned long long)hm->build_id);
+	// Record the base package dir so a running app can rebuild the patch itself
+	// (hot_reload.build_patch/apply_patch): `odin build <pkg_dir> -hot-reload-patch`.
+	if (hm->pkg_dir.len > 0) {
+		gb_fprintf(&f, "pkg_dir %.*s\n", LIT(hm->pkg_dir));
+	}
 	for (u32 idx = 0; idx < hm->orig.count; idx++) {
 		StringMapEntry<u64> const &e = hm->orig.entries[idx];
 		gb_fprintf(&f, "orig %llu %.*s\n", cast(unsigned long long)e.value, LIT(e.key));

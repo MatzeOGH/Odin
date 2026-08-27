@@ -28,7 +28,7 @@ hits: i64
 // the rest of the standard library. Edit it (see demo.ps1 / README.md), rebuild the object,
 // then press `r`; the loader patches only the procedures whose code changed.
 update :: proc(s: ^State) {
-	// ---- EDIT HERE, then recompile (ctrl-alt-r) and press `r` in the run terminal ----
+	// ---- EDIT HERE, then `odin build . -hot-reload-patch` (ctrl-alt-r) and press `r` ----
 	// Try: change the numbers, print something new, add a global/proc above and use it.
 	fmt.println("   [update] v1")   // bump "v1" -> "v2" to see the reload instantly
 	s.counter += s.step             // host-owned state, via pointer
@@ -48,7 +48,8 @@ update :: proc(s: ^State) {
 @(thread_local) v:int
 @(thread_local) neo : int
 
-OBJ_DIR :: "hot_objs" // directory of the reload set's per-package objects (see recompile.ps1)
+// The reload set's per-package objects live in `hot_objs\` (the default `-hot-reload-patch`
+// output dir, see recompile.ps1); `hr.apply_dir()` reads that directory by default.
 
 main :: proc() {
 	state := State{counter = 0, step = 1}
@@ -61,8 +62,9 @@ main :: proc() {
 	rl.SetRandomSeed(1)
 
 	fmt.printfln("hot-reload demo — pid %d", pid)
-	fmt.println("commands:  [enter]/t = tick    r = reload from hot.obj    q = quit")
-	fmt.println("edit `update` in game.odin, rebuild the object, then press `r`.")
+	fmt.println("commands:  [enter]/t = tick    b = rebuild+reload    r = reload only    q = quit")
+	fmt.println("edit `update` in game.odin, then press `b` (self-contained: it runs the")
+	fmt.println("`-hot-reload-patch` build for you and reloads) — or build by hand and press `r`.")
 
 	buf: [256]u8
 	for {
@@ -76,8 +78,13 @@ main :: proc() {
 			switch strings.trim_space(line) {
 			case "q":
 				return
+			case "b":
+				// Self-contained: rebuild the patch from within this process, then reload.
+				// odin is two dirs up from the package (repo root); run.ps1 runs us from here.
+				ok := hr.apply_patch(odin = "..\\..\\odin.exe")
+				fmt.printfln("rebuild+reload ok: %v", ok)
 			case "r":
-				ok := hr.apply_dir(OBJ_DIR)
+				ok := hr.apply_dir() // default dir "hot_objs"
 				fmt.printfln("reload ok: %v", ok)
 			case: // empty line or "t": advance the simulation
 				update(&state)

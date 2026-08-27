@@ -587,6 +587,7 @@ struct BuildContext {
 	bool   use_single_module;
 	bool   use_separate_modules;
 	bool   hot_reload; // emit hot-reload support symbols (PDB-resolved) for in-process hot reload
+	bool   hot_reload_patch;        // set by -hot-reload-patch: this build is a reload patch object (auto obj-mode + auto hot_objs/ out dir)
 	bool   hot_reload_is_reload;    // true when an existing manifest was found => this build patches a running exe
 	i64    hot_reload_arena_size;   // bytes reserved for new globals introduced across a reload
 	i64    hot_reload_tls_arena_size; // per-thread bytes reserved for new thread-locals introduced across a reload
@@ -2286,6 +2287,10 @@ gb_internal String infer_object_extension_from_build_context() {
 	return output_extension;
 }
 
+// Defined later in the unity build (cached.cpp); forward-declared here for the
+// -hot-reload-patch out-dir default below.
+gb_internal bool check_if_exists_directory_otherwise_create(String const &str);
+
 // NOTE(Jeroen): Set/create the output and other paths and report an error as appropriate.
 // We've previously called `parse_build_flags`, so `out_filepath` should be set.
 gb_internal bool init_build_paths(String init_filename) {
@@ -2316,6 +2321,32 @@ gb_internal bool init_build_paths(String init_filename) {
 	if (bc->hot_reload && bc->hot_reload_manifest.len == 0) {
 		String pkg_dir = bc->build_paths[BuildPath_Main_Package].basename;
 		bc->hot_reload_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-hot-reload.manifest"));
+	}
+
+	// -hot-reload-patch: when no explicit -out was given, default the reload patch object's
+	// output into a stable per-package `hot_objs/` directory that the loader's `apply_dir()`
+	// reads by convention, and clear any stale `*.obj` from a previous edit-set first so a
+	// reload only ever maps the current one. This is what lets the recompile command be just
+	// `odin build <pkg> -hot-reload-patch` with no -build-mode/-out/manifest to hand-align. An
+	// explicit -out disables both the default and the clean.
+	if (bc->hot_reload_patch && bc->out_filepath.len == 0) {
+		String pkg_dir  = bc->build_paths[BuildPath_Main_Package].basename;
+		String objs_dir = concatenate_strings(ha, pkg_dir, STR_LIT("/hot_objs"));
+		check_if_exists_directory_otherwise_create(objs_dir);
+		Array<FileInfo> list = {};
+		if (read_directory(objs_dir, &list) == ReadDirectory_None) {
+			for (isize i = 0; i < list.count; i++) {
+				if (list[i].is_dir) {
+					continue;
+				}
+				if (string_ends_with(list[i].name, STR_LIT(".obj"))) {
+					char const *c = alloc_cstring(temporary_allocator(), list[i].fullpath);
+					gb_file_remove(c);
+				}
+			}
+		}
+		array_free(&list);
+		bc->out_filepath = concatenate_strings(ha, objs_dir, STR_LIT("/hot.obj"));
 	}
 
 	bool produces_output_file = false;

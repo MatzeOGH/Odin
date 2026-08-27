@@ -501,7 +501,7 @@ apply :: proc(obj_path: string) -> bool {
 // caller does not have to enumerate them — point this at the output directory. Works for a
 // single-object build too (one match). Order is irrelevant: the objects are all mapped
 // before any relocation (see `apply_many`), so cross-object references resolve regardless.
-apply_dir :: proc(dir: string) -> bool {
+apply_dir :: proc(dir := "hot_objs") -> bool {
 	pattern := fmt.tprintf("%s/*.obj", dir)
 	matches, err := filepath.glob(pattern, context.temp_allocator)
 	if err != nil || len(matches) == 0 {
@@ -509,6 +509,88 @@ apply_dir :: proc(dir: string) -> bool {
 		return false
 	}
 	return apply_many(matches)
+}
+
+// Self-contained rebuild: recompile the reload PATCH from inside the running program (no
+// external terminal, no hand-typed `odin build`). `build_patch` shells out to
+//
+//     odin build <pkg_dir> -hot-reload-patch
+//
+// where `<pkg_dir>` is the base package directory the `-hot-reload` exe build recorded in the
+// manifest. On success the reload objects are in `<pkg_dir>/hot_objs/`. `apply_patch` runs
+// that and, only if it succeeds, loads them — so a compile error leaves the running code
+// untouched (it just prints the compiler's diagnostics and returns false), never taking the
+// session down. Typical use, from the program's own reload trigger:
+//
+//     if hot_reload.apply_patch() { /* new code is live */ }
+//
+// `odin` defaults to "odin" on PATH — pass an explicit path if it is not there. `manifest`
+// defaults to "odin-hot-reload.manifest" in the working directory (where the base build writes
+// it when run from the package dir) — pass the path if the app runs elsewhere. `env` is passed
+// to the build process verbatim; when nil (the default) the child inherits THIS process's
+// environment, so launch the app from the same shell/dev-prompt the base build used (the full
+// build environment is deliberately NOT baked into the manifest — it would bloat the file and
+// leak machine-specific secrets). Provide `env` only to override that.
+build_patch :: proc(odin := "odin", manifest := "odin-hot-reload.manifest", env: []string = nil) -> bool {
+	pkg_dir, ok := hr_manifest_pkg_dir(manifest)
+	if !ok {
+		fmt.eprintfln("[hot] build_patch: no pkg_dir in manifest %q (build the exe with -hot-reload first)", manifest)
+		return false
+	}
+	return hr_run_patch_build(odin, pkg_dir, env)
+}
+
+// Rebuild the patch (see `build_patch`) and, if it succeeds, load it from
+// `<pkg_dir>/hot_objs/`. Holds on a failed build (returns false without touching running code).
+apply_patch :: proc(odin := "odin", manifest := "odin-hot-reload.manifest", env: []string = nil) -> bool {
+	pkg_dir, ok := hr_manifest_pkg_dir(manifest)
+	if !ok {
+		fmt.eprintfln("[hot] apply_patch: no pkg_dir in manifest %q (build the exe with -hot-reload first)", manifest)
+		return false
+	}
+	if !hr_run_patch_build(odin, pkg_dir, env) {
+		return false
+	}
+	objs_dir, _ := filepath.join({pkg_dir, "hot_objs"}, context.temp_allocator)
+	return apply_dir(objs_dir)
+}
+
+@(private)
+hr_run_patch_build :: proc(odin: string, pkg_dir: string, env: []string) -> bool {
+	cmd := []string{odin, "build", pkg_dir, "-hot-reload-patch"}
+	fmt.printfln("[hot] rebuilding patch: %s build %q -hot-reload-patch", odin, pkg_dir)
+	state, sout, serr, err := os.process_exec({command = cmd, env = env}, context.temp_allocator)
+	if err != nil {
+		fmt.eprintfln("[hot] build failed to launch %q (is it on PATH?): %v", odin, err)
+		return false
+	}
+	if len(sout) > 0 { fmt.print(string(sout)) }
+	if len(serr) > 0 { fmt.eprint(string(serr)) }
+	if state.exit_code != 0 {
+		fmt.eprintfln("[hot] patch build failed (exit %d) — not reloading, running code left as-is", state.exit_code)
+		return false
+	}
+	return true
+}
+
+// Read the base package directory the exe build recorded in the manifest.
+@(private)
+hr_manifest_pkg_dir :: proc(manifest_path: string) -> (string, bool) {
+	data, err := os.read_entire_file(manifest_path, context.temp_allocator)
+	if err != nil {
+		return "", false
+	}
+	content := string(data)
+	for line in strings.split_lines_iterator(&content) {
+		l := strings.trim_space(line)
+		if strings.has_prefix(l, "pkg_dir ") {
+			pd := strings.trim_space(l[len("pkg_dir "):])
+			if len(pd) > 0 {
+				return pd, true
+			}
+		}
+	}
+	return "", false
 }
 
 // Load a SET of COFF objects produced by a separate-modules `-build-mode:obj -hot-reload`

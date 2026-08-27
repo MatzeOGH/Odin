@@ -20,13 +20,14 @@ A reload may also **introduce new globals and new procedures** (see below).
 Use the `odin.exe` from **this repo** (it has `-hot-reload` and the
 `core:sys/hot_reload` loader package).
 
-1. **Build the demo once and run it.** `-hot-reload` reserves the new-global arena
-   and (implying `-debug`) produces the PDB the loader resolves symbols from;
-   `-hot-reload-manifest` records the layout so reload builds can line up against
-   it. It loads `hot.obj` from its working directory, so run it from this folder:
+1. **Build the demo once and run it.** `-hot-reload` reserves the new-global arena,
+   implies `-debug` (producing the PDB the loader resolves symbols from), auto-adds
+   `/OPT:NOREF,NOICF`, and writes the manifest (default
+   `<pkg>/odin-hot-reload.manifest`) so reload builds line up against it. Run it from
+   this folder (it reloads objects from `.\hot_objs\`):
 
    ```
-   odin build examples/hot_reload -out:examples/hot_reload/hot_reload.exe -debug -hot-reload -hot-reload-manifest:examples/hot_reload/hot.manifest
+   odin build examples/hot_reload -out:examples/hot_reload/hot_reload.exe -hot-reload
    cd examples/hot_reload
    .\hot_reload.exe
    ```
@@ -38,17 +39,33 @@ Use the `odin.exe` from **this repo** (it has `-hot-reload` and the
    optionally **add a new global or a new procedure** and use them from `update`.
    Save.
 
-3. **Rebuild only the object** in a second terminal (do *not* rebuild the exe —
-   that would restart the process). Pass the **same** manifest so any new global
-   gets a stable arena slot:
+3. **Rebuild only the patch** in a second terminal (do *not* rebuild the exe —
+   that would restart the process). One command — `-hot-reload-patch` implies
+   `-build-mode:obj`, emits into `.\hot_objs\` (created + stale `*.obj` cleared), and
+   reuses the default manifest so any new global gets a stable arena slot:
 
    ```
-   odin build examples/hot_reload -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:examples/hot_reload/hot.manifest -out:examples/hot_reload/hot.obj
+   cd examples/hot_reload
+   odin build . -hot-reload-patch
    ```
 
 4. Back in the running program, press `r` + Enter. It patches `update` in place.
    Type `t` again — new behavior, `hits` continues, any new global keeps its value
    across further reloads, and the **pid is unchanged**.
+
+### Skip the manual build: press `b`
+
+Steps 3–4 collapse into one: after editing, press `b` + Enter. The running program
+rebuilds the patch itself and reloads it — no second terminal. That is
+`hot_reload.apply_patch()`, which runs `odin build <pkg> -hot-reload-patch` for you
+(via `core:os` `process_exec`), streams any compiler errors, and reloads **only if the
+build succeeds** — a failed build is surfaced and the running code is left untouched, so
+a typo never takes the session down. It finds the package to rebuild from the `pkg_dir`
+the `-hot-reload` exe build recorded in the manifest; `odin` is taken from `PATH` unless
+you pass a path (the demo passes `..\..\odin.exe`). `build_patch()` is the same rebuild
+without the reload. Launch the program from the same shell the base build used, so the
+child `odin` inherits the build environment (the environment is not baked into the
+manifest).
 
 ## Or run the whole thing scripted
 
@@ -108,9 +125,12 @@ the symbol name.)
    the same new global lands at the same address every reload and its state
    persists.
 
-4. **Recompile to an object.** On reload the whole program is rebuilt to one COFF
-   object with `-hot-reload -hot-reload-manifest:<same path> -build-mode:obj
-   -use-single-module`.
+4. **Recompile to an object.** On reload the program is rebuilt to reload object(s)
+   with a single `odin build <pkg> -hot-reload-patch` — that flag implies
+   `-build-mode:obj`, defaults `-out` to `<pkg>/hot_objs/` (created, and stale `*.obj`
+   cleared), and reuses the default manifest. The explicit flags
+   (`-hot-reload -build-mode:obj -hot-reload-manifest:<path> -out:<dir>`) still work
+   and are needed only when the exe and the reload build come from different directories.
 
 5. **Load + relocate + patch** (`core:sys/hot_reload`, call `hot_reload.apply("hot.obj")`):
    - Map the object's sections into one contiguous block reserved **within ±2 GB
@@ -182,7 +202,8 @@ exit 0 = PASS).
 ## Files
 
 - `game.odin` — the demo: an ordinary (untagged) procedure `update` and a `main`
-  REPL that calls `hot_reload.apply`.
+  REPL where `b` = `hot_reload.apply_patch` (rebuild + reload in-process) and `r` =
+  `hot_reload.apply_dir` (reload only).
 - `demo.ps1` — builds the exe, simulates an edit that adds a new global + proc →
   `hot.obj`, and drives two reloads.
 - `demo_raylib.ps1` — builds the exe with `vendor:raylib` statically linked, then

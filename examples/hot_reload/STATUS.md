@@ -481,10 +481,48 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 
 ### Tier 4 — workflow / reach
 
+- [x] **`-hot-reload-patch` recompile flag (CLI ergonomics).** The reload/recompile step is now
+      a single, self-documenting command: `odin build <pkg> -hot-reload-patch`. The flag implies
+      `-hot-reload` (which itself implies `-debug` + auto `/OPT:NOREF,NOICF`) **plus**
+      `-build-mode:obj`, and — when no `-out` is given — defaults the output to
+      `<pkg>/hot_objs/hot.obj`, creating `hot_objs/` and clearing any stale `*.obj` from a
+      previous edit-set first (so `apply_dir` maps only the current one). The default manifest is
+      reused. So a recompile needs no `-build-mode`, `-out`, manifest, `-use-single-module`, or
+      linker flags to hand-align with the host build, and a contradictory `-build-mode` is a clear
+      build error. The host build likewise drops to `odin build <pkg> -hot-reload` (the old
+      `-debug` / `-extra-linker-flags:"/OPT:NOREF,NOICF"` are now redundant). Loader companion:
+      `apply_dir` gained a default arg (`apply_dir :: proc(dir := "hot_objs")`), so the host calls
+      `hr.apply_dir()`. All five hot-reload flags now have `odin build --help` text (previously
+      none did). The explicit flags still work for cross-directory builds (e.g. `demo.ps1`, whose
+      exe and object come from different dirs, keeps them). Compiler:
+      `src/main.cpp` (`BuildFlag_HotReloadPatch` enum/registration/handler, the help entries, the
+      contradiction guard), `src/build_settings.cpp` (`hot_reload_patch` field, the out-dir
+      default + clean in `init_build_paths`). Verified: host + patch build with the short commands,
+      `hot_objs/` auto-created and stale-cleaned, a real edit patches live
+      (`before=1 after=2 reload_ok=true`), and `mt_test` still 200/200. **Still TODO below:** the
+      running program does not yet watch/rebuild on its own.
 - [ ] **Built-in file watching + auto-rebuild** — watch sources, rebuild the object,
-      and reload automatically (today: rebuild by hand, press `r`).
-- [ ] **Self-contained reload** — have the running program drive the rebuild (invoke
-      `odin` via `core:os/os2`) so no external terminal is needed.
+      and reload automatically (today: `hr.apply_patch()` or press `b`/`r`, no file watcher yet).
+- [x] **Self-contained reload** — the running program drives the rebuild itself, so no external
+      terminal is needed. `core:sys/hot_reload` gained `build_patch()` and `apply_patch()`:
+      `build_patch` shells out (via `core:os` `process_exec`) to `odin build <pkg_dir>
+      -hot-reload-patch`, streaming the compiler's stdout/stderr; `apply_patch` runs that and, only
+      on exit 0, loads `<pkg_dir>/hot_objs/` (so a **failed build holds** — the compiler's
+      diagnostics are surfaced and the running code is left untouched, never crashing the session).
+      `<pkg_dir>` is the absolute base-package directory the `-hot-reload` exe build now records in
+      the manifest (`pkg_dir` line, written by `hot_reload_manifest_write`, preserved across reload
+      builds via `HotReloadManifest.pkg_dir`), so the app needs no build config of its own — it
+      reads the command target from the manifest. `odin` defaults to `"odin"` on PATH (overridable);
+      the build **environment is deliberately NOT baked into the manifest** — `process_exec` with
+      `env=nil` inherits the running app's environment (launch it from the same shell/dev-prompt as
+      the base build), which avoids bloating the manifest and leaking machine-specific secrets; an
+      optional `env` parameter overrides it. The demo's `b` key = `apply_patch()` (rebuild+reload),
+      `r` = `apply_dir()` (reload only). Compiler: `src/llvm_backend.{cpp,hpp}` (the `pkg_dir`
+      manifest field/read/write). Loader: `core/sys/hot_reload/hot_reload.odin`
+      (`build_patch`/`apply_patch`/`hr_run_patch_build`/`hr_manifest_pkg_dir`). Verified end-to-end:
+      an edited program rebuilt+reloaded itself in-process (`before=1 after=2 apply_patch_ok=true`),
+      and a syntax error was surfaced with the reload held (`apply_patch_ok=false`, no crash).
+      **Still TODO:** the built-in file watcher above (auto-trigger `apply_patch` on save).
 - [ ] **Cross-platform** — ELF (Linux) and Mach-O (macOS) loaders; currently COFF/x64
       only. (No `.obj`/relocation parser for those formats exists in `core` yet.)
 - [ ] **Multiple modules / DLL targets / multiple live processes.**
