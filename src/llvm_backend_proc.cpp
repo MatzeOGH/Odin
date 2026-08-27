@@ -4811,6 +4811,9 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 			LLVMSetInitializer(global_data, array);
 			LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
 			LLVMSetLinkage(global_data, LLVMInternalLinkage);
+			if (build_context.hot_reload) {
+				lb_set_odin_rtti_section(global_data);
+			}
 
 
 

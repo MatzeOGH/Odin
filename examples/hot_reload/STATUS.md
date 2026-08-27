@@ -4,7 +4,63 @@ Live++-style in-process hot reload for the Odin compiler. Windows / x64.
 Status as of this branch. See `README.md` for how to run it and how it works.
 
 ## NEW TODOs
-
+- [x] **Reloading broke static string literals (garbage / wrong strings after a reload)** and, once
+      that was fixed over-broadly, **broke `@(pre/post_patch_hook)` globals**. Both come from how the
+      loader decides "share with the exe by name" vs "use the reload object's own fresh copy."
+      - **String garbage.** String-literal constants are private COFF symbols named
+        `csbs$<module>$<counter>` — a *build-order* counter, not content
+        (`src/llvm_backend_general.cpp`). So `csbs$game$3` names *different* strings in the exe vs a
+        reload object. PASS 1c resolved every defined symbol against the exe PDB by name, so a
+        reload's string reference bound to an unrelated exe string → garbage; adding a string shifted
+        all ids (one landed on `fmt`/`mem`'s digit+units table). The *set* of such build-order
+        constants is larger than strings: `csba$` (byte-slice/array backings), `ldir$`
+        (`#load_directory`), and the RTTI cluster (`__$ti-N`, the type-info giant array + member
+        arrays) are all build-order/private and must resolve object-local too.
+      - **Wrong first fix.** An initial gate ("resolve object-local unless `storage_class ==
+        EXTERNAL`") worked in separate-module builds (real globals are EXTERNAL there) but regressed
+        `-use-single-module` builds, where package globals collapse to **class-3 STATIC** — the same
+        class as `csbs$` constants — so real globals (`g_blob`, `g_state`, …) were wrongly resolved
+        object-local. The migrate hook then wrote the exe's `g_blob` in the pre-hook and read the
+        object's empty copy in the post-hook → `deserialize` sliced `[0:40]` over a len-0 blob →
+        crash.
+      - **Fix (future-proof, section-based).** The compiler now tags every fresh-per-reload private
+        constant with the `.odinti` section under `-hot-reload` — done once in
+        `lb_make_global_private_const` (`src/llvm_backend_general.cpp`) so any private const added
+        later is covered automatically, plus the two synthetic sites that bypass that helper
+        (`src/llvm_backend_const.cpp`, `src/llvm_backend_proc.cpp`). The loader
+        (`core/sys/hot_reload/hot_reload.odin`, `hr_is_object_local_const`) classifies **by section**:
+        a `.odinti` symbol resolves object-local; everything else (procs, globals, statics,
+        `@(rodata)`/`#load`) keeps the exe/hot/object policy so state is preserved — heuristic-free
+        and correct in **both** module modes. Verified: string demo prints correctly; the migrate
+        hook crash is gone; `mt`/`free`/`rodata`/`multipkg`/`hook`/`migrate`/`migrate_full`/
+        `migrate_enum` all PASS.
+- [x] **Reflection now refreshes across a reload (edited layouts AND brand-new types).** Previously
+      `fmt.println(x)` reflected the exe's *frozen* `type_table`, so an edited struct still printed
+      its old fields and a new type printed empty. Because a type's `typeid` is a hash of its *name*
+      (stable across builds) and `__type_info_of` linear-probes `type_table` by `id % len` reading
+      `len` dynamically, the loader can simply swap the table. Under `-hot-reload` the compiler
+      publishes the address of `runtime.type_table` as `__odin_hot_reload_type_table_ref`
+      (`src/llvm_backend_type.cpp`); after a reload that changed or added any named type, the loader
+      overwrites `type_table`'s 16-byte slice header with the reload metadata object's fresh, complete
+      table (which contains the edited + new types — the front-end re-runs whole-program each reload),
+      under the stop-the-world + `VirtualProtect`, tracked in `_hr_owner` so the backing block is kept
+      alive. A type-only reload (no proc/data change) no longer early-frees, so it still performs the
+      swap. Loader: `hr_type_table_needs_swap` + the swap in `apply_many`. Verified end-to-end by
+      `examples/hot_reload/reflect_test` (adds `y: i64` to a struct and a brand-new `Extra` type;
+      after the reload both reflect via `fmt`).
+      - **Also fixed here — COFF relocation overflow (`IMAGE_SCN_LNK_NRELOC_OVFL`).** Making the RTTI
+        object-local means the loader must now apply *all* of the large `.odinti` section's
+        relocations. A section with > 0xFFFF relocations saturates COFF's 16-bit count at 0xFFFF and
+        sets `IMAGE_SCN_LNK_NRELOC_OVFL`, putting the real count in the first reloc record's
+        `VirtualAddress` with the actual relocations starting at index 1. The loader ignored this, so
+        for any real-sized program (e.g. one importing `vendor:raylib`) most type-info pointers stayed
+        unrelocated and walking the fresh type graph faulted. The reloc loop now decodes the overflow
+        count. (`reflect_test` links raylib specifically to exercise this path.)
+      - **Caveat (documented under Known limitations):** a `^Type_Info` cached by the app *before* a
+        reload keeps pointing at the old (still-valid) exe entry; new lookups see the new table. Same
+        class as the rodata/block-free stale-pointer caveat.
+      - **Still true:** the frozen host exe cannot name a brand-new type at a *source* call site; only
+        reflection reached through hot code sees new types.
 - [ ] Odin has a concept of LibraryCollections, it should be possible to disable an enable hot reload selectifly for them
 
 
@@ -319,8 +375,10 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       `type_info_of`/enum reflection through the runtime `__type_info_of(typeid)` hash
       lookup instead of a build-local index, so it lands on the exe's `Type_Info` and
       matches `any` values (typeid is already the build-stable canonical hash from
-      `lb_typeid`). **Limitation:** a brand-new type introduced *only* by a hot edit is
-      absent from the exe's frozen `type_table` and won't reflect correctly.
+      `lb_typeid`). **Update:** a brand-new type (or an edited layout) introduced by a hot edit now
+      reflects too — the loader swaps `runtime.type_table` to the reload's fresh table on reload (see
+      the reflection-refresh item under "NEW TODOs"). What still cannot work: the frozen host exe
+      naming a brand-new type at a *source* call site.
 - [x] **Function-local statics.** Local `@(static)` variables are now preserved the
       same way file-scope globals are: an *original* static (present in the exe)
       resolves to the exe's copy across a reload, and a *new* static introduced by a
@@ -628,9 +686,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   carry compile-time constant initializers (applied once) but not runtime
   initializers or `@(init)`; and the new-global arena is a fixed size
   (`-hot-reload-arena-size`, default 256 KiB).
-- Reflection from hot code works (`fmt` of basic types, `%v` on a user struct, `typeid`) as
-  long as the type already existed in the base build's `type_table`; a brand-new type
-  introduced *only* by a hot edit is absent from the frozen `type_table` and won't reflect.
+- Reflection from hot code works (`fmt` of basic types, `%v` on a user struct, `typeid`), and now
+  refreshes across a reload: an *edited* struct/enum/union layout and a *brand-new* type reached
+  through hot code both reflect, because the loader swaps `runtime.type_table` to the reload's fresh,
+  complete table (see the reflection-refresh item under "NEW TODOs"). Two caveats: (a) a `^Type_Info`
+  the app cached *before* a reload keeps pointing at the old (still-valid) exe entry — new lookups see
+  the new table; (b) the frozen host exe still cannot name a brand-new type at a *source* call site.
 - The mapped object block, its trampoline/import-cell pages, and its `.pdata` registration are
   now reclaimed (`RtlDeleteFunctionTable` + `VirtualFree`) once superseded and no thread is
   inside — a no-op reload frees them immediately, a patching reload frees older generations at

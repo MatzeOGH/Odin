@@ -1050,6 +1050,8 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 
 				if (cc.link_section.len > 0) {
 					LLVMSetSection(array_data, alloc_cstring(permanent_allocator(), cc.link_section));
+				} else if (build_context.hot_reload) {
+					lb_set_odin_rtti_section(array_data);
 				}
 				if (cc.is_rodata) {
 					LLVMSetGlobalConstant(array_data, true);

@@ -409,6 +409,11 @@ gb_internal void lb_make_global_private_const(LLVMValueRef global_data) {
 	LLVMSetLinkage(global_data, LLVMLinkerPrivateLinkage);
 	LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
 	LLVMSetGlobalConstant(global_data, true);
+	if (build_context.hot_reload) {
+		// Route every compiler-generated private constant (string/byte-slice/array
+		// backings, RTTI, etc.) into the `.odinti` section.
+		lb_set_odin_rtti_section(global_data);
+	}
 }
 gb_internal void lb_make_global_private_const(lbAddr const &addr) {
 	lb_make_global_private_const(addr.addr.value);

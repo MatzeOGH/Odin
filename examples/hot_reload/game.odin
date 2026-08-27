@@ -20,6 +20,7 @@ State :: struct {
 hits: i64
 
 
+new_int := 86
 
 // With the exe built `-hot-reload`, EVERY procedure is hot-reloadable automatically (no
 // tag needed). Its body may call other procedures, read/write globals, reference brand-new
@@ -31,6 +32,7 @@ update :: proc(s: ^State) {
 	// ---- EDIT HERE, then `odin build . -hot-reload-patch` (ctrl-alt-r) and press `r` ----
 	// Try: change the numbers, print something new, add a global/proc above and use it.
 	fmt.println("   [update] v1")   // bump "v1" -> "v2" to see the reload instantly
+	
 	s.counter += s.step             // host-owned state, via pointer
 	hits += 2                       // global state, resolved to the exe's copy
 	// Foreign-library call from a `vendor:raylib` package that the exe already links
@@ -39,11 +41,46 @@ update :: proc(s: ^State) {
 	// them to their address in the running image via the exe's PDB. See demo_raylib.ps1.
 	// ----------------------------------------------------------------------------------
 
+
+
 	a := rl.GetRandomValue(1,100)
-	fmt.println(a)
+	fmt.println("hello world")
 	neo = neo + 1
-	fmt.println(v)
+	//fmt.println(v)
+	//rl.InitWindow(600, 500, "hello")
+	//rl.CloseWindow()
+	//boo : BOO
+	//fmt.println(boo)
+
+	
+	boo := BOO {
+		a = 59
+	}
+	fmt.println(boo)
+	
 }
+
+
+BOO :: struct {
+	a : i8
+}
+/*
+BOO :: struct {
+
+}*/
+
+@(pre_patch_hook)
+save :: proc(changed: []hr.Type_Change) {
+	fmt.println("pre_patch_hook")
+}
+
+// @(post_patch_hook): NEW code. If State's layout changed, build a fresh new-layout
+// State and deserialize the saved fields into it by name, then swap the host pointer.
+@(post_patch_hook)
+load :: proc(changed: []hr.Type_Change) {
+	fmt.println("post_patch_hook")
+}
+
 
 @(thread_local) v:int
 @(thread_local) neo : int

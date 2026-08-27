@@ -23,6 +23,8 @@
 // Defined in llvm_backend_proc.cpp; forward-declared for llvm_backend_general.cpp.
 gb_internal bool lb_path_is_stdlib(String fullpath);
 
+gb_internal void lb_set_odin_rtti_section(LLVMValueRef value);
+
 #include "llvm_abi.cpp"
 #include "llvm_backend_opt.cpp"
 #include "llvm_backend_general.cpp"

@@ -1156,13 +1156,18 @@ gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup typ
 	LLVMSetGlobalConstant(global_type_table.value, true);
 
 	if (build_context.hot_reload) {
-		// Publish the type table under a fixed external name so the loader can diff struct
-		// layouts across a reload. See tech_design.md §9.
 		Type *slice_type = type_deref(global_type_table.type);
 		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_hot_reload_type_infos");
 		LLVMSetInitializer(tbl, slice);
 		LLVMSetGlobalConstant(tbl, true);
 		LLVMSetLinkage(tbl, LLVMExternalLinkage);
 		lb_append_to_used(m, tbl);
+		
+		LLVMTypeRef ref_ty = LLVMPointerType(lb_type(m, slice_type), 0);
+		LLVMValueRef ref = LLVMAddGlobal(m->mod, ref_ty, "__odin_hot_reload_type_table_ref");
+		LLVMSetInitializer(ref, global_type_table.value);
+		LLVMSetGlobalConstant(ref, true);
+		LLVMSetLinkage(ref, LLVMExternalLinkage);
+		lb_append_to_used(m, ref);
 	}
 }

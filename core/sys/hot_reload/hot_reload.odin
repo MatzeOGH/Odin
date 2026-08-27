@@ -1,17 +1,7 @@
 #+build windows
 package hot_reload
 
-// Live++-style in-process hot reload for Odin (Windows / x64).
-//
-// Build the host with `-hot-reload -debug`, recompile after an edit with
-// `-hot-reload-patch`, then call `apply_dir("hot_objs")` from the running process. The
-// objects are loaded directly (no DLL), relocated against the exe and each other, and the
-// prologue of each changed hot procedure is overwritten with a jump to the fresh code. The
-// process never restarts and its state is untouched.
-//
-// The full design (symbol ABI, manifest, arena, change detection, TLS, refresh, hooks) is
-// documented in tech_design.md next to this file. Public entry points: apply / apply_dir /
-// apply_many, build_patch / apply_patch.
+// Live patching utility for windows without the dll reload
 
 import "base:intrinsics"
 import "base:runtime"
@@ -62,8 +52,18 @@ Coff_Reloc :: struct #packed {
 }
 
 IMAGE_FILE_MACHINE_AMD64 :: 0x8664
-IMAGE_SCN_MEM_EXECUTE    :: 0x20000000 // section characteristic: executable (code)
-IMAGE_SCN_MEM_WRITE      :: 0x80000000 // section characteristic: writable (.data/.bss)
+IMAGE_SCN_MEM_EXECUTE       :: 0x20000000 // section characteristic: executable (code)
+IMAGE_SCN_MEM_WRITE         :: 0x80000000 // section characteristic: writable (.data/.bss)
+IMAGE_SCN_LNK_NRELOC_OVFL   :: 0x01000000 // section has >0xFFFF relocs; real count in reloc[0].VirtualAddress
+
+// Section the compiler emits every fresh-per-reload constant into under -hot-reload:
+// string/byte-slice/array backings and all RTTI (`__$ti-N`, the type-info giant array
+// + member arrays). Such a symbol's link name is build-order-dependent (`csbs$..`,
+// `csba$..`, `__$ti-N`) and NOT unique across builds, so the loader must resolve it to
+// its OWN object's fresh copy rather than bind it to an unrelated exe symbol of the same
+// name (which is how the string-literal-garbage bug happened). See
+// `lb_make_global_private_const` in src/llvm_backend_general.cpp.
+HR_CONST_SECTION :: ".odinti"
 
 // x64 relocation kinds we handle.
 IMAGE_REL_AMD64_ADDR64   :: 0x01
@@ -317,6 +317,34 @@ hr_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, se
 		}
 	}
 	return changes[:]
+}
+
+// True if the reload's fresh type table (in the metadata object) has any named type whose
+// layout changed vs the exe, OR any brand-new named type absent from the exe. Drives whether
+// runtime.type_table is swapped so reflection (`fmt`, `type_info_of` in hot code) sees the
+// edited/new types. Unlike `hr_build_type_changes` (which needs an exe counterpart to migrate
+// FROM, so it skips new types), this also reports a brand-new type.
+@(private)
+hr_type_table_needs_swap :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> bool {
+	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, HR_TYPE_INFOS_SYM)
+	new_tis := hr_read_type_infos(new_addr)
+	if len(new_tis) == 0 {
+		return false
+	}
+	old_by_name := hr_exe_types_by_name()
+	for ti in new_tis {
+		if ti == nil { continue }
+		named, ok := ti.variant.(runtime.Type_Info_Named)
+		if !ok { continue }
+		old_ti, found := old_by_name[hr_qualified_name(named)]
+		if !found {
+			return true // brand-new named type: not in the exe's frozen table
+		}
+		if hr_layout_differs(old_ti, ti) {
+			return true // an existing type's layout was edited
+		}
+	}
+	return false
 }
 
 // True if `ti` (when named) is itself directly changed, or if any type it embeds BY
@@ -911,23 +939,34 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			sn := int(sym.section_number)
 			if sn > 0 && o.section_bases[sn] != nil {
 				obj_addr := rawptr(uintptr(o.section_bases[sn]) + uintptr(sym.value))
-				if _, seen := all_defs[name]; !seen {
-					all_defs[name] = obj_addr
-				}
-				if _, seen := all_syms[name]; !seen {
-					exe_addr := hr_resolve_pdb(name)
-					// Only a symbol defined in an executable section can be a hot procedure.
-					// Restricting the (byte-reading) hot check to code symbols also avoids
-					// dereferencing a data global that happens to sit next to an unmapped page.
-					sh := section_header(o.data, o.sec_off, sn - 1)
-					is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
-					if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) && hr_proc_changed(name, obj_hashes, have_obj_hashes) {
-						all_syms[name] = obj_addr
-						append(&hot_names, Hot{name, oi})
-					} else if exe_addr != nil {
-						all_syms[name] = exe_addr
-					} else {
-						all_syms[name] = obj_addr
+				sh := section_header(o.data, o.sec_off, sn - 1)
+				// Compiler-generated constants — string/byte-slice/array backings and all
+				// RTTI (`__$ti-N`, the type-info giant array + member arrays) — are emitted
+				// into the `.odinti` section under -hot-reload. Their link names are
+				// build-order-dependent (`csbs$..`, `csba$..`, `__$ti-N`) and NOT unique
+				// across builds, so they must resolve to THIS object's OWN fresh copy and
+				// never bind to an unrelated exe symbol of the same name. Leave them out of
+				// the shared maps; PASS 2 resolves them object-local. Everything else
+				// (procs, globals, statics, @(rodata)/#load) keeps the exe/hot/object policy
+				// so its state is preserved and its references are shared across the reload.
+				if !hr_is_object_local_const(sh) {
+					if _, seen := all_defs[name]; !seen {
+						all_defs[name] = obj_addr
+					}
+					if _, seen := all_syms[name]; !seen {
+						exe_addr := hr_resolve_pdb(name)
+						// Only a symbol defined in an executable section can be a hot procedure.
+						// Restricting the (byte-reading) hot check to code symbols also avoids
+						// dereferencing a data global that happens to sit next to an unmapped page.
+						is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
+						if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) && hr_proc_changed(name, obj_hashes, have_obj_hashes) {
+							all_syms[name] = obj_addr
+							append(&hot_names, Hot{name, oi})
+						} else if exe_addr != nil {
+							all_syms[name] = exe_addr
+						} else {
+							all_syms[name] = obj_addr
+						}
 					}
 				}
 			}
@@ -951,7 +990,13 @@ apply_many :: proc(obj_paths: []string) -> bool {
 				name := symbol_name(sym, o.data, o.strtab_off)
 				sn := int(sym.section_number)
 				if sn > 0 && o.section_bases[sn] != nil {
-					o.resolved[i] = all_syms[name] // decided in PASS 1c
+					sh := section_header(o.data, o.sec_off, sn - 1)
+					if hr_is_object_local_const(sh) {
+						// Compiler constant in `.odinti` (see PASS 1c): object-local only.
+						o.resolved[i] = rawptr(uintptr(o.section_bases[sn]) + uintptr(sym.value))
+					} else {
+						o.resolved[i] = all_syms[name] // decided in PASS 1c
+					}
 				} else if sn == 0 {
 					if a, ok := all_syms[name]; ok {
 						o.resolved[i] = a // defined in another reload object
@@ -972,8 +1017,20 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			is_text := section_name(sh) == ".text"
 			nreloc := int(sh.number_of_relocations)
 			roff := int(sh.pointer_to_relocations)
+			// COFF relocation overflow: a section with >= 0xFFFF relocations saturates the
+			// 16-bit count at 0xFFFF and sets IMAGE_SCN_LNK_NRELOC_OVFL; the REAL count then
+			// lives in the first relocation record's VirtualAddress and the actual relocations
+			// start at index 1. The large `.odinti` RTTI section trips this — without handling
+			// it, most type-info pointers stay unrelocated and walking the reload's fresh type
+			// graph (reflection refresh, hook diff) faults on a bogus pointer.
+			reloc0 := 0
+			if (u32(sh.characteristics) & IMAGE_SCN_LNK_NRELOC_OVFL) != 0 && nreloc == 0xFFFF {
+				first := (^Coff_Reloc)(raw_data(o.data[roff:]))
+				nreloc = int(first.virtual_address)
+				reloc0 = 1
+			}
 			for r in 0 ..< nreloc {
-				rel := (^Coff_Reloc)(raw_data(o.data[roff + r*RELOC_SIZE:]))
+				rel := (^Coff_Reloc)(raw_data(o.data[roff + (reloc0 + r)*RELOC_SIZE:]))
 
 				// Thread-local access: rewrite the per-variable SECREL offset to the
 				// variable's offset in the EXE's TLS block (the object's own .tls$
@@ -1195,12 +1252,36 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		}
 	}
 
+	// 3.8) Reflection refresh: if the reload's fresh type table (metadata object) has any
+	//      edited or brand-new named type, swap runtime.type_table's slice header to point at
+	//      it, so `__type_info_of` / `fmt` reflect the current layout and resolve new types.
+	//      Detected here — BEFORE the no-op early-free — so a type-only reload (no proc/data
+	//      change) still keeps its block and performs the swap. The write itself happens under
+	//      the stop-the-world below. `tt_ref` is the exe's `&runtime.type_table` (via the
+	//      compiler-published `__odin_hot_reload_type_table_ref`); `fresh_ti_hdr` is the
+	//      object's fresh `[]^Type_Info` header (already relocated to its own giant array).
+	swap_type_table := false
+	tt_ref:       rawptr
+	fresh_ti_hdr: rawptr
+	if meta_i >= 0 {
+		mo := &objs[meta_i]
+		if hr_type_table_needs_swap(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases) {
+			ref := hr_resolve_pdb("__odin_hot_reload_type_table_ref")
+			hdr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, HR_TYPE_INFOS_SYM)
+			if ref != nil && ok {
+				tt_ref = (^rawptr)(ref)^ // deref the ref global -> &runtime.type_table (exe)
+				fresh_ti_hdr = hdr
+				swap_type_table = tt_ref != nil
+			}
+		}
+	}
+
 	// 4) Patch each discovered hot procedure's running entry to jump to its fresh code.
 	//    `hot_names` were collected in PASS 1c (an exe symbol whose entry is the patchable
 	//    hot-patch prologue, across ALL objects). Resolve every original (exe, via the PDB)
 	//    and fresh (object) address first, then patch the whole batch with all other threads
 	//    suspended and only once no thread is parked in a region we overwrite.
-	if len(hot_names) == 0 && len(refresh_targets) == 0 {
+	if len(hot_names) == 0 && len(refresh_targets) == 0 && !swap_type_table {
 		// Nothing will jump into or point at this reload's freshly-mapped blocks, and no thread
 		// is inside them (nothing was patched), so free them immediately instead of leaking — a
 		// no-op reload (the common change-detection case) otherwise leaked one block per reload.
@@ -1321,6 +1402,26 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	if len(refresh_targets) > 0 {
 		fmt.printfln("[hot] refreshed %d @(rodata)/#load global(s)", len(refresh_targets))
+	}
+
+	// Swap runtime.type_table's 16-byte slice header {data, len} to the reload's fresh, complete
+	// type table (in the metadata object). `__type_info_of` probes by `id % len` and matches on
+	// the (name-stable) id, so a table of any size/order reflects edited layouts AND resolves
+	// brand-new types. Tracked in `_hr_owner` so the block backing the fresh table is kept alive
+	// until a later reload re-swaps the header. Done under the stop-the-world so no reader tears.
+	if swap_type_table {
+		SLICE_HDR :: size_of(rawptr) + size_of(int) // {data, len} = 16 bytes on x64
+		old: win.DWORD
+		if win.VirtualProtect(tt_ref, win.SIZE_T(SLICE_HDR), win.PAGE_READWRITE, &old) {
+			intrinsics.mem_copy(tt_ref, fresh_ti_hdr, SLICE_HDR)
+			restored: win.DWORD
+			win.VirtualProtect(tt_ref, win.SIZE_T(SLICE_HDR), old, &restored)
+			_hr_owner[uintptr(tt_ref)] = gen_serial
+			append(&gen_owned, uintptr(tt_ref))
+			fmt.println("[hot] refreshed reflection type_table (edited/new types now visible)")
+		} else {
+			fmt.eprintln("[hot] could not make runtime.type_table writable to refresh reflection")
+		}
 	}
 
 	patched := 0
@@ -1989,6 +2090,13 @@ section_name :: proc(sh: ^Coff_Section_Header) -> string {
 		n += 1
 	}
 	return string(sh.name[:n])
+}
+
+// A defined symbol whose section is the compiler's fresh-per-reload constant section is
+// resolved to the reload object's own copy, never shared with the exe by name. See
+// HR_CONST_SECTION.
+hr_is_object_local_const :: proc(sh: ^Coff_Section_Header) -> bool {
+	return section_name(sh) == HR_CONST_SECTION
 }
 
 symbol_name :: proc(sym: ^Coff_Symbol, data: []byte, strtab_off: int) -> string {
