@@ -40,9 +40,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         same-directory build; pass `-hot-reload-manifest` explicitly only when the exe and the
         reload obj are built from different directories.
       - Verified: `mt_test` 200/200 in multi-object mode (reload set = metadata + user object);
-        a two-package project emits only the edited package's object; the default manifest is
-        auto-created by the exe build and read by the reload build; `rodata_test` and the
-        `migrate` hooks path pass on the single-object route.
+        `multipkg_test` (4 user packages, chain pkgc→pkgb→pkga + independent pkgd) — one reload
+        patches all three edited packages, the fresh cross-package chain resolves at every hop
+        (a=2, b=22, c=222), the unchanged pkgd is neither re-emitted nor broken (d=1000), and
+        per-package + main globals survive; the default manifest is auto-created by the exe
+        build and read by the reload build; `rodata_test` and the `migrate` hooks path pass on
+        the single-object route.
 
 - [x] **`@(hot_reload)` procedure attribute** — marks a procedure replaceable:
       emits `noinline` + `"patchable-function"="prologue-short-redirect"` and forces
