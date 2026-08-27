@@ -316,7 +316,7 @@ struct Entity {
 			bool    no_sanitize_thread         : 1;
 			bool    is_objc_impl_or_import     : 1;
 			bool    is_objc_class_method       : 1;
-			bool    is_hot_reload              : 1;
+			bool    no_hot_reload              : 1; // opt OUT of automatic -hot-reload patchability
 		} Procedure;
 		struct {
 			bool is_asm_group;

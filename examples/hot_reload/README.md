@@ -5,23 +5,25 @@ executable with freshly compiled code, without restarting the process and withou
 a DLL boundary — the way [Live++](https://liveplusplus.tech/) works.
 
 Unlike the usual "compile the game as a DLL and reload it" pattern, here the
-source uses **normal direct calls**. On reload we recompile the program to a COFF
-object, load that object directly into the running process, **relocate it against
-the running process**, and overwrite the prologue of each running `@(hot_reload)`
-procedure with a jump to the fresh code. Existing call sites reach the new code
-transparently; process state — including package **globals** — is untouched.
+source uses **normal direct calls** and **no per-procedure tags** — under
+`-hot-reload` every procedure is hot-patchable automatically (Live++-style). On
+reload we recompile the program to a COFF object, load that object directly into
+the running process, **relocate it against the running process**, and overwrite
+the prologue of each procedure **whose code changed** with a jump to the fresh
+code. Existing call sites reach the new code transparently; process state —
+including package **globals** — is untouched.
 
 A reload may also **introduce new globals and new procedures** (see below).
 
 ## Manual workflow (edit, then reload by hand)
 
-Use the `odin.exe` from **this repo** (it has `@(hot_reload)`, `-hot-reload`, and
-the `core:sys/hot_reload` loader package).
+Use the `odin.exe` from **this repo** (it has `-hot-reload` and the
+`core:sys/hot_reload` loader package).
 
-1. **Build the demo once and run it.** `-hot-reload` bakes a symbol table into the
-   exe and reserves the new-global arena; `-hot-reload-manifest` records the
-   layout so reload builds can line up against it. It loads `hot.obj` from its
-   working directory, so run it from this folder:
+1. **Build the demo once and run it.** `-hot-reload` reserves the new-global arena
+   and (implying `-debug`) produces the PDB the loader resolves symbols from;
+   `-hot-reload-manifest` records the layout so reload builds can line up against
+   it. It loads `hot.obj` from its working directory, so run it from this folder:
 
    ```
    odin build examples/hot_reload -out:examples/hot_reload/hot_reload.exe -debug -hot-reload -hot-reload-manifest:examples/hot_reload/hot.manifest
@@ -88,15 +90,16 @@ the symbol name.)
 
 ## How it works
 
-1. **The language feature.** `@(hot_reload)` (a procedure attribute) marks a
-   procedure as replaceable. The compiler gives it `noinline`, a patchable
-   prologue, and exports it under a stable, unmangled symbol name.
+1. **The build flag (no tags).** Building with `-hot-reload` makes **every**
+   eligible procedure replaceable — no `@(hot_reload)` tag. The compiler gives each
+   one `noinline` and a patchable prologue (a 16-byte pad + short-redirect entry);
+   `@(no_hot_reload)` opts a procedure out. `-hot-reload` implies `-debug`.
 
-2. **The baked table.** Building with `-hot-reload` bakes
-   `runtime.hot_reload_symbol_table` into the exe: `{name, address, is_hot, kind,
-   type_hash}` for every procedure and global. It is the running process's
-   name → address map; `type_hash` is the build-stable canonical hash of a
-   global's type.
+2. **PDB-based resolution + change detection.** There is no baked symbol table. The
+   loader resolves the running exe's procedure/global addresses from the exe's
+   **PDB** (DbgHelp), and the compiler emits a small `{name_hash, content_hash}`
+   table (`__odin_hot_reload_func_hashes`, no addresses — dead-code elimination
+   stays on) so the loader patches only the procedures whose code actually changed.
 
 3. **The new-global arena + manifest.** `-hot-reload` also reserves a zero-init
    arena (`__odin_hot_reload_global_arena`) in the exe. The compiler writes a
@@ -131,9 +134,11 @@ the symbol name.)
      `/OPT:NOREF,NOICF` so the linker keeps such unreferenced functions in the image;
      see `demo_raylib.ps1`. Adding a library *not* linked into the base exe at all is
      not supported.
-   - Overwrite each running hot procedure's first 14 bytes with a RIP-relative
-     absolute jump and `FlushInstructionCache`. `apply` discovers which procedures
-     to patch from the baked table, so callers don't list them.
+   - Redirect each running procedure whose code changed to its fresh copy (atomic
+     short-jump publish into the prologue pad, or a 14-byte overwrite fallback) and
+     `FlushInstructionCache`. `apply` discovers which procedures to patch itself
+     (structurally, via the prologue pad, filtered by the change-detection hashes),
+     so callers don't list them.
 
 ## Scope and limitations
 
@@ -176,8 +181,8 @@ exit 0 = PASS).
 
 ## Files
 
-- `game.odin` — the demo: a `@(hot_reload)` procedure and a `main` REPL that calls
-  `hot_reload.apply`.
+- `game.odin` — the demo: an ordinary (untagged) procedure `update` and a `main`
+  REPL that calls `hot_reload.apply`.
 - `demo.ps1` — builds the exe, simulates an edit that adds a new global + proc →
   `hot.obj`, and drives two reloads.
 - `demo_raylib.ps1` — builds the exe with `vendor:raylib` statically linked, then
@@ -187,12 +192,15 @@ exit 0 = PASS).
 
 ## Compiler / library changes this depends on
 
-- `@(hot_reload)` procedure attribute — `src/checker.{hpp,cpp}`, `src/entity.cpp`,
-  `src/check_decl.cpp`, `src/llvm_backend_proc.cpp`.
-- `-hot-reload`, `-hot-reload-arena-size`, `-hot-reload-manifest` flags; baked
-  table (`{name, address, is_hot, kind, type_hash}`); new-global arena + manifest —
-  `src/main.cpp`, `src/build_settings.cpp`, `src/llvm_backend.cpp`,
-  `base/runtime/core.odin`.
+- Tagless patchability + `@(no_hot_reload)` opt-out — `src/checker.{hpp,cpp}`,
+  `src/entity.cpp`, `src/check_decl.cpp`, `src/llvm_backend_proc.cpp`
+  (`lb_proc_is_hot_reloadable`).
+- `-hot-reload` (implies `-debug`), `-hot-reload-arena-size`, `-hot-reload-manifest`
+  flags; PDB-based resolution + change-detection hash table
+  (`__odin_hot_reload_func_hashes`); new-global arena + manifest; auto
+  `/OPT:NOREF,NOICF` — `src/main.cpp`, `src/build_settings.cpp`,
+  `src/llvm_backend.cpp`, `src/linker.cpp`, `core/sys/windows/dbghelp.odin`
+  (`SymEnumSymbolsW`).
 - Reflection from hot code — under `-hot-reload`, a complete `type_table`
   (`src/checker.cpp`, `generate_minimum_dependency_set`) and typeid-based
   `type_info` resolution (`src/llvm_backend_type.cpp`, `lb_type_info` →

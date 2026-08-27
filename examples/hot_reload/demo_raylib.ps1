@@ -61,7 +61,6 @@ State :: struct {
 
 hits: i64
 
-@(hot_reload)
 update :: proc(s: ^State) {
 	s.counter += s.step
 	hits += 2

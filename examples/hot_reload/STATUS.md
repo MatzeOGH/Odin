@@ -311,8 +311,29 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       raylib whole-lib scenario works without manual `-extra-linker-flags`. (LLVM-level DCE of
       Odin procs/globals still applies; `/OPT:NOREF` only keeps linker-visible library members.
       `/WHOLEARCHIVE:<lib>` is still needed to pull a member the base never touched at all.)
-- [ ] **no hot_reload attribute** — the uses does not need to tag procedures as hot
-			reloadable but the patcher does so automatically
+- [x] **No `@(hot_reload)` attribute (tagless, Live++-style)** — the user no longer tags
+      procedures. Under `-hot-reload` EVERY eligible procedure is made hot-patchable
+      automatically (`lb_proc_is_hot_reloadable` in `src/llvm_backend_proc.cpp` gates the
+      `noinline` + patchable-prologue emission; eligible = has a body, not foreign, not the
+      entry point, not force-inlined, normal prologue, and not `@(no_hot_reload)`). The
+      `@(hot_reload)` attribute is REMOVED; `@(no_hot_reload)` opts a specific proc out (keeps
+      it inlinable/optimized and unpatched). No forced `@(export)` — the PDB resolves mangled
+      link names. **Change detection** keeps this cheap and safe: the compiler emits a
+      `{u64 name_hash, u64 content_hash}` table `__odin_hot_reload_func_hashes` (no addresses,
+      DCE stays on) via `lb_hot_reload_emit_func_hashes`, where `content_hash` is a debug- and
+      build-normalized hash of the procedure's LLVM IR (strips `!`/`#` metadata & attr-group
+      numbers, trims trailing commas so -debug/-o:none matches non-debug, and canonicalizes
+      the build-specific `$<module>$<hex>` tail of constant-global names). The loader
+      (`core/sys/hot_reload/hot_reload.odin`) seeds a live `name_hash→content_hash` map from
+      the exe's table and, each reload, patches ONLY procedures whose hash changed (unchanged
+      procs — the whole runtime and the loader itself — are skipped, so there is no
+      "patch the patcher" hazard and only edited procs relocate). `-hot-reload` now **implies
+      `-debug`** (`src/main.cpp`), which also pins base and reload builds to the same
+      optimization level (`-o:none`) so the hashes match. Verified: a one-proc edit patches
+      exactly that proc; a no-op reload prints "no changed procedures"; `mt_test` still
+      200/200. **Soundness note:** a change to a string literal's *content* at the same length
+      is not detected (the content lives in a separate constant global, not in the referencing
+      proc's IR); length changes and all code changes are detected.
 - [ ] **Validate optimized builds** (`-o:speed`/`-o:size`) — cross-TU inlining and
       COMDAT folding can defeat patching; confirm `noinline` + single module hold up.
 - [ ] **Free the previously mapped block** on the next reload (currently leaks one
@@ -366,10 +387,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 ## Known limitations (current, by design of the PoC)
 
 - Windows / x64 / COFF only.
-- **Requires `-debug`.** The loader resolves the running exe's symbols from its PDB, so the
-  host must be built `-hot-reload -debug` with the `.pdb` present next to it (enforced at
-  build time). The `@(hot_reload)` set is recovered structurally from the patchable-function
-  prefix — see `hr_is_hot_entry` — with no baked table or metadata section.
+- **`-hot-reload` implies `-debug`.** The loader resolves the running exe's symbols from its
+  PDB, so a `.pdb` must sit next to the exe; `-hot-reload` now turns on `-debug` automatically
+  (`src/main.cpp`). This also pins base and reload builds to the same optimization level
+  (`-o:none`), which the change-detection content hashes rely on to match. The hot-patchable
+  set is emitted for every eligible procedure and recovered structurally from the
+  patchable-function prefix — see `hr_is_hot_entry`.
 - Multithreaded-safe: a reload suspends the other threads, checks their instruction
   pointers, and publishes each redirect with a single atomic store (see Tier 1). The
   interactive demo still reloads between ticks for clarity; the multithreaded path is

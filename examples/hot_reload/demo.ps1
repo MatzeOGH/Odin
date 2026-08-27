@@ -56,7 +56,6 @@ bonus :: proc() -> i64 {
 	return 5
 }
 
-@(hot_reload)
 update :: proc(s: ^State) {
 	reloads += 1
 	threshold += 1
