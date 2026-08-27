@@ -17,7 +17,6 @@ State :: struct {
 	dead:   bool, // removed in v2
 }
 
-@(hot_reload)
 init_state :: proc(p: rawptr) {
 	s := (^State)(p)
 	s.health = 99
@@ -27,7 +26,6 @@ init_state :: proc(p: rawptr) {
 	s.dead = true
 }
 
-@(hot_reload)
 report :: proc(p: rawptr) -> Report {
 	s := (^State)(p)
 	sq, is_sq := s.shape.(Square)

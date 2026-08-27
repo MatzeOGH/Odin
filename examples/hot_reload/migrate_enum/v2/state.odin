@@ -14,7 +14,6 @@ State :: struct {
 	label:  [4]u8,
 }
 
-@(hot_reload)
 init_state :: proc(p: rawptr) {
 	s := (^State)(p)
 	s.id = 123
@@ -22,7 +21,6 @@ init_state :: proc(p: rawptr) {
 	s.label = {'a', 'b', 'c', 'd'}
 }
 
-@(hot_reload)
 report :: proc(p: rawptr) -> Report {
 	s := (^State)(p)
 	return Report{id = s.id, facing = i64(s.facing), label0 = i64(s.label[0])}

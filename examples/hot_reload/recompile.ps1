@@ -11,12 +11,19 @@ $here = $PSScriptRoot
 $odin = Join-Path $here '..\..\odin.exe'
 
 Set-Location $here
-if (-not (Test-Path (Join-Path $here 'hot.manifest'))) {
-	throw 'hot.manifest not found — run run.ps1 first (it builds the exe and the manifest).'
+if (-not (Test-Path (Join-Path $here 'odin-hot-reload.manifest'))) {
+	throw 'odin-hot-reload.manifest not found — run run.ps1 first (it builds the exe and the manifest).'
 }
 
-Write-Host '==> recompiling game.odin -> hot.obj'
-& $odin build . -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:hot.manifest -out:hot.obj
+Write-Host '==> recompiling game.odin -> hot_objs\ (separate modules)'
+$objs = Join-Path $here 'hot_objs'
+Remove-Item $objs -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $objs | Out-Null
+# No -use-single-module: emit one object per package. The standard library is resolved from
+# the running exe (its objects are not emitted), and an unchanged user package is not
+# re-emitted at all — so a reload typically produces just the default/metadata object plus the
+# package(s) you actually edited. The loader (apply_dir) maps the whole set together.
+& $odin build . -build-mode:obj -hot-reload -out:(Join-Path $objs 'hot.obj')
 if ($LASTEXITCODE -ne 0) { throw 'obj build failed' }
 
-Write-Host '==> hot.obj ready — press `r` in the running exe to reload.'
+Write-Host '==> hot_objs\ ready — press `r` in the running exe to reload.'

@@ -6,7 +6,7 @@ package hot_reload_mt_test
 // Unlike the interactive demo, this program drives itself and exits 0 on success /
 // non-zero on failure, so it can run unattended (see run_mt_test.ps1).
 //
-// It spawns N worker threads that hammer the `@(hot_reload) work` procedure in a
+// It spawns N worker threads that hammer the hot-reloaded `work` procedure in a
 // tight loop, then reloads `mt_hot.obj` into the process RELOADS times WHILE the
 // workers are running — the exact race the thread-safe patcher must survive. It then
 // asserts: (1) the process never crashed, (2) every worker kept running across the
@@ -34,7 +34,7 @@ work :: proc(s: ^State) {
 
 N_WORKERS :: 4
 RELOADS   :: 200
-OBJ_PATH  :: "mt_hot.obj"
+OBJ_DIR   :: "objs" // directory of the reload set's per-package objects
 
 Worker :: struct {
 	state: State,
@@ -82,7 +82,7 @@ main :: proc() {
 	// The stress: reload the object many times while every worker is executing `work`.
 	ok_count := 0
 	for _ in 0 ..< RELOADS {
-		if hr.apply(OBJ_PATH) {
+		if hr.apply_dir(OBJ_DIR) {
 			ok_count += 1
 		}
 	}

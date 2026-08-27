@@ -3,7 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File examples\hot_reload\mt_test\run_mt_test.ps1
 #
 # Builds the test .exe (-hot-reload), simulates an "edit" that changes the
-# @(hot_reload) `work` body from `s.n += 1` to `s.n += 100`, compiles that to
+# hot-reloaded `work` body from `s.n += 1` to `s.n += 100`, compiles that to
 # mt_hot.obj, and runs the .exe. The .exe spawns worker threads that hammer `work`
 # while the main thread reloads the object 200x, then asserts the workers survived
 # and the patch took effect. Exit code is propagated: 0 = PASS, non-zero = FAIL.
@@ -30,8 +30,13 @@ $edited = (Get-Content -Raw (Join-Path $here 'mt_test.odin')) -replace 's\.n \+=
 if ($edited -notmatch 's\.n \+= 100') { throw 'edit substitution failed (source marker changed?)' }
 $edited | Out-File -Encoding utf8 (Join-Path $src 'mt_test.odin')
 
-Write-Host '==> compiling the edit to mt_hot.obj (same manifest)'
-& $odin build $src -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'mt_hot.obj')
+Write-Host '==> compiling the edit to a multi-object reload set (separate modules, same manifest)'
+$objs = Join-Path $work 'objs'
+Remove-Item $objs -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $objs | Out-Null
+# No -use-single-module: emit one object per package into objs/. The loader (apply_dir)
+# maps them all and relocates them against the exe AND against each other.
+& $odin build $src -build-mode:obj -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $objs 'mt_hot.obj')
 if ($LASTEXITCODE -ne 0) { throw 'obj build failed' }
 
 Write-Host '==> running the stress test (workers hammer `work` while the main thread reloads 200x)'

@@ -48,7 +48,7 @@ update :: proc(s: ^State) {
 @(thread_local) v:int
 @(thread_local) neo : int
 
-OBJ_PATH :: "hot.obj"
+OBJ_DIR :: "hot_objs" // directory of the reload set's per-package objects (see recompile.ps1)
 
 main :: proc() {
 	state := State{counter = 0, step = 1}
@@ -77,7 +77,7 @@ main :: proc() {
 			case "q":
 				return
 			case "r":
-				ok := hr.apply(OBJ_PATH)
+				ok := hr.apply_dir(OBJ_DIR)
 				fmt.printfln("reload ok: %v", ok)
 			case: // empty line or "t": advance the simulation
 				update(&state)

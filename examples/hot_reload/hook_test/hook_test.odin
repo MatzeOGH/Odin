@@ -11,7 +11,7 @@ package hot_reload_hook_test
 //   (3) the loader diffs old vs new type-info and hands the hooks exactly the types
 //       whose layout changed: the edit adds a field to `State`, so `changed` carries
 //       State with old.size 8 and new.size 16;
-//   (4) the ordinary @(hot_reload) patch still takes effect.
+//   (4) the ordinary hot-reload patch still takes effect.
 
 import "base:runtime"
 import "core:fmt"
@@ -43,10 +43,8 @@ State :: struct {
 
 // Pull Holder/Shape (and their members) into the type table without embedding them in
 // State (which would change State's asserted size).
-@(hot_reload)
 touch :: proc() -> (Holder, Shape) { return {}, {} }
 
-@(hot_reload)
 work :: proc(s: ^State) {
 	s.n += 1
 	s.mode = .Run
@@ -129,7 +127,7 @@ main :: proc() {
 	// Shape's variants were re-ordered (same size) -> union-aware compare must flag it.
 	if !post_saw_shape { fail("diff did not flag Shape (union variants reordered)") }
 
-	// The @(hot_reload) patch must also have taken: reloaded body adds 100.
+	// The hot-reload patch must also have taken: reloaded body adds 100.
 	probe: State
 	PROBE :: 10
 	for _ in 0 ..< PROBE {

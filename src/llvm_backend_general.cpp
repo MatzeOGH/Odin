@@ -56,6 +56,18 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	Checker *c = m->checker;
 	m->info = &c->info;
 
+	// Per-module optimization level. Normally every module uses the global level; under
+	// -hot-reload, the standard-library collections (base/core/vendor) are never
+	// hot-patched, so build them optimized/inlined at -o:2 while user modules stay at the
+	// global level (-o:none + noinline + patchable). A user proc's IR is independent of a
+	// builtin module's opt level (no cross-module inlining without LTO), so this does not
+	// perturb the per-function change-detection hashes. `default_module`, polymorphic, and
+	// equal modules have no builtin package and keep the global level.
+	m->optimization_level = build_context.optimization_level;
+	if (build_context.hot_reload && m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath)) {
+		m->optimization_level = 2;
+	}
+
 
 	String name = build_context.build_paths[BuildPath_Output].name;
 	gbString module_name = gb_string_make(heap_allocator(), "");

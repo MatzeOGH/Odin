@@ -19,7 +19,7 @@ New-Item -ItemType Directory -Force $work | Out-Null
 Remove-Item $manifest -ErrorAction SilentlyContinue
 
 Write-Host '==> building hook-test .exe (-hot-reload, VER=1)'
-& $odin build $here -out:(Join-Path $work 'hook_test.exe') -debug -hot-reload -hot-reload-manifest:$manifest
+& $odin build $here -out:(Join-Path $work 'hook_test.exe') -debug -hot-reload -hot-reload-manifest:$manifest -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'exe build failed' }
 
 Write-Host '==> simulating an edit: VER 1->2, work adds 100'
@@ -40,7 +40,7 @@ if ($edited -notmatch 'Shape  :: union \{ Square, Circle \}') { throw 'edit subs
 $edited | Out-File -Encoding utf8 (Join-Path $src 'hook_test.odin')
 
 Write-Host '==> compiling the edit to hook_hot.obj (same manifest)'
-& $odin build $src -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'hook_hot.obj')
+& $odin build $src -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'hook_hot.obj') -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'obj build failed' }
 
 Write-Host '==> running'

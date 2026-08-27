@@ -23,7 +23,6 @@ State :: struct {
 	shape:  Shape,
 }
 
-@(hot_reload)
 init_state :: proc(p: rawptr) {
 	s := (^State)(p)
 	s.hp = 99
@@ -33,7 +32,6 @@ init_state :: proc(p: rawptr) {
 	s.shape = Square{7}
 }
 
-@(hot_reload)
 report :: proc(p: rawptr) -> Report {
 	s := (^State)(p)
 	sq, is_sq := s.shape.(Square)

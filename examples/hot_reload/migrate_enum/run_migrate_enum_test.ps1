@@ -32,12 +32,12 @@ function Stage($name, $stateDir) {
 
 Write-Host '==> building migrate-enum .exe (v1 layout)'
 $exeSrc = Stage 'exe_src' 'v1'
-& $odin build $exeSrc -out:(Join-Path $work 'migrate_enum.exe') -debug -hot-reload -hot-reload-manifest:$manifest
+& $odin build $exeSrc -out:(Join-Path $work 'migrate_enum.exe') -debug -hot-reload -hot-reload-manifest:$manifest -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'exe build failed' }
 
 Write-Host '==> compiling v2 layout to migrate_enum_hot.obj (same manifest)'
 $objSrc = Stage 'obj_src' 'v2'
-& $odin build $objSrc -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'migrate_enum_hot.obj')
+& $odin build $objSrc -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'migrate_enum_hot.obj') -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'obj build failed' }
 
 Write-Host '==> running'

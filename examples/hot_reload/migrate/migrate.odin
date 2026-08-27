@@ -6,7 +6,7 @@ package hot_reload_migrate
 // exits 0 = PASS.
 //
 // The host keeps its state behind a `rawptr` and never touches the fields directly —
-// only @(hot_reload) procs do — so the host binary is layout-agnostic. On reload:
+// only the hot-reloaded procs do — so the host binary is layout-agnostic. On reload:
 //   * a @(pre_patch_hook) (old code) serializes the live State by name, and
 //   * a @(post_patch_hook) (new code) allocates the NEW layout and deserializes the
 //     saved fields into it, reflecting via hot_reload.Type_Change.new (the reloaded
@@ -48,7 +48,6 @@ g_migrated_v2:   i64
 g_migrated_extra: i64
 g_migrated:      bool
 
-@(hot_reload)
 init_state :: proc(p: rawptr) {
 	s := (^State)(p)
 	s.n = 42

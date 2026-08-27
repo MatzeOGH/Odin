@@ -3,15 +3,24 @@ package hot_reload
 
 // Live++-style in-process hot reload for Odin (Windows / x64).
 //
-// Recompile the whole program to a single COFF object:
+// Recompile with SEPARATE modules to a directory of COFF objects (one per package):
 //
-//     odin build <pkg> -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:<path> -out:hot.obj
+//     odin build <pkg> -build-mode:obj -hot-reload -hot-reload-manifest:<path> -out:<dir>/hot.obj
 //
-// then call `apply("hot.obj")` from the running process. The object is loaded
-// directly into the process (no DLL), relocated, and the prologue of each running
-// `@(hot_reload)` procedure is overwritten with a jump to the fresh code. Existing
-// direct calls reach the new code; the process never restarts and its state is
-// untouched.
+// then call `apply_dir("<dir>")` from the running process (or `apply_many({...})` with an
+// explicit list; `apply("one.obj")` still works for a single object). The objects are loaded
+// directly into the process (no DLL), relocated against the exe AND each other, and the
+// prologue of each running hot procedure whose code changed is overwritten with a jump to the
+// fresh code. Existing direct calls reach the new code; the process never restarts and its
+// state is untouched.
+//
+// The reload set is small: the standard-library collections (base/core/vendor) are NOT
+// emitted on a reload build — that code is already in the running exe and is resolved from its
+// PDB — and an UNCHANGED user package is not re-emitted either. So a reload typically produces
+// just the default/metadata object plus the package(s) actually edited. The loader maps every
+// object before relocating, so a new procedure/global defined in one object is reachable from
+// another (a cross-object reference beyond signed-32-bit REL32 range goes through a near
+// trampoline, like any far external).
 //
 // Relocations against *external* symbols (other procedures, runtime helpers, and
 // globals) are resolved against the addresses in the already-running process by
@@ -44,6 +53,7 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import win "core:sys/windows"
 
@@ -394,20 +404,13 @@ hr_resolve_pre_hook :: proc(name: string, ctx: rawptr) -> rawptr {
 
 @(private)
 hr_resolve_post_hook :: proc(name: string, ctx: rawptr) -> rawptr {
-	o := (^Hr_Obj_Ref)(ctx)
-	addr, _ := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, name)
-	return addr
-}
-
-// The parsed reload object, threaded to the post-hook resolver so it can look up each
-// post hook's object-local (fresh) copy by name.
-@(private)
-Hr_Obj_Ref :: struct {
-	data:          []byte,
-	sym_off:       int,
-	n_syms:        int,
-	strtab_off:    int,
-	section_bases: []rawptr,
+	// `ctx` points at the whole reload set's object-local symbol map (see `apply_many`),
+	// so a post-hook body may live in ANY of the reload objects, not just one.
+	defs := (^map[string]rawptr)(ctx)
+	if addr, ok := defs^[name]; ok {
+		return addr
+	}
+	return nil
 }
 
 // One entry of the compiler-emitted `__odin_hot_reload_func_hashes` table: a procedure's
@@ -490,16 +493,38 @@ hr_proc_changed :: proc(name: string, obj_hashes: map[u64]u64, have_obj_hashes: 
 // per-call scratch runs on a private arena, so it never touches the app's
 // `context.temp_allocator`.
 apply :: proc(obj_path: string) -> bool {
-	return load_and_patch(obj_path)
+	return apply_many({obj_path})
 }
 
-// Load `obj_path`, relocate it against this running process, and replace every
-// `@(hot_reload)` procedure with its fresh implementation. Returns true if every
-// hot procedure was patched.
-load_and_patch :: proc(obj_path: string) -> bool {
+// Convenience: reload every `*.obj` in `dir` as ONE multi-object set. A separate-modules
+// `-build-mode:obj -hot-reload` build emits one object per (non-empty) package, so the
+// caller does not have to enumerate them — point this at the output directory. Works for a
+// single-object build too (one match). Order is irrelevant: the objects are all mapped
+// before any relocation (see `apply_many`), so cross-object references resolve regardless.
+apply_dir :: proc(dir: string) -> bool {
+	pattern := fmt.tprintf("%s/*.obj", dir)
+	matches, err := filepath.glob(pattern, context.temp_allocator)
+	if err != nil || len(matches) == 0 {
+		fmt.eprintfln("[hot] apply_dir: no .obj files found in %q", dir)
+		return false
+	}
+	return apply_many(matches)
+}
+
+// Load a SET of COFF objects produced by a separate-modules `-build-mode:obj -hot-reload`
+// build (one per user package, plus the default/metadata object), relocate them against
+// the running process AND against each other, and replace every changed hot procedure with
+// its fresh implementation. Symbols the objects leave undefined — chiefly the whole
+// standard library, whose bodies a reload build omits — resolve from the running exe's PDB.
+// Returns true if every discovered hot procedure was patched.
+//
+// A single-object reload is just `apply_many({one_path})`. Loading multiple objects is what
+// lets a new procedure/global defined in one object be referenced from another (resolved via
+// the cross-object `all_syms` map below, through a near trampoline when out of REL32 range).
+apply_many :: proc(obj_paths: []string) -> bool {
 	// Refuse a concurrent/nested reload rather than corrupt the shared loader state.
 	if _, swapped := intrinsics.atomic_compare_exchange_strong(&_hr_busy, false, true); !swapped {
-		fmt.eprintln("[hot] a reload is already in progress; apply()/load_and_patch() must be called from one thread, one reload at a time")
+		fmt.eprintln("[hot] a reload is already in progress; apply()/apply_many() must be called from one thread, one reload at a time")
 		return false
 	}
 	defer intrinsics.atomic_store(&_hr_busy, false)
@@ -516,43 +541,22 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	context.temp_allocator = runtime.arena_allocator(&scratch)
 	defer runtime.arena_destroy(&scratch)
 
-	data, err := os.read_entire_file(obj_path, context.allocator)
-	if err != nil {
-		fmt.eprintln("[hot] could not read object:", obj_path, err)
+	if len(obj_paths) == 0 {
+		fmt.eprintln("[hot] apply_many: no objects given")
 		return false
 	}
-	defer delete(data)
-
-	if len(data) < FILE_HDR_SIZE {
-		fmt.eprintln("[hot] object too small")
-		return false
-	}
-	hdr := (^Coff_File_Header)(raw_data(data))
-	if int(hdr.machine) != IMAGE_FILE_MACHINE_AMD64 {
-		fmt.eprintfln("[hot] unexpected machine 0x%x (need AMD64)", int(hdr.machine))
-		return false
-	}
-
-	n_sections := int(hdr.number_of_sections)
-	sec_off := FILE_HDR_SIZE + int(hdr.size_of_optional_header)
-	sym_off := int(hdr.pointer_to_symbol_table)
-	n_syms := int(hdr.number_of_symbols)
-	strtab_off := sym_off + n_syms*COFF_SYMBOL_SIZE
 
 	// Every running-exe address is resolved on demand from the exe's PDB (see
-	// `hr_resolve_pdb`, which caches). Discover the `@(hot_reload)` procedures to
-	// patch structurally while resolving the object's symbols below (collected into
-	// `hot_names`). `tls_cache` memoizes each thread-local's exe TLS-block offset,
-	// computed lazily via its accessor when a SECREL relocation first references it.
+	// `hr_resolve_pdb`, which caches). `tls_cache` memoizes each thread-local's exe
+	// TLS-block offset, computed lazily via its accessor when a SECREL relocation first
+	// references it (shared across objects; offsets are thread- and object-independent).
 	if !hr_dbghelp_ensure() {
 		fmt.eprintln("[hot] could not initialize DbgHelp; is the exe built with -debug (a PDB next to it)?")
 		return false
 	}
-	hot_names := make([dynamic]string, context.temp_allocator)
-	tls_cache := make(map[string]uintptr, context.temp_allocator)
 
 	// Change detection: seed the live-hash baseline from the exe's func-hash table once,
-	// then diff this reload object's hashes against it so only procedures whose code
+	// then diff each reload object's hashes against it so only procedures whose code
 	// changed are patched (unchanged procs — including the whole runtime and this loader —
 	// are skipped). If either table is missing (older exe/object), every eligible procedure
 	// is treated as changed, matching the pre-change-detection behaviour.
@@ -561,271 +565,337 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		hr_read_func_hashes(hr_resolve_pdb("__odin_hot_reload_func_hashes"), &_hr_cur)
 		_hr_cur_ready = true
 	}
-	obj_hashes := make(map[u64]u64, context.temp_allocator)
-	have_obj_hashes := false // set once the object's table is located (after sections map)
 
 	section_header :: proc(data: []byte, sec_off, i: int) -> ^Coff_Section_Header {
 		return (^Coff_Section_Header)(raw_data(data[sec_off + i*SECTION_HDR_SIZE:]))
 	}
 
-	// 1) Lay every section out inside ONE contiguous block, then map that block
-	//    within +/-2GB of the exe. This is essential: RIP-relative (REL32)
-	//    references from the loaded code to the exe's procedures and globals must
-	//    fit in a signed 32-bit displacement, and inter-section REL32 references
-	//    must reach across the block too. A far-away VirtualAlloc would overflow.
+	// One reload object, mapped into its own near-exe block. Each object relocates against
+	// the exe, against the other objects (via `all_syms`), and internally; a far target
+	// (cross-object beyond REL32 range) is reached through this object's near trampolines.
+	Obj :: struct {
+		path:          string,
+		data:          []byte,
+		sec_off:       int,
+		sym_off:       int,
+		n_syms:        int,
+		strtab_off:    int,
+		n_sections:    int,
+		section_bases: []rawptr,
+		offsets:       []int,
+		block:         rawptr,
+		total:         int,
+		text_base:     rawptr,
+		text_size:     int,
+		near_arena:    Near_Arena,
+		resolved:      []rawptr,
+	}
 	PAGE :: 0x1000
-	section_bases := make([]rawptr, n_sections + 1, context.temp_allocator)
-	offsets := make([]int, n_sections + 1, context.temp_allocator)
-	total := 0
-	for i in 0 ..< n_sections {
-		sh := section_header(data, sec_off, i)
-		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
-		if size == 0 {
-			offsets[i + 1] = -1
-			continue
+
+	objs := make([dynamic]Obj, 0, len(obj_paths), context.temp_allocator)
+
+	// PASS 1a) Parse each object and lay every section out inside ONE contiguous block per
+	//    object, mapped within +/-2GB of the exe. This is essential: RIP-relative (REL32)
+	//    references from the loaded code to the exe's procedures/globals must fit in a
+	//    signed 32-bit displacement, and inter-section REL32 references must reach across
+	//    the block too. A cross-OBJECT REL32 that overflows is routed through a trampoline.
+	for path in obj_paths {
+		data, err := os.read_entire_file(path, context.temp_allocator)
+		if err != nil {
+			fmt.eprintln("[hot] could not read object:", path, err)
+			return false
+		}
+		if len(data) < FILE_HDR_SIZE {
+			fmt.eprintln("[hot] object too small:", path)
+			return false
+		}
+		hdr := (^Coff_File_Header)(raw_data(data))
+		if int(hdr.machine) != IMAGE_FILE_MACHINE_AMD64 {
+			fmt.eprintfln("[hot] %s: unexpected machine 0x%x (need AMD64)", path, int(hdr.machine))
+			return false
+		}
+
+		o: Obj
+		o.path       = path
+		o.data       = data
+		o.n_sections = int(hdr.number_of_sections)
+		o.sec_off    = FILE_HDR_SIZE + int(hdr.size_of_optional_header)
+		o.sym_off    = int(hdr.pointer_to_symbol_table)
+		o.n_syms     = int(hdr.number_of_symbols)
+		o.strtab_off = o.sym_off + o.n_syms*COFF_SYMBOL_SIZE
+
+		o.section_bases = make([]rawptr, o.n_sections + 1, context.temp_allocator)
+		o.offsets = make([]int, o.n_sections + 1, context.temp_allocator)
+		total := 0
+		for i in 0 ..< o.n_sections {
+			sh := section_header(data, o.sec_off, i)
+			size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
+			if size == 0 {
+				o.offsets[i + 1] = -1
+				continue
+			}
+			total = ((total + PAGE - 1) / PAGE) * PAGE
+			o.offsets[i + 1] = total
+			total += size
 		}
 		total = ((total + PAGE - 1) / PAGE) * PAGE
-		offsets[i + 1] = total
-		total += size
-	}
-	total = ((total + PAGE - 1) / PAGE) * PAGE
+		o.total = total
 
-	block := alloc_near_exe(total)
-	if block == nil {
-		fmt.eprintln("[hot] could not reserve memory within 2GB of the exe")
-		return false
-	}
-	text_base: rawptr
-	text_size: int
-	for i in 0 ..< n_sections {
-		if offsets[i + 1] < 0 {
-			continue
+		o.block = alloc_near_exe(total)
+		if o.block == nil {
+			fmt.eprintln("[hot] could not reserve memory within 2GB of the exe for", path)
+			return false
 		}
-		sh := section_header(data, sec_off, i)
-		base := rawptr(uintptr(block) + uintptr(offsets[i + 1]))
-		section_bases[i + 1] = base
-		if int(sh.size_of_raw_data) > 0 && int(sh.pointer_to_raw_data) != 0 {
-			intrinsics.mem_copy(base, raw_data(data[int(sh.pointer_to_raw_data):]), int(sh.size_of_raw_data))
+		for i in 0 ..< o.n_sections {
+			if o.offsets[i + 1] < 0 {
+				continue
+			}
+			sh := section_header(data, o.sec_off, i)
+			base := rawptr(uintptr(o.block) + uintptr(o.offsets[i + 1]))
+			o.section_bases[i + 1] = base
+			if int(sh.size_of_raw_data) > 0 && int(sh.pointer_to_raw_data) != 0 {
+				intrinsics.mem_copy(base, raw_data(data[int(sh.pointer_to_raw_data):]), int(sh.size_of_raw_data))
+			}
+			if section_name(sh) == ".text" {
+				o.text_base = base
+				o.text_size = int(sh.size_of_raw_data)
+			}
 		}
-		if section_name(sh) == ".text" {
-			text_base = base
-			text_size = int(sh.size_of_raw_data)
+		// Near-block scratch for trampolines (far REL32 targets, incl. cross-object) and
+		// import cells (`__imp_X` slots), allocated near this object's block so a REL32 reaches them.
+		o.near_arena = Near_Arena{
+			near   = uintptr(o.block),
+			tramps = make(map[uintptr]rawptr, context.temp_allocator),
+			cells  = make(map[uintptr]rawptr, context.temp_allocator),
 		}
-	}
-
-	// This reload object's per-procedure content hashes (plain integers, no relocations),
-	// for change detection in the resolution loop below.
-	if tbl, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_func_hashes"); ok {
-		hr_read_func_hashes(tbl, &obj_hashes)
-		have_obj_hashes = len(obj_hashes) > 0
+		o.resolved = make([]rawptr, o.n_syms, context.temp_allocator)
+		append(&objs, o)
 	}
 
-	// Build-identity guard (F6): refuse a reload object built against a different exe
-	// layout. A stale object (base exe rebuilt, arena relaid) would resolve names and write
-	// const-init blobs at now-wrong arena offsets -> silent corruption. The compiler bakes
-	// the same `__odin_hot_reload_build_id` into the exe and every object built against it;
-	// mismatch here means "rebuild the reload object". Skipped if either symbol is absent
-	// (older exe/object without the id), matching the func-hash "missing -> lenient" policy.
+	// PASS 1b) Read the per-procedure content-hash table for change detection. It is emitted
+	//    once, into the default/metadata object; find it in whichever object carries it.
+	obj_hashes := make(map[u64]u64, context.temp_allocator)
+	have_obj_hashes := false
+	for &o in objs {
+		if tbl, ok := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, "__odin_hot_reload_func_hashes"); ok {
+			hr_read_func_hashes(tbl, &obj_hashes)
+			have_obj_hashes = len(obj_hashes) > 0
+			break
+		}
+	}
+
+	// Build-identity guard (F6): refuse a reload set built against a different exe layout.
+	// A stale object (base exe rebuilt, arena relaid) would resolve names and write const-init
+	// blobs at now-wrong arena offsets -> silent corruption. The compiler bakes the same
+	// `__odin_hot_reload_build_id` into the exe and every object built against it; mismatch
+	// here means "rebuild the reload objects". Skipped if either symbol is absent (older
+	// exe/object without the id), matching the func-hash "missing -> lenient" policy.
 	if exe_bid := hr_resolve_pdb("__odin_hot_reload_build_id"); exe_bid != nil {
-		if obj_bid, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_build_id"); ok {
-			exe_id := (^u64)(exe_bid)^
-			obj_id := (^u64)(obj_bid)^
-			if exe_id != obj_id {
-				fmt.eprintfln("[hot] build-id mismatch: this reload object (%d) was not built against the running exe (%d). Rebuild the reload object against the current exe.", obj_id, exe_id)
-				return false
+		for &o in objs {
+			if obj_bid, ok := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, "__odin_hot_reload_build_id"); ok {
+				exe_id := (^u64)(exe_bid)^
+				obj_id := (^u64)(obj_bid)^
+				if exe_id != obj_id {
+					fmt.eprintfln("[hot] build-id mismatch: reload object %s (%d) was not built against the running exe (%d). Rebuild the reload objects against the current exe.", o.path, obj_id, exe_id)
+					return false
+				}
+				break
 			}
 		}
 	}
 
-	// 2) Resolve every symbol slot to a runtime address.
-	//    - defined & hot (patchable prologue in exe) -> the object's fresh copy (new code)
-	//    - defined & present in the exe (via PDB)     -> the exe's address (reuse / preserve globals)
-	//    - defined & object-local                     -> the object's loaded copy (new procs, constants, labels)
-	//    - undefined external                         -> the exe's address (PDB / export), else unresolved
-	//
-	// New globals reach here as an undefined external reference to
-	// `__odin_hot_reload_global_arena` (resolved to the exe's arena) plus a
-	// per-site byte offset baked into the relocation addend — so they land in
-	// stable in-image storage. New procedures are object-local and resolve to
-	// their fresh copy, callable from patched and other new code.
-	// Near-block scratch for trampolines (far REL32 targets) and import cells
-	// (`__imp_X` slots). Allocated near the loaded block so a REL32 can reach them.
-	near_arena := Near_Arena{
-		near   = uintptr(block),
-		tramps = make(map[uintptr]rawptr, context.temp_allocator),
-		cells  = make(map[uintptr]rawptr, context.temp_allocator),
-	}
-
-	resolved := make([]rawptr, n_syms, context.temp_allocator)
-	// name -> this object's address for every DEFINED symbol, built once here so the
-	// later per-proc / per-refresh lookups reuse it instead of re-scanning the whole
-	// symbol table (find_symbol_address is O(n_syms) per call). First-seen wins, matching
-	// find_symbol_address's first-defined-match semantics.
-	obj_syms := make(map[string]rawptr, n_syms, context.temp_allocator)
-	{
+	// PASS 1c) Decide each DEFINED symbol's canonical runtime address across the WHOLE object
+	//    set, into `all_syms` (name -> decided address; the resolution policy from the old
+	//    single-object loader, now applied once per name, first-defined-wins):
+	//    - defined & hot (patchable prologue in exe) & CHANGED -> the object's fresh copy (patch the entry)
+	//    - defined & present in the exe (via PDB)               -> the exe's address (reuse / preserve globals)
+	//    - defined & object-local                               -> the object's loaded copy (new procs/globals/constants)
+	//    `all_defs` keeps the OBJECT-LOCAL address of every defined symbol (regardless of the
+	//    decision) so refresh (@(rodata)/#load fresh copy) and post-patch-hook bodies resolve
+	//    to the fresh code in whichever object defines them.
+	all_syms := make(map[string]rawptr, context.temp_allocator)
+	all_defs := make(map[string]rawptr, context.temp_allocator)
+	Hot :: struct { name: string, obj: int }
+	hot_names := make([dynamic]Hot, context.temp_allocator)
+	for &o, oi in objs {
 		i := 0
-		for i < n_syms {
-			sym := coff_symbol(data, sym_off, i)
-			name := symbol_name(sym, data, strtab_off)
+		for i < o.n_syms {
+			sym := coff_symbol(o.data, o.sym_off, i)
+			name := symbol_name(sym, o.data, o.strtab_off)
 			sn := int(sym.section_number)
-			if sn > 0 && section_bases[sn] != nil {
-				obj_addr := rawptr(uintptr(section_bases[sn]) + uintptr(sym.value))
-				if _, seen := obj_syms[name]; !seen {
-					obj_syms[name] = obj_addr
+			if sn > 0 && o.section_bases[sn] != nil {
+				obj_addr := rawptr(uintptr(o.section_bases[sn]) + uintptr(sym.value))
+				if _, seen := all_defs[name]; !seen {
+					all_defs[name] = obj_addr
 				}
-				exe_addr := hr_resolve_pdb(name)
-				// Only a symbol defined in an executable section can be a hot procedure.
-				// Restricting the (byte-reading) hot check to code symbols also avoids
-				// dereferencing a data global that happens to sit next to an unmapped page.
-				sh := section_header(data, sec_off, sn - 1)
-				is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
-				if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) && hr_proc_changed(name, obj_hashes, have_obj_hashes) {
-					// A hot procedure whose code CHANGED: run this object's fresh copy and
-					// redirect the exe's entry to it (patched in step 4).
-					resolved[i] = obj_addr
-					append(&hot_names, name)
-				} else if exe_addr != nil {
-					// Pre-existing and unchanged (or a non-hot proc / global): reuse the
-					// exe's copy. Global state is preserved, unchanged code is not
-					// re-patched, and an unchanged proc whose exe entry is already a
-					// trampoline from a prior reload still reaches the current version.
-					resolved[i] = exe_addr
-				} else {
-					// Object-local: a new proc/global, a string constant, a label.
-					resolved[i] = obj_addr
+				if _, seen := all_syms[name]; !seen {
+					exe_addr := hr_resolve_pdb(name)
+					// Only a symbol defined in an executable section can be a hot procedure.
+					// Restricting the (byte-reading) hot check to code symbols also avoids
+					// dereferencing a data global that happens to sit next to an unmapped page.
+					sh := section_header(o.data, o.sec_off, sn - 1)
+					is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
+					if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) && hr_proc_changed(name, obj_hashes, have_obj_hashes) {
+						all_syms[name] = obj_addr
+						append(&hot_names, Hot{name, oi})
+					} else if exe_addr != nil {
+						all_syms[name] = exe_addr
+					} else {
+						all_syms[name] = obj_addr
+					}
 				}
-			} else if sn == 0 {
-				// Undefined external: an Odin symbol (via the exe's PDB), a C-runtime
-				// helper / _tls_index / Windows-API export, or an `__imp_` cell.
-				resolved[i] = hr_resolve(name, &near_arena)
 			}
 			i += 1 + int(sym.number_of_aux_symbols)
 		}
 	}
 
-	// 3) Apply relocations for every section.
+	// PASS 2) Resolve each object's symbol slots, then apply its relocations.
+	//    A DEFINED slot takes its whole-set decision from `all_syms`. An UNDEFINED slot
+	//    resolves to another reload object (via `all_syms`) if present — this is what makes
+	//    a new proc/global in one object reachable from another — else to the running process
+	//    (exe PDB / export / __imp_ cell) via `hr_resolve`.
 	unresolved, unsupported := 0, 0
 	unresolved_text := 0 // unresolved relocations that land in executable code -> fatal
-	for i in 0 ..< n_sections {
-		sh := section_header(data, sec_off, i)
-		base := section_bases[i + 1]
-		if base == nil {
-			continue
+	tls_cache := make(map[string]uintptr, context.temp_allocator)
+	for &o in objs {
+		{
+			i := 0
+			for i < o.n_syms {
+				sym := coff_symbol(o.data, o.sym_off, i)
+				name := symbol_name(sym, o.data, o.strtab_off)
+				sn := int(sym.section_number)
+				if sn > 0 && o.section_bases[sn] != nil {
+					o.resolved[i] = all_syms[name] // decided in PASS 1c
+				} else if sn == 0 {
+					if a, ok := all_syms[name]; ok {
+						o.resolved[i] = a // defined in another reload object
+					} else {
+						o.resolved[i] = hr_resolve(name, &o.near_arena)
+					}
+				}
+				i += 1 + int(sym.number_of_aux_symbols)
+			}
 		}
-		is_text := section_name(sh) == ".text"
-		nreloc := int(sh.number_of_relocations)
-		roff := int(sh.pointer_to_relocations)
-		for r in 0 ..< nreloc {
-			rel := (^Coff_Reloc)(raw_data(data[roff + r*RELOC_SIZE:]))
 
-			// Thread-local access: rewrite the per-variable SECREL offset to the
-			// variable's offset in the EXE's TLS block (the object's own .tls$
-			// layout differs), so hot code reads the running threads' real slots.
-			if int(rel.type) == IMAGE_REL_AMD64_SECREL {
-				site := uintptr(base) + uintptr(rel.virtual_address)
-				usym := coff_symbol(data, sym_off, int(rel.symbol_table_index))
-				sname := symbol_name(usym, data, strtab_off)
-				if off, ok := hr_tls_offset(sname, &tls_cache); ok {
-					// Absolute 32-bit section offset + any per-site addend already
-					// present (e.g. an array-element index within the variable).
-					(^u32)(site)^ = u32(off) + (^u32)(site)^
-				} else {
+		for si in 0 ..< o.n_sections {
+			sh := section_header(o.data, o.sec_off, si)
+			base := o.section_bases[si + 1]
+			if base == nil {
+				continue
+			}
+			is_text := section_name(sh) == ".text"
+			nreloc := int(sh.number_of_relocations)
+			roff := int(sh.pointer_to_relocations)
+			for r in 0 ..< nreloc {
+				rel := (^Coff_Reloc)(raw_data(o.data[roff + r*RELOC_SIZE:]))
+
+				// Thread-local access: rewrite the per-variable SECREL offset to the
+				// variable's offset in the EXE's TLS block (the object's own .tls$
+				// layout differs), so hot code reads the running threads' real slots.
+				if int(rel.type) == IMAGE_REL_AMD64_SECREL {
+					site := uintptr(base) + uintptr(rel.virtual_address)
+					usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
+					sname := symbol_name(usym, o.data, o.strtab_off)
+					if off, ok := hr_tls_offset(sname, &tls_cache); ok {
+						// Absolute 32-bit section offset + any per-site addend already
+						// present (e.g. an array-element index within the variable).
+						(^u32)(site)^ = u32(off) + (^u32)(site)^
+					} else {
+						unresolved += 1
+						if is_text {
+							unresolved_text += 1
+							fmt.eprintfln("[hot] thread-local not resolvable in exe (its accessor __odin_hrtls$%s is not in the exe/PDB): %s", sname, sname)
+						}
+					}
+					continue
+				}
+
+				target := o.resolved[int(rel.symbol_table_index)]
+				if target == nil {
 					unresolved += 1
 					if is_text {
 						unresolved_text += 1
-						fmt.eprintfln("[hot] thread-local not resolvable in exe (its accessor __odin_hrtls$%s is not in the exe/PDB): %s", sname, sname)
+						usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
+						uname := symbol_name(usym, o.data, o.strtab_off)
+						fmt.eprintfln("[hot] unresolved symbol in executable code: %s", uname)
+						fmt.eprintfln("[hot]   (if this is a foreign-library function: its code is not present in the running image. Reference it once in the base build, or link the archive whole, e.g. /WHOLEARCHIVE. Adding a library not linked into the base build is not supported. A base build without -debug also has no PDB to resolve non-exported symbols.)")
 					}
+					continue
 				}
+				site := uintptr(base) + uintptr(rel.virtual_address)
+				switch int(rel.type) {
+				case IMAGE_REL_AMD64_ADDR64:
+					(^u64)(site)^ = (^u64)(site)^ + u64(uintptr(target))
+				case IMAGE_REL_AMD64_REL32 ..= IMAGE_REL_AMD64_REL32 + 5:
+					extra := i64(int(rel.type) - IMAGE_REL_AMD64_REL32) // REL32_1..5 bias
+					addend := i64((^i32)(site)^)
+					next := i64(site) + 4 + extra
+					disp := i64(uintptr(target)) + addend - next
+					if disp < -0x8000_0000 || disp > 0x7FFF_FFFF {
+						// Target out of REL32 range (a CRT/DLL export, or a symbol in ANOTHER
+						// reload object whose block landed >2GB away): route the reference
+						// through a near trampoline that jumps the full 64 bits.
+						final := u64(i64(uintptr(target)) + addend)
+						if th := hr_trampoline_for(&o.near_arena, uintptr(final)); th != nil {
+							disp = i64(uintptr(th)) - next
+						} else if is_text {
+							unresolved_text += 1
+							fmt.eprintln("[hot] could not allocate trampoline for out-of-range target")
+						}
+					}
+					(^i32)(site)^ = i32(disp)
+				case IMAGE_REL_AMD64_ADDR32NB:
+					// 32-bit image-relative RVA (fills .pdata RUNTIME_FUNCTION fields and
+					// .xdata handler/chain pointers). This object lives in `o.block`, which
+					// we pass to RtlAddFunctionTable as the image base, so the RVA is
+					// `target - o.block` plus any inline addend (e.g. an .pdata EndAddress that
+					// points at func+size). Assumes the target is in-block (always true for
+					// unwind data); an external target would wrap to a bogus RVA.
+					addend := i64((^i32)(site)^)
+					off := i64(uintptr(target)) - i64(uintptr(o.block))
+					if off < 0 || off + addend < 0 || off + addend > i64(o.total) {
+						// External target: the RVA would wrap. Refuse rather than corrupt the
+						// unwind tables (does not arise for Odin unwind data today).
+						unresolved += 1
+						if is_text { unresolved_text += 1 }
+						fmt.eprintln("[hot] ADDR32NB target out of block (RVA would wrap)")
+					} else {
+						(^u32)(site)^ = u32(off + addend)
+					}
+				case:
+					unsupported += 1
+				}
+			}
+		}
+
+		// Freshly written executable code — make the instruction cache coherent.
+		if o.text_base != nil {
+			win.FlushInstructionCache(win.GetCurrentProcess(), o.text_base, win.SIZE_T(o.text_size))
+		}
+
+		// Register this object's .pdata so the OS unwinder can find unwind info for RIPs in
+		// its hot code. Odin has no language exceptions, but Windows x64 stack walking is
+		// table-driven (no frame-pointer chain), so these tables are what a `panic`/`assert`
+		// backtrace, the runtime's hardware-fault handler (a segfault/div0 in a hot proc
+		// raises SEH even without `try`), and a debugger's call-stack window all rely on.
+		// The .pdata RVAs were fixed up above (ADDR32NB) relative to `o.block`, so `o.block`
+		// is this object's image base. NOTE: this only fixes UNWINDING; it does not make hot
+		// code source-debuggable (no PDB/module is registered for the mapped block).
+		for si in 0 ..< o.n_sections {
+			sh := section_header(o.data, o.sec_off, si)
+			if section_name(sh) != ".pdata" {
 				continue
 			}
-
-			target := resolved[int(rel.symbol_table_index)]
-			if target == nil {
-				unresolved += 1
-				if is_text {
-					unresolved_text += 1
-					usym := coff_symbol(data, sym_off, int(rel.symbol_table_index))
-					uname := symbol_name(usym, data, strtab_off)
-					fmt.eprintfln("[hot] unresolved symbol in executable code: %s", uname)
-					fmt.eprintfln("[hot]   (if this is a foreign-library function: its code is not present in the running image. Reference it once in the base build, or link the archive whole, e.g. /WHOLEARCHIVE. Adding a library not linked into the base build is not supported. A base build without -debug also has no PDB to resolve non-exported symbols.)")
-				}
+			pbase := o.section_bases[si + 1]
+			if pbase == nil {
 				continue
 			}
-			site := uintptr(base) + uintptr(rel.virtual_address)
-			switch int(rel.type) {
-			case IMAGE_REL_AMD64_ADDR64:
-				(^u64)(site)^ = (^u64)(site)^ + u64(uintptr(target))
-			case IMAGE_REL_AMD64_REL32 ..= IMAGE_REL_AMD64_REL32 + 5:
-				extra := i64(int(rel.type) - IMAGE_REL_AMD64_REL32) // REL32_1..5 bias
-				addend := i64((^i32)(site)^)
-				next := i64(site) + 4 + extra
-				disp := i64(uintptr(target)) + addend - next
-				if disp < -0x8000_0000 || disp > 0x7FFF_FFFF {
-					// Target (e.g. a CRT/DLL export) is out of REL32 range: route the
-					// reference through a near trampoline that jumps the full 64 bits.
-					final := u64(i64(uintptr(target)) + addend)
-					if th := hr_trampoline_for(&near_arena, uintptr(final)); th != nil {
-						disp = i64(uintptr(th)) - next
-					} else if is_text {
-						unresolved_text += 1
-						fmt.eprintln("[hot] could not allocate trampoline for out-of-range target")
-					}
+			size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
+			count := u32(size / size_of(win.RUNTIME_FUNCTION))
+			if count > 0 {
+				if !win.RtlAddFunctionTable(win.PRUNTIME_FUNCTION(pbase), win.DWORD(count), win.DWORD64(uintptr(o.block))) {
+					fmt.eprintln("[hot] RtlAddFunctionTable failed; stack traces through hot code may be wrong")
 				}
-				(^i32)(site)^ = i32(disp)
-			case IMAGE_REL_AMD64_ADDR32NB:
-				// 32-bit image-relative RVA (fills .pdata RUNTIME_FUNCTION fields and
-				// .xdata handler/chain pointers). The whole object lives in `block`,
-				// which we pass to RtlAddFunctionTable as the image base, so the RVA is
-				// `target - block` plus any inline addend (e.g. an .pdata EndAddress that
-				// points at func+size). Assumes the target is in-block (always true for
-				// unwind data); an external target would wrap to a bogus RVA.
-				addend := i64((^i32)(site)^)
-				off := i64(uintptr(target)) - i64(uintptr(block))
-				if off < 0 || off + addend < 0 || off + addend > i64(total) {
-					// External target: the RVA would wrap. Refuse rather than corrupt the
-					// unwind tables (does not arise for Odin unwind data today).
-					unresolved += 1
-					if is_text { unresolved_text += 1 }
-					fmt.eprintln("[hot] ADDR32NB target out of block (RVA would wrap)")
-				} else {
-					(^u32)(site)^ = u32(off + addend)
-				}
-			case:
-				unsupported += 1
-			}
-		}
-	}
-
-	// Freshly written executable code — make the instruction cache coherent.
-	if text_base != nil {
-		win.FlushInstructionCache(win.GetCurrentProcess(), text_base, win.SIZE_T(text_size))
-	}
-
-	// 3.1) Register the object's .pdata so the OS unwinder can find unwind info for RIPs
-	//      in the hot code. Odin has no language exceptions, but Windows x64 stack walking
-	//      is table-driven (no frame-pointer chain), so these tables are what a `panic`/
-	//      `assert` backtrace, the runtime's hardware-fault handler (a segfault/div0 in a
-	//      hot proc raises SEH even without `try`), and a debugger's call-stack window all
-	//      rely on. Without this, a walk that crosses a hot frame finds no RUNTIME_FUNCTION,
-	//      treats it as a leaf, recovers the wrong return address, and corrupts. Normal
-	//      call/return is unaffected. The .pdata RVAs were fixed up above (ADDR32NB)
-	//      relative to `block`, so `block` is the image base. NOTE: this only fixes
-	//      UNWINDING; it does not make hot code source-debuggable (no PDB/module is
-	//      registered for the mapped block, so no source-line breakpoints in hot code).
-	for i in 0 ..< n_sections {
-		sh := section_header(data, sec_off, i)
-		if section_name(sh) != ".pdata" {
-			continue
-		}
-		pbase := section_bases[i + 1]
-		if pbase == nil {
-			continue
-		}
-		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
-		count := u32(size / size_of(win.RUNTIME_FUNCTION))
-		if count > 0 {
-			if !win.RtlAddFunctionTable(win.PRUNTIME_FUNCTION(pbase), win.DWORD(count), win.DWORD64(uintptr(block))) {
-				fmt.eprintln("[hot] RtlAddFunctionTable failed; stack traces through hot code may be wrong")
 			}
 		}
 	}
@@ -839,85 +909,100 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		return false
 	}
 
-	// 3.5) Apply once-only constant initializers for brand-new globals. Each entry
-	//      copies its constant blob into the exe's arena at `arena_offset` iff the
-	//      `flag` byte is still 0, then sets the flag — so re-applying an object (or
-	//      any later reload) never clobbers state the running program accumulated.
-	//      (Relocations were applied above, so `blob` pointers are already correct.)
-	if tbl_addr, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_new_global_inits"); ok {
-		if arena_addr := hr_resolve_pdb("__odin_hot_reload_global_arena"); arena_addr != nil {
-			count := (^i64)(tbl_addr)^
-			entries := ([^]New_Global_Init)(rawptr(uintptr(tbl_addr) + 8))
-			for k in 0 ..< int(count) {
-				e := entries[k]
-				flag := (^u8)(uintptr(arena_addr) + uintptr(e.flag_offset))
-				if flag^ == 0 {
-					dst := rawptr(uintptr(arena_addr) + uintptr(e.arena_offset))
-					intrinsics.mem_copy(dst, e.blob, int(e.size))
-					flag^ = 1
+	// PASS 3) Whole-set metadata, then patch. The metadata tables (new_global_inits,
+	//    refresh_syms, pre/post patch-hook tables, type_infos) are emitted once, into the
+	//    default/metadata object; locate it (it carries the func-hash table).
+	meta_i := -1
+	for &o, oi in objs {
+		if _, ok := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, "__odin_hot_reload_func_hashes"); ok {
+			meta_i = oi
+			break
+		}
+	}
+
+	// 3.5) Apply once-only constant initializers for brand-new globals (all routed into the
+	//      metadata object). Each entry copies its constant blob into the exe's arena at
+	//      `arena_offset` iff the `flag` byte is still 0, then sets the flag — so re-applying
+	//      never clobbers state the running program accumulated. `blob` pointers were
+	//      relocated in PASS 2.
+	if meta_i >= 0 {
+		mo := &objs[meta_i]
+		if tbl_addr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_hot_reload_new_global_inits"); ok {
+			if arena_addr := hr_resolve_pdb("__odin_hot_reload_global_arena"); arena_addr != nil {
+				count := (^i64)(tbl_addr)^
+				entries := ([^]New_Global_Init)(rawptr(uintptr(tbl_addr) + 8))
+				for k in 0 ..< int(count) {
+					e := entries[k]
+					flag := (^u8)(uintptr(arena_addr) + uintptr(e.flag_offset))
+					if flag^ == 0 {
+						dst := rawptr(uintptr(arena_addr) + uintptr(e.arena_offset))
+						intrinsics.mem_copy(dst, e.blob, int(e.size))
+						flag^ = 1
+					}
 				}
 			}
 		}
 	}
 
-	// 3.6) If any pre/post-patch hook exists, diff the reloaded object's freshly
-	//      emitted type-info against the exe's baked type_table to find every type whose
-	//      layout changed, then fire the autowired pre-patch hooks — OLD code (resolved
-	//      from the exe by name), while the running state is still laid out the old way,
-	//      so a hook can serialize it. Skip the diff entirely when there are no hooks.
-	obj_ref := Hr_Obj_Ref{data, sym_off, n_syms, strtab_off, section_bases}
+	// 3.6) If any pre/post-patch hook exists, diff the reload set's freshly emitted type-info
+	//      (in the metadata object) against the exe's baked type_table to find every type
+	//      whose layout changed, then fire the autowired pre-patch hooks — OLD code (resolved
+	//      from the exe by name), while the running state is still laid out the old way, so a
+	//      hook can serialize it. Skip the diff entirely when there are no hooks.
 	pre_tbl := hr_resolve_pdb("__odin_hot_reload_pre_patch_hooks")
-	post_tbl, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_post_patch_hooks")
+	post_tbl: rawptr
 	changed: []Type_Change
-	if hr_hook_count(pre_tbl) > 0 || hr_hook_count(post_tbl) > 0 {
-		changed = hr_build_type_changes(data, sym_off, n_syms, strtab_off, section_bases)
+	if meta_i >= 0 {
+		mo := &objs[meta_i]
+		post_tbl, _ = find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_hot_reload_post_patch_hooks")
+		if hr_hook_count(pre_tbl) > 0 || hr_hook_count(post_tbl) > 0 {
+			changed = hr_build_type_changes(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases)
+		}
 	}
 	defer delete(changed) // outlives the pre hook; freed after the post hook
 	hr_call_patch_hooks(pre_tbl, changed, hr_resolve_pre_hook, nil)
 
-	// 3.7) Immutable-data ("refresh") globals — @(rodata) / #load. The compiler lists each
-	//      one's {size, link name} in a self-contained blob (no relocations). For every one
-	//      that also exists in the exe, repoint the exe's copy at THIS reload's fresh copy:
-	//      overwrite `size` bytes exe<-object. For a slice/string/#load global that size is
-	//      the 16-byte header, so the exe header comes to point at the object's fresh blob
-	//      (which persists in this mapped block) — a data size change is therefore free; a
-	//      value-type @(rodata) is overwritten in place. Because the exe's single canonical
-	//      copy is updated, ALL code (patched or not) sees the new data. A symbol absent from
-	//      the exe is a NEW @(rodata)/#load global — skipped here, since object code already
-	//      references its object-local fresh copy. The writes happen under the stop-the-world
-	//      below so a reader never sees a torn value.
+	// 3.7) Immutable-data ("refresh") globals — @(rodata) / #load — listed in the metadata
+	//      object's self-contained {size, link name} blob. For every one that also exists in
+	//      the exe, repoint the exe's copy at THIS reload's fresh copy (its OBJECT-LOCAL
+	//      address in whichever object defines it, via `all_defs`): overwrite `size` bytes
+	//      exe<-object. For a slice/string/#load global that size is the 16-byte header, so
+	//      the exe header comes to point at the object's fresh blob (a data size change is
+	//      free); a value-type @(rodata) is overwritten in place. Written under the
+	//      stop-the-world below so a reader never sees a torn value.
 	Refresh_Target :: struct {
 		exe, obj: rawptr,
 		size:     int,
 	}
 	refresh_targets := make([dynamic]Refresh_Target, context.temp_allocator)
-	if tbl, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_refresh_syms"); ok {
-		p := uintptr(tbl)
-		count := (^i64)(p)^
-		p += 8
-		for _ in 0 ..< int(count) {
-			size := int((^i64)(p)^); p += 8
-			nlen := int((^i64)(p)^); p += 8
-			name := string(([^]u8)(rawptr(p))[:nlen]); p += uintptr(nlen)
-			exe := hr_resolve_pdb(name)
-			obj, found := obj_syms[name]
-			if exe != nil && found && size > 0 {
-				append(&refresh_targets, Refresh_Target{exe, obj, size})
+	if meta_i >= 0 {
+		mo := &objs[meta_i]
+		if tbl, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_hot_reload_refresh_syms"); ok {
+			p := uintptr(tbl)
+			count := (^i64)(p)^
+			p += 8
+			for _ in 0 ..< int(count) {
+				size := int((^i64)(p)^); p += 8
+				nlen := int((^i64)(p)^); p += 8
+				name := string(([^]u8)(rawptr(p))[:nlen]); p += uintptr(nlen)
+				exe := hr_resolve_pdb(name)
+				obj, found := all_defs[name]
+				if exe != nil && found && size > 0 {
+					append(&refresh_targets, Refresh_Target{exe, obj, size})
+				}
 			}
 		}
 	}
 
 	// 4) Patch each discovered hot procedure's running entry to jump to its fresh code.
-	//    `hot_names` were collected in step 2 (an exe symbol whose entry is the
-	//    patchable hot-patch prologue). Resolve every original (exe, via the PDB) and
-	//    fresh (object) address first, then patch the whole batch with all other
-	//    threads suspended and only once no thread is parked in a region we overwrite —
-	//    so a concurrent thread never executes a half-written instruction.
+	//    `hot_names` were collected in PASS 1c (an exe symbol whose entry is the patchable
+	//    hot-patch prologue, across ALL objects). Resolve every original (exe, via the PDB)
+	//    and fresh (object) address first, then patch the whole batch with all other threads
+	//    suspended and only once no thread is parked in a region we overwrite.
 	if len(hot_names) == 0 && len(refresh_targets) == 0 {
 		if have_obj_hashes {
-			// Change detection: no procedure's code changed since the currently-live
-			// version and no immutable data to repoint — a valid no-op reload (e.g. only
-			// comments changed, or a new proc nothing calls yet). Refresh the baseline.
+			// Change detection: no procedure's code changed since the currently-live version
+			// and no immutable data to repoint — a valid no-op reload. Refresh the baseline.
 			for k, v in obj_hashes {
 				_hr_cur[k] = v
 			}
@@ -933,17 +1018,16 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	}
 	// Resolve and validate EVERY hot target before writing a single byte: patching is
 	// not transactional, so a failure discovered mid-batch would leave the program
-	// half-patched (some procs new, some old, callers split across two ABIs). If any
-	// target cannot be resolved, abort the whole reload with nothing applied.
+	// half-patched. If any target cannot be resolved, abort with nothing applied.
 	targets := make([dynamic]Target, context.temp_allocator)
-	for name in hot_names {
-		original := hr_resolve_pdb(name) // cached; found in step 2
-		fresh, found := obj_syms[name]   // built in step 2; avoids re-scanning the symbol table
+	for h in hot_names {
+		original := hr_resolve_pdb(h.name) // cached; found in PASS 1c
+		fresh, found := all_syms[h.name]   // its decided (object-fresh) address
 		if original == nil || !found {
-			fmt.eprintfln("[hot] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v); nothing patched", name, original != nil, found)
+			fmt.eprintfln("[hot] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v); nothing patched", h.name, original != nil, found)
 			return false
 		}
-		append(&targets, Target{name, original, fresh})
+		append(&targets, Target{h.name, original, fresh})
 	}
 	// (A reload with only immutable-data changes has no proc targets but non-empty
 	// refresh_targets; the empty-both case already returned above.)
@@ -1002,51 +1086,50 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 	}
 	hr_resume(handles)
-	// 5) Tighten the block from RWX to per-section protections now that all relocations,
-	//    refresh copies, and patches are done: executable code -> execute+read; read-only
-	//    data (@(rodata)/#load payloads, unwind tables) -> read-only so a stray write faults
-	//    as in a normal build; real data (.data/.bss) -> read+write. Sections are page-aligned
-	//    in the block (each owns whole pages), so protect them independently. One-shot per
-	//    reload (each reload maps a fresh block).
-	for i in 0 ..< n_sections {
-		if offsets[i + 1] < 0 {
-			continue
+	// 5) Tighten every object's block from RWX to per-section protections now that all
+	//    relocations, refresh copies, and patches are done: executable code -> execute+read;
+	//    read-only data (@(rodata)/#load payloads, unwind tables) -> read-only so a stray
+	//    write faults as in a normal build; real data (.data/.bss) -> read+write.
+	for &o in objs {
+		for i in 0 ..< o.n_sections {
+			if o.offsets[i + 1] < 0 {
+				continue
+			}
+			sh := section_header(o.data, o.sec_off, i)
+			base := o.section_bases[i + 1]
+			size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
+			if size <= 0 || base == nil {
+				continue
+			}
+			psize := win.SIZE_T(((size + PAGE - 1) / PAGE) * PAGE)
+			ch := u32(sh.characteristics)
+			prot: win.DWORD = win.PAGE_READONLY
+			if (ch & IMAGE_SCN_MEM_EXECUTE) != 0 {
+				prot = win.PAGE_EXECUTE_READ
+			} else if (ch & IMAGE_SCN_MEM_WRITE) != 0 {
+				prot = win.PAGE_READWRITE
+			}
+			old: win.DWORD
+			win.VirtualProtect(base, psize, prot, &old)
 		}
-		sh := section_header(data, sec_off, i)
-		base := section_bases[i + 1]
-		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
-		if size <= 0 || base == nil {
-			continue
-		}
-		psize := win.SIZE_T(((size + PAGE - 1) / PAGE) * PAGE)
-		ch := u32(sh.characteristics)
-		prot: win.DWORD = win.PAGE_READONLY
-		if (ch & IMAGE_SCN_MEM_EXECUTE) != 0 {
-			prot = win.PAGE_EXECUTE_READ
-		} else if (ch & IMAGE_SCN_MEM_WRITE) != 0 {
-			prot = win.PAGE_READWRITE
-		}
-		old: win.DWORD
-		win.VirtualProtect(base, psize, prot, &old)
 	}
 
 	if patched != len(targets) {
 		return false
 	}
 
-	// The reload object is now the live version: update the change-detection baseline
-	// so the next reload diffs against it (patched procs get their new hash; unchanged
-	// procs keep theirs; newly added procs are recorded).
+	// The reload set is now the live version: update the change-detection baseline so the
+	// next reload diffs against it (patched procs get their new hash; unchanged procs keep
+	// theirs; newly added procs are recorded).
 	for k, v in obj_hashes {
 		_hr_cur[k] = v
 	}
 
-	// 6) Fire the autowired post-patch hooks — NEW code: each is resolved to its
-	//    OBJECT-LOCAL (fresh) copy by name, so an ordinary exported proc works (no hot
-	//    prefix needed). A hook here allocates the new layout and deserializes what a
-	//    pre-patch hook saved. Reflecting the new layout requires `change.new` (not
-	//    `type_info_of`, which in hot code still gives the exe's old layout).
-	hr_call_patch_hooks(post_tbl, changed, hr_resolve_post_hook, &obj_ref)
+	// 6) Fire the autowired post-patch hooks — NEW code: each is resolved to its OBJECT-LOCAL
+	//    (fresh) copy by name across the whole reload set (via `all_defs`), so a hook body may
+	//    live in any object. A hook allocates the new layout and deserializes what a pre-patch
+	//    hook saved. Reflecting the new layout requires `change.new` (not `type_info_of`).
+	hr_call_patch_hooks(post_tbl, changed, hr_resolve_post_hook, &all_defs)
 	return true
 }
 

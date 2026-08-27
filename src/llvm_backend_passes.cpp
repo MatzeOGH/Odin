@@ -1,4 +1,4 @@
-	switch (build_context.optimization_level) {
+	switch (opt_level) {
 	case -1:
 		array_add(&passes, "function(annotation-remarks)");
 		break;

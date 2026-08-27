@@ -4,4 +4,6 @@
 *.exe
 *.obj
 *.pdb
-hot.manifest
+*.rdi
+*.manifest
+hot_objs/

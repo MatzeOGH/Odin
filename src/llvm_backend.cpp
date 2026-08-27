@@ -19,6 +19,11 @@
 
 
 #include "llvm_backend.hpp"
+
+// Defined in llvm_backend_proc.cpp (included below), but referenced earlier from
+// llvm_backend_general.cpp to set each module's per-module optimization level.
+gb_internal bool lb_path_is_stdlib(String fullpath);
+
 #include "llvm_abi.cpp"
 #include "llvm_backend_opt.cpp"
 #include "llvm_backend_general.cpp"
@@ -2499,6 +2504,9 @@ gb_internal WORKER_TASK_PROC(lb_llvm_module_pass_worker_proc) {
 	LLVMPassBuilderOptionsRef pb_options = LLVMCreatePassBuilderOptions();
 	defer (LLVMDisposePassBuilderOptions(pb_options));
 
+	// Per-module optimization level: the included pass list switches on `opt_level`
+	// (see lb_init_module_worker_proc — builtin collections optimize, user code stays none).
+	int const opt_level = wd->m->optimization_level;
 	#include "llvm_backend_passes.cpp"
 
 	// asan - Linux, Darwin, Windows
@@ -2809,6 +2817,29 @@ gb_internal void lb_add_foreign_library_paths(lbGenerator *gen) {
 	}
 }
 
+// On a hot-reload RELOAD build (an -build-mode:obj build against an existing manifest), decide
+// whether to SKIP emitting an object for module `m`. Two cases are skipped:
+//   1. a builtin-collection (base/core/vendor) module — that code is already in the running exe
+//      and the loader resolves it from the exe's PDB; this drops the standard library (~40
+//      objects) from the reload set; and
+//   2. a USER package module none of whose procedures changed vs the manifest baseline — its
+//      code is unchanged and still in the exe, so re-emitting (and reloading) it is pure waste.
+// So a reload produces objects only for the CHANGED user packages plus the default/metadata
+// module. The base EXE build (build-mode:exe) never skips (everything is linked into the exe).
+// default_module carries the metadata tables + RTTI, has pkg==nullptr, and is always emitted.
+gb_internal bool lb_hot_reload_skip_object(lbModule *m) {
+	if (!(build_context.hot_reload && build_context.hot_reload_is_reload && build_context.build_mode == BuildMode_Object)) {
+		return false;
+	}
+	if (m->pkg == nullptr) {
+		return false; // default/metadata module — always emit
+	}
+	if (lb_path_is_stdlib(m->pkg->fullpath)) {
+		return true; // (1) standard library — resolved from the exe
+	}
+	return !m->hot_reload_changed; // (2) unchanged user package — skip
+}
+
 gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) {
 	LLVMCodeGenFileType code_gen_file_type = LLVMObjectFile;
 	if (build_context.build_mode == BuildMode_Assembly) {
@@ -2821,7 +2852,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 	if (do_threading) {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			if (lb_is_module_empty(m)) {
+			if (lb_is_module_empty(m) || lb_hot_reload_skip_object(m)) {
 				continue;
 			}
 
@@ -2843,7 +2874,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 	} else {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			if (lb_is_module_empty(m)) {
+			if (lb_is_module_empty(m) || lb_hot_reload_skip_object(m)) {
 				continue;
 			}
 
@@ -3195,10 +3226,19 @@ gb_internal void hot_reload_manifest_read(HotReloadManifest *hm) {
 	if (build_context.hot_reload_manifest.len == 0) {
 		return;
 	}
+	// The base build is the executable: it establishes the reload layout FRESH and (re)writes
+	// the manifest. Only a reload build (`-build-mode:obj`) reads the baseline. This makes the
+	// distinction rely on the build mode rather than on whether a manifest file happens to
+	// exist — so the default manifest path can persist between sessions without a stale file
+	// making the base exe build masquerade as a reload. (`-hot-reload` requires the host be an
+	// executable, so a non-Object build here is always the base.)
+	if (build_context.build_mode != BuildMode_Object) {
+		return;
+	}
 	char const *path_c = alloc_cstring(temporary_allocator(), build_context.hot_reload_manifest);
 	gbFileContents fc = gb_file_read_contents(permanent_allocator(), true, path_c);
 	if (fc.data == nullptr || fc.size == 0) {
-		return; // no manifest yet: this is the base (exe) build
+		return; // manifest missing/empty: the exe was not built yet (build it first)
 	}
 	hm->exists = true;
 	build_context.hot_reload_is_reload = true;
@@ -3511,17 +3551,42 @@ gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
 
 	HotReloadManifest &hm = gen->hot_reload_manifest;
 	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
-	for (lbProcedure *p : m->generated_procedures) {
-		if (!lb_proc_is_hot_reloadable(p)) {
-			continue;
+	// Gather hot procedures from EVERY module, not just default_module: with separate
+	// modules a user proc lives in its own package module, so a default_module-only walk
+	// (the pre-multi-module behaviour) would miss every hot proc and leave the exe's
+	// baseline table empty. The table itself is still DEFINED in default_module (`m`).
+	auto hot_procs = array_make<lbProcedure *>(temporary_allocator(), 0, 1024);
+	for (auto const &entry : gen->modules) {
+		lbModule *mod = entry.value;
+		for (lbProcedure *p : mod->generated_procedures) {
+			if (lb_proc_is_hot_reloadable(p)) {
+				array_add(&hot_procs, p);
+			}
 		}
+	}
+	for (lbProcedure *p : hot_procs) {
 		u64 name_hash    = fnv64a(p->name.text, p->name.len);
 		u64 content_hash = lb_hot_reload_proc_content_hash(p);
 
+		// Minimal object emission: mark this proc's module CHANGED if its content hash differs
+		// from the manifest baseline (or is new / this is a base build). At object-generation
+		// time an unchanged USER package module is not emitted at all — its code is unchanged
+		// and still in the exe, so a reload skips producing (and loading) its object entirely.
+		// `hm.fhash` still holds the baseline HERE (it is overwritten just below), so read
+		// first. All file-scope globals live in default_module (which is always emitted), so a
+		// user package module changes iff one of its procs changed — proc hashing suffices.
+		if (!hm.exists) {
+			p->module->hot_reload_changed = true; // base build: no baseline, treat as changed
+		} else {
+			u64 *base = string_map_get(&hm.fhash, p->name);
+			if (base == nullptr || *base != content_hash) {
+				p->module->hot_reload_changed = true;
+			}
+		}
+
 		// Persist this build's per-proc content hash into the manifest (item 3 cheap half):
-		// the base build's fhash is the exe's per-proc baseline, which a future reload build
-		// can diff against at compile time to decide which procedures to emit. Inert today
-		// (the loader still diffs at runtime); groundwork for minimal object emission.
+		// the base build's fhash is the exe's per-proc baseline, which a reload build diffs
+		// against (just above) to decide which package objects to emit.
 		string_map_set(&hm.fhash, p->name, content_hash);
 
 		// Hot-proc ABI guard (F8): the frozen host's call sites marshal the ORIGINAL
@@ -3602,7 +3667,6 @@ gb_internal void lb_hot_reload_emit_build_id(lbGenerator *gen) {
 
 gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
-	LLVMTypeRef rawptr_llvm = lb_type(m, t_rawptr);
 
 	// Reserve the per-thread TLS arena and record it so a new thread-local (a GEP into
 	// it) resolves through this arena's accessor. Every thread's static TLS block then
@@ -3610,7 +3674,7 @@ gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	// storage.
 	if (build_context.hot_reload_tls_arena_size > 0) {
 		LLVMValueRef tls_arena = lb_hot_reload_tls_arena(m);
-		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0};
+		lbHotReloadStaticSym s = {str_lit("__odin_hot_reload_tls_arena"), tls_arena, 0, m};
 		array_add(&gen->hot_reload_tls_syms, s);
 	}
 
@@ -3624,21 +3688,27 @@ gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	// variable's offset in the exe's TLS block — no baked mapping required, because the
 	// name is a pure function of the variable's (build-stable) link name.
 	{
-		LLVMTypeRef acc_ty = LLVMFunctionType(rawptr_llvm, nullptr, 0, false);
 		for (lbHotReloadStaticSym const &s : gen->hot_reload_tls_syms) {
 			if (s.name.len == 0 || s.value == nullptr) {
 				continue;
 			}
+			// Emit the accessor into the SAME module that defines the thread-local
+			// (`s.module`): with separate modules a thread-local `@(static)` in, say, a
+			// runtime proc lives in that package's module, and LLVM forbids referencing a
+			// global from a different module. The symbol is public either way, so the
+			// loader still resolves it by name via the exe's PDB regardless of module.
+			lbModule *am = (s.module != nullptr) ? s.module : m;
+			LLVMTypeRef acc_ty = LLVMFunctionType(lb_type(am, t_rawptr), nullptr, 0, false);
 			char const *acc_name = gb_bprintf("__odin_hrtls$%.*s", LIT(s.name));
-			LLVMValueRef acc = LLVMAddFunction(m->mod, acc_name, acc_ty);
+			LLVMValueRef acc = LLVMAddFunction(am->mod, acc_name, acc_ty);
 			LLVMSetLinkage(acc, LLVMExternalLinkage); // public: found via the exe's PDB
-			LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(m->ctx, acc, "entry");
-			LLVMBuilderRef b = LLVMCreateBuilderInContext(m->ctx);
+			LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(am->ctx, acc, "entry");
+			LLVMBuilderRef b = LLVMCreateBuilderInContext(am->ctx);
 			LLVMPositionBuilderAtEnd(b, bb);
-			LLVMValueRef addr = LLVMBuildPointerCast(b, s.value, rawptr_llvm, "");
+			LLVMValueRef addr = LLVMBuildPointerCast(b, s.value, lb_type(am, t_rawptr), "");
 			LLVMBuildRet(b, addr);
 			LLVMDisposeBuilder(b);
-			lb_append_to_used(m, acc); // loader calls it by name; survive linker DCE
+			lb_append_to_used(am, acc); // loader calls it by name; survive linker DCE
 		}
 	}
 
@@ -3817,27 +3887,30 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	// GB_ASSERT_MSG(LLVMTargetHasAsmBackend(target));
 
-	LLVMCodeGenOptLevel code_gen_level = LLVMCodeGenLevelNone;
-	switch (build_context.optimization_level) {
-	default:/*fallthrough*/
-	case 0: code_gen_level = LLVMCodeGenLevelNone;       break;
-	case 1: code_gen_level = LLVMCodeGenLevelLess;       break;
-	case 2: code_gen_level = LLVMCodeGenLevelDefault;    break;
-	case 3: code_gen_level = LLVMCodeGenLevelAggressive; break;
-	}
-
 	// NOTE(bill): Target Machine Creation
 	// NOTE(bill, 2021-05-04): Target machines must be unique to each module because they are not thread safe
 	auto target_machines = array_make<LLVMTargetMachineRef>(permanent_allocator(), 0, gen->modules.count);
 
 	for (auto const &entry : gen->modules) {
+		lbModule *m = entry.value;
+
+		// Per-module codegen opt level (see lb_init_module_worker_proc): under -hot-reload
+		// the builtin collections are built optimized while user modules stay -o:none.
+		LLVMCodeGenOptLevel code_gen_level = LLVMCodeGenLevelNone;
+		switch (m->optimization_level) {
+		default:/*fallthrough*/
+		case 0: code_gen_level = LLVMCodeGenLevelNone;       break;
+		case 1: code_gen_level = LLVMCodeGenLevelLess;       break;
+		case 2: code_gen_level = LLVMCodeGenLevelDefault;    break;
+		case 3: code_gen_level = LLVMCodeGenLevelAggressive; break;
+		}
+
 		LLVMTargetMachineRef target_machine = LLVMCreateTargetMachine(
 			target, target_triple, (const char *)llvm_cpu.text,
 			llvm_features,
 			code_gen_level,
 			get_reloc_mode(),
 			code_mode);
-		lbModule *m = entry.value;
 		m->target_machine = target_machine;
 		LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(target_machine);
 		LLVMSetModuleDataLayout(m->mod, data_layout);
@@ -4306,7 +4379,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		// the loader can rewrite SECREL sites to the exe's offset). `g.value` here is
 		// still the raw global, before the const-pointer-cast below.
 		if (build_context.hot_reload && !is_foreign && e->Variable.thread_local_model.len != 0) {
-			lbHotReloadStaticSym s = {name, g.value, type_hash_canonical_type(e->type)};
+			lbHotReloadStaticSym s = {name, g.value, type_hash_canonical_type(e->type), m};
 			array_add(&gen->hot_reload_tls_syms, s);
 		}
 

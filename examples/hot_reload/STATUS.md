@@ -5,6 +5,45 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 
 ## Done
 
+- [x] **Separate modules + per-module optimization + multi-object incremental reload.**
+      `-hot-reload` no longer forces `-use-single-module` (`src/main.cpp`); at `-o:none` the
+      normal per-package module layout is used for both the base exe and the reload build.
+      - **Per-module optimization** (`lbModule.optimization_level`, `src/llvm_backend.hpp` /
+        `lb_init_module_worker_proc` / the per-module target-machine + pass pipeline in
+        `src/llvm_backend.cpp` + `src/llvm_backend_passes.cpp`): builtin collections compile at
+        `-o:2` (inlined); user modules stay `-o:none` + `noinline` + patchable. User-proc IR is
+        independent of the builtin opt level (no cross-module inlining without LTO), so the
+        change-detection hashes are unaffected.
+      - **Minimal object emission** (`lb_hot_reload_skip_object` in `src/llvm_backend.cpp`): a
+        reload build (`-build-mode:obj` against an existing manifest) emits objects only for the
+        default/metadata module and the CHANGED user packages. Builtin collections are skipped
+        (resolved from the exe's PDB); an unchanged user package (all proc content-hashes match
+        the manifest baseline — `lb_hot_reload_emit_func_hashes` sets `lbModule.hot_reload_changed`)
+        is skipped too.
+      - **Multi-object loader** (`core/sys/hot_reload/hot_reload.odin`): `apply` →
+        `apply_many([]string)` (and `apply_dir(dir)` which globs `*.obj`). Two passes: map every
+        object + build a cross-object `all_syms` (decided address per symbol) and `all_defs`
+        (object-local address per symbol); then resolve + relocate + patch each object, with an
+        undefined external resolving to another reload object via `all_syms` before falling back
+        to the exe (`hr_resolve`). Cross-object calls beyond REL32 range reuse the trampoline
+        path. Metadata tables (func_hashes/build_id/new_global_inits/refresh_syms/type_infos/
+        patch-hooks) are read from the default/metadata object; refresh + post-patch-hook bodies
+        resolve via `all_defs`. Fixed a separate-modules cross-module break: TLS accessor thunks
+        (`__odin_hrtls$*`) now emit into the module that defines the thread-local
+        (`lbHotReloadStaticSym.module`).
+      - **Auto-manifest:** `-hot-reload-manifest` is now optional — it defaults to
+        `<main-package-dir>/odin-hot-reload.manifest` (`src/build_settings.cpp`). Base-vs-reload
+        is decided by build mode (exe = base, obj = reload) rather than by whether a manifest
+        file exists, so the base exe build always (re)writes it fresh and a stale default file
+        never makes it masquerade as a reload (`hot_reload_manifest_read` early-returns unless
+        `build_mode == BuildMode_Object`). No manual manifest path or reset is needed for a
+        same-directory build; pass `-hot-reload-manifest` explicitly only when the exe and the
+        reload obj are built from different directories.
+      - Verified: `mt_test` 200/200 in multi-object mode (reload set = metadata + user object);
+        a two-package project emits only the edited package's object; the default manifest is
+        auto-created by the exe build and read by the reload build; `rodata_test` and the
+        `migrate` hooks path pass on the single-object route.
+
 - [x] **`@(hot_reload)` procedure attribute** — marks a procedure replaceable:
       emits `noinline` + `"patchable-function"="prologue-short-redirect"` and forces
       `@(export)` (stable, unmangled symbol name).
@@ -65,11 +104,20 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 
 ### Tier 1 — architectural (the real gaps to Live++)
 
-- [ ] ~~**Incremental compilation.** Recompile only changed procedures/modules instead
-      of the whole program to one object each reload. Needs compiler work to emit and
-      reuse per-procedure or per-module objects (object emission is in
-      `src/llvm_backend.cpp` ~`lb_llvm_object_generation`, currently temp-and-delete).~~ 
-			-- needs major work on the compiler that is not yet supported 
+- [~] **Incremental compilation (object side done; front-end still whole-program).**
+      `-hot-reload` no longer forces `-use-single-module`: both the base exe and the reload
+      build use normal separate (per-package) modules. On a reload build the object emission
+      is now minimal — `lb_llvm_object_generation` (`src/llvm_backend.cpp`) skips
+      (`lb_hot_reload_skip_object`) every builtin-collection module (base/core/vendor: already
+      in the exe, resolved from its PDB) **and** every USER package whose procedures are all
+      unchanged vs the manifest baseline (per-proc content-hash diff in
+      `lb_hot_reload_emit_func_hashes`; a module is flagged `lbModule.hot_reload_changed`). So a
+      reload emits only the default/metadata object plus the package(s) actually edited, and the
+      loader (`apply_dir`/`apply_many`) maps that small set. **Still whole-program:** the
+      front-end (parse + type-check) and LLVM IR generation still run over the entire program
+      each reload — only object emission and loading are incremental. True front-end
+      incrementality (reusing checker/IR across builds) remains major compiler work.
+      Multi-object loader: see Tier 1 "Multiple objects" and the loader rewrite below.
 - [x] **Thread-safe / atomic patching.** Patching is now safe while other threads run the
       hot procedures, via two composed layers (Windows/x64). Verified by an automated
       stress test: `examples/hot_reload/mt_test` spawns worker threads that hammer the hot
@@ -451,10 +499,13 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 
 - Windows / x64 / COFF only.
 - **Only the user's own packages are hot-patchable; `core`/`base`/`vendor` are excluded.** Editing
-  a `core`/`vendor` procedure and reloading will NOT patch it (it stays inlined/optimized) — rebuild
-  the base exe for standard-library changes. This is deliberate: auto-tagging every standard-library
-  procedure as hot-patchable OOMs the compiler on any `fmt`-using program (see the tagless item under
-  Tier 3). A user-defined `-collection` is treated as user code and stays hot-patchable.
+  a `core`/`vendor` procedure and reloading will NOT patch it — rebuild the base exe for
+  standard-library changes. This is deliberate: auto-tagging every standard-library procedure as
+  hot-patchable OOMs the compiler on any `fmt`-using program (see the tagless item under Tier 3).
+  A user-defined `-collection` is treated as user code and stays hot-patchable. As of the
+  separate-modules change, the excluded collections are compiled at full optimization (their own
+  `-o:2`, inlined) while user modules stay `-o:none` + `noinline` + patchable — the per-module
+  optimization level is `lbModule.optimization_level`, set in `lb_init_module_worker_proc`.
 - **`-hot-reload` implies `-debug`.** The loader resolves the running exe's symbols from its
   PDB, so a `.pdb` must sit next to the exe; `-hot-reload` now turns on `-debug` automatically
   (`src/main.cpp`). This also pins base and reload builds to the same optimization level
@@ -465,7 +516,10 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   pointers, and publishes each redirect with a single atomic store (see Tier 1). The
   interactive demo still reloads between ticks for clarity; the multithreaded path is
   exercised by `mt_test/`.
-- Whole-program recompile per reload; no incremental build.
+- Incremental on the object side: a reload emits objects only for changed user packages
+  (plus the default/metadata object); the standard library and unchanged user packages are
+  not re-emitted. The front-end (parse/check) + IR generation still run over the whole
+  program each reload — only object emission and loading are incremental.
 - New globals and new procedures may be *added* across a reload. An existing
   global's type/layout must not change (rejected at build time); new globals may
   carry compile-time constant initializers (applied once) but not runtime

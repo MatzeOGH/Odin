@@ -123,6 +123,11 @@ struct lbModule {
 	AstPackage *pkg; // possibly associated
 	AstFile *file;   // possibly associated
 	char const *module_name;
+	int optimization_level; // per-module opt level: under -hot-reload, builtin-collection
+	                        // modules build optimized/inlined while user modules stay -o:none
+	bool hot_reload_changed; // -hot-reload reload build: a proc in this module changed vs the
+	                         // manifest baseline, so its object must be re-emitted (unchanged
+	                         // user modules are skipped — their code is still in the exe)
 
 	PtrMap<u64/*type hash*/, LLVMTypeRef>  types;                  // mutex: types_mutex
 	PtrMap<void *, lbStructFieldRemapping> struct_field_remapping; // Key: LLVMTypeRef or Type *, mutex: types_mutex
@@ -239,6 +244,8 @@ struct lbHotReloadStaticSym {
 	String       name;
 	LLVMValueRef value;
 	u64          type_hash;
+	lbModule *   module; // the module that DEFINES `value`; the accessor thunk must be
+	                     // emitted here (LLVM forbids referencing a global cross-module)
 };
 
 // An immutable-data global — `@(rodata)` or one whose initializer is a `#load(...)`

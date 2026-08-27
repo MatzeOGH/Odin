@@ -1428,11 +1428,15 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							// from the PDB, so -hot-reload IMPLIES -debug (a PDB next to the exe).
 							// Enabling it here also pins base and reload builds to the same
 							// optimization level (-o:none, derived from ODIN_DEBUG), which the
-							// per-function change-detection hashes rely on to match. Force a single
-							// module so all procedures share one .text.
+							// per-function change-detection hashes rely on to match.
+							//
+							// NOTE: -hot-reload no longer forces a single module. At -o:none the
+							// default is separate (per-package) modules, so user code and the
+							// standard-library collections build as independent modules; the loader
+							// consumes the resulting per-package objects. User packages stay
+							// -o:none + noinline + patchable; builtin collections build normally.
 							build_context.hot_reload = true;
 							build_context.ODIN_DEBUG = true;
-							build_context.use_single_module = true;
 							if (build_context.hot_reload_arena_size == 0) {
 								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
 							}

@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Force $work | Out-Null
 Remove-Item $manifest -ErrorAction SilentlyContinue
 
 Write-Host '==> building migrate-test .exe (-hot-reload, State v1)'
-& $odin build $here -out:(Join-Path $work 'migrate_test.exe') -debug -hot-reload -hot-reload-manifest:$manifest
+& $odin build $here -out:(Join-Path $work 'migrate_test.exe') -debug -hot-reload -hot-reload-manifest:$manifest -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'exe build failed' }
 
 Write-Host '==> simulating an edit: insert `extra: i64` at the FRONT of State, EDIT_VERSION 1->2'
@@ -36,7 +36,7 @@ if ($edited -notmatch 'extra: i64,')       { throw 'edit substitution failed (St
 $edited | Out-File -Encoding utf8 (Join-Path $src 'migrate.odin')
 
 Write-Host '==> compiling the edit to migrate_hot.obj (same manifest)'
-& $odin build $src -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'migrate_hot.obj')
+& $odin build $src -build-mode:obj -use-single-module -hot-reload -hot-reload-manifest:$manifest -out:(Join-Path $work 'migrate_hot.obj') -ignore-unknown-attributes
 if ($LASTEXITCODE -ne 0) { throw 'obj build failed' }
 
 Write-Host '==> running'

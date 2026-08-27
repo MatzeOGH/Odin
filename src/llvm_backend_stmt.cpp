@@ -2672,7 +2672,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			// reload object's reference to the exe copy by name via the PDB. New statics
 			// are handled above (arena / error) and never reach here.
 			MUTEX_GUARD(&gen->hot_reload_mutex);
-			lbHotReloadStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type)};
+			lbHotReloadStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type), p->module};
 			array_add(&gen->hot_reload_tls_syms, s);
 		}
 	}

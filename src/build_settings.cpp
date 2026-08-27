@@ -2306,6 +2306,18 @@ gb_internal bool init_build_paths(String init_filename) {
 		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 	}
 
+	// -hot-reload: if no manifest path was given, default it to a stable file in the main
+	// package's directory. The manifest pins new-global arena offsets / build-id / the per-proc
+	// baseline hashes across the base exe build and every reload obj build; both builds of the
+	// SAME package resolve to the same file, so the user need not pass -hot-reload-manifest.
+	// (The base build is the executable and always (re)writes it fresh — see
+	// hot_reload_manifest_read — so a stale file from a previous session is not mistaken for a
+	// reload baseline.)
+	if (bc->hot_reload && bc->hot_reload_manifest.len == 0) {
+		String pkg_dir = bc->build_paths[BuildPath_Main_Package].basename;
+		bc->hot_reload_manifest = concatenate_strings(ha, pkg_dir, STR_LIT("/odin-hot-reload.manifest"));
+	}
+
 	bool produces_output_file = false;
 	if (bc->command_kind == Command_doc && bc->cmd_doc_flags & CmdDocFlag_DocFormat) {
 		produces_output_file = true;
