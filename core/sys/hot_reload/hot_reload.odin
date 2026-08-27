@@ -87,11 +87,14 @@ New_Global_Init :: struct {
 	blob:         rawptr,
 }
 
-// One layout change discovered by diffing the exe's baked type-info (old) against
-// the reload object's freshly emitted type-info (new). `old` is the layout the
-// running program was built with (also what `type_info_of` returns in hot code);
-// `new` is the reloaded layout. A `@(post_patch_hook)` MUST reflect via `new`,
-// because `type_info_of` in hot code still resolves to the exe's old table.
+// One layout change discovered by diffing the CURRENTLY-LIVE type-info (old) against
+// the reload object's freshly emitted type-info (new). `old` is the layout that is
+// live in memory right now — the exe's baked layout on the first reload, or the most
+// recently reloaded layout on every reload after that (the baseline advances each time
+// `runtime.type_table` is swapped, see `hr_advance_live_types`). It is exactly what
+// `type_info_of` returns in hot code (which reads the swapped table). `new` is this
+// reload's layout. A `@(post_patch_hook)` MUST reflect via `new`, because `type_info_of`
+// still resolves to the currently-live (old) table until this reload's swap lands.
 Type_Change :: struct {
 	old: ^runtime.Type_Info,
 	new: ^runtime.Type_Info,
@@ -157,6 +160,13 @@ hr_call_patch_hooks :: proc(tbl_addr: rawptr, changed: []Type_Change, resolve: p
 // runtime `type_table` slices, but externally named so the loader can resolve the
 // exe's copy (old layouts, via the PDB) and the object's copy (new layouts).
 HR_TYPE_INFOS_SYM :: "__odin_hot_reload_type_infos"
+
+// The runtime's live `[]^Type_Info` slice global (`base:runtime`'s `type_table`), by its PDB
+// link name. `&runtime.type_table` is what a reflection refresh swaps; the loader normally
+// finds it by dereferencing `__odin_hot_reload_type_table_ref`, but resolves this directly as
+// a fallback when that ref global is not surfaced by the PDB enumeration (see the swap in
+// `apply_many`). The enumerated Odin link name uses `::` separators.
+HR_TYPE_TABLE_SYM :: "runtime::type_table"
 
 // True iff `a` (old) and `b` (new) describe the same NAMED type but a changed layout.
 // Catches: size change; struct field add / remove / reorder / rename (compares each
@@ -246,37 +256,71 @@ hr_qualified_name :: proc(named: runtime.Type_Info_Named) -> string {
 	return fmt.tprintf("%s.%s", named.pkg, named.name)
 }
 
-// The exe's named types indexed by package-qualified name. The exe never changes across
-// reloads, so this is built once and reused (the map + its keys live for the process).
-@(private) hr_exe_types_cache: map[string]^runtime.Type_Info
-@(private) hr_exe_types_built: bool
+// The CURRENTLY-LIVE named types indexed by package-qualified name — the baseline the
+// diff compares each reload's fresh type-info against. Seeded from the exe's baked table
+// once (before any reload the live layout IS the exe's), then rebuilt from each reload's
+// fresh table whenever `runtime.type_table` is swapped, so `old` in `Type_Change` reflects
+// the LAST reload rather than app start (see `hr_advance_live_types`). The map + its keys
+// live for the process, pinned to the OS heap.
+@(private) _hr_live_types: map[string]^runtime.Type_Info
+@(private) _hr_live_types_ready: bool
 
 @(private)
-hr_exe_types_by_name :: proc() -> map[string]^runtime.Type_Info {
-	if hr_exe_types_built {
-		return hr_exe_types_cache
+hr_live_types_by_name :: proc() -> map[string]^runtime.Type_Info {
+	if _hr_live_types_ready {
+		return _hr_live_types
 	}
-	hr_exe_types_built = true
+	_hr_live_types_ready = true
 	old_tis := hr_read_type_infos(hr_resolve_pdb(HR_TYPE_INFOS_SYM))
 	// Process-lifetime map + keys: pin to the OS heap so they never alias the caller's
 	// (possibly scoped/temporary) allocator — see the allocator note on `apply`.
-	hr_exe_types_cache = make(map[string]^runtime.Type_Info, runtime.heap_allocator())
+	_hr_live_types = make(map[string]^runtime.Type_Info, runtime.heap_allocator())
 	for ti in old_tis {
 		if ti == nil { continue }
 		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
 			key := strings.clone(hr_qualified_name(named), runtime.heap_allocator())
-			hr_exe_types_cache[key] = ti
+			_hr_live_types[key] = ti
 		}
 	}
-	return hr_exe_types_cache
+	return _hr_live_types
 }
 
-// Diff the reloaded object's freshly emitted type-info (new layout) against the exe's
-// baked type-info (old layout) and return one `Type_Change` per NAMED type whose layout
-// differs. `old` comes from the exe (also what hot-code `type_info_of` returns); `new`
-// comes from the object, so a post-patch hook can reflect the real new layout. The slice
-// is allocated with `context.allocator` (it must outlive the user's pre-patch hook); the
-// caller deletes it.
+// Advance the currently-live type baseline to this reload's fresh, COMPLETE type table
+// (its `[]^runtime.Type_Info` header at `new_hdr`). Called after a reload has SWAPPED
+// `runtime.type_table` to that table, so the baseline keeps pointing at exactly the block
+// the swap pins alive (via `_hr_owner[tt_ref]`) — never a stale/older generation. Rebuilt
+// from scratch (old keys + map freed, refilled) so a type deleted across reloads leaves no
+// dangling pointer. MUST run with the world resumed: it allocates (heap make/clone/delete),
+// which would deadlock against a suspended thread holding the heap lock.
+@(private)
+hr_advance_live_types :: proc(new_hdr: rawptr) {
+	new_tis := hr_read_type_infos(new_hdr)
+	if len(new_tis) == 0 {
+		return
+	}
+	if _hr_live_types_ready {
+		for k in _hr_live_types {
+			delete(k, runtime.heap_allocator())
+		}
+		delete(_hr_live_types)
+	}
+	_hr_live_types = make(map[string]^runtime.Type_Info, runtime.heap_allocator())
+	_hr_live_types_ready = true
+	for ti in new_tis {
+		if ti == nil { continue }
+		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
+			key := strings.clone(hr_qualified_name(named), runtime.heap_allocator())
+			_hr_live_types[key] = ti
+		}
+	}
+}
+
+// Diff the reloaded object's freshly emitted type-info (new layout) against the
+// CURRENTLY-LIVE type-info (old layout) and return one `Type_Change` per NAMED type whose
+// layout differs. `old` comes from the live baseline (the exe's on the first reload, or the
+// last reload's afterward — also what hot-code `type_info_of` returns); `new` comes from the
+// object, so a post-patch hook can reflect the real new layout. The slice is allocated with
+// `context.allocator` (it must outlive the user's pre-patch hook); the caller deletes it.
 @(private)
 hr_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> []Type_Change {
 	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, HR_TYPE_INFOS_SYM)
@@ -284,7 +328,7 @@ hr_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, se
 	if len(new_tis) == 0 {
 		return nil
 	}
-	old_by_name := hr_exe_types_by_name()
+	old_by_name := hr_live_types_by_name()
 	if len(old_by_name) == 0 {
 		return nil
 	}
@@ -320,10 +364,10 @@ hr_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, se
 }
 
 // True if the reload's fresh type table (in the metadata object) has any named type whose
-// layout changed vs the exe, OR any brand-new named type absent from the exe. Drives whether
-// runtime.type_table is swapped so reflection (`fmt`, `type_info_of` in hot code) sees the
-// edited/new types. Unlike `hr_build_type_changes` (which needs an exe counterpart to migrate
-// FROM, so it skips new types), this also reports a brand-new type.
+// layout changed vs the CURRENTLY-LIVE baseline, OR any brand-new named type absent from it.
+// Drives whether runtime.type_table is swapped so reflection (`fmt`, `type_info_of` in hot
+// code) sees the edited/new types. Unlike `hr_build_type_changes` (which needs a live
+// counterpart to migrate FROM, so it skips new types), this also reports a brand-new type.
 @(private)
 hr_type_table_needs_swap :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> bool {
 	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, HR_TYPE_INFOS_SYM)
@@ -331,14 +375,14 @@ hr_type_table_needs_swap :: proc(data: []byte, sym_off, n_syms, strtab_off: int,
 	if len(new_tis) == 0 {
 		return false
 	}
-	old_by_name := hr_exe_types_by_name()
+	old_by_name := hr_live_types_by_name()
 	for ti in new_tis {
 		if ti == nil { continue }
 		named, ok := ti.variant.(runtime.Type_Info_Named)
 		if !ok { continue }
 		old_ti, found := old_by_name[hr_qualified_name(named)]
 		if !found {
-			return true // brand-new named type: not in the exe's frozen table
+			return true // brand-new named type: not in the currently-live table
 		}
 		if hr_layout_differs(old_ti, ti) {
 			return true // an existing type's layout was edited
@@ -1182,7 +1226,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	//      metadata object). Each entry copies its constant blob into the exe's arena at
 	//      `arena_offset` iff the `flag` byte is still 0, then sets the flag — so re-applying
 	//      never clobbers state the running program accumulated. `blob` pointers were
-	//      relocated in PASS 2.
+	//      relocated in PASS 2. NOTE (multi-reload): the flag lives in the persistent arena, so
+	//      a global added in an earlier reload is intentionally NOT re-initialized here — even if
+	//      a later reload changes its compile-time initializer — because its live value may have
+	//      moved on. First-write-wins; deliberate.
 	if meta_i >= 0 {
 		mo := &objs[meta_i]
 		if tbl_addr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_hot_reload_new_global_inits"); ok {
@@ -1266,10 +1313,19 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	if meta_i >= 0 {
 		mo := &objs[meta_i]
 		if hr_type_table_needs_swap(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases) {
-			ref := hr_resolve_pdb("__odin_hot_reload_type_table_ref")
+			// `tt_ref` must be `&runtime.type_table` (the exe's live slice header). The compiler
+			// publishes `__odin_hot_reload_type_table_ref` (a pointer global holding that address)
+			// for a stable, un-mangled way to find it — but on some toolchains that constant global
+			// is not surfaced by the PDB symbol enumeration (unlike the runtime global itself), so
+			// the ref resolves to nil and reflection silently never refreshed. Fall back to
+			// resolving `runtime.type_table` directly by its (enumerated) link name.
 			hdr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, HR_TYPE_INFOS_SYM)
-			if ref != nil && ok {
+			if ref := hr_resolve_pdb("__odin_hot_reload_type_table_ref"); ref != nil {
 				tt_ref = (^rawptr)(ref)^ // deref the ref global -> &runtime.type_table (exe)
+			} else {
+				tt_ref = hr_resolve_pdb(HR_TYPE_TABLE_SYM) // ref global absent from PDB: resolve the global directly
+			}
+			if ok {
 				fresh_ti_hdr = hdr
 				swap_type_table = tt_ref != nil
 			}
@@ -1409,6 +1465,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	// the (name-stable) id, so a table of any size/order reflects edited layouts AND resolves
 	// brand-new types. Tracked in `_hr_owner` so the block backing the fresh table is kept alive
 	// until a later reload re-swaps the header. Done under the stop-the-world so no reader tears.
+	did_swap := false
 	if swap_type_table {
 		SLICE_HDR :: size_of(rawptr) + size_of(int) // {data, len} = 16 bytes on x64
 		old: win.DWORD
@@ -1418,6 +1475,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			win.VirtualProtect(tt_ref, win.SIZE_T(SLICE_HDR), old, &restored)
 			_hr_owner[uintptr(tt_ref)] = gen_serial
 			append(&gen_owned, uintptr(tt_ref))
+			did_swap = true
 			fmt.println("[hot] refreshed reflection type_table (edited/new types now visible)")
 		} else {
 			fmt.eprintln("[hot] could not make runtime.type_table writable to refresh reflection")
@@ -1474,6 +1532,15 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	// theirs; newly added procs are recorded).
 	for k, v in obj_hashes {
 		_hr_cur[k] = v
+	}
+
+	// Advance the TYPE baseline the same way, so the next reload's `Type_Change.old` (and the
+	// changed-set diff) reflect THIS reload's layout, not app start. Only when the table was
+	// actually swapped — then `fresh_ti_hdr`'s block is pinned alive by `_hr_owner[tt_ref]`, so
+	// the baseline's pointers stay valid. Done here, AFTER hr_resume: it allocates (heap
+	// make/clone/delete) and must not run while other threads are suspended (heap-lock deadlock).
+	if did_swap {
+		hr_advance_live_types(fresh_ti_hdr)
 	}
 
 	// 6) Fire the autowired post-patch hooks — NEW code: each is resolved to its OBJECT-LOCAL

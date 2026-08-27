@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$env:ODIN_ROOT = 'C:\Users\matth\Documents\Projects\Odin'
 $here     = $PSScriptRoot
-$repo     = 'C:\Users\matth\Documents\Projects\Odin'
+$repo     = Resolve-Path (Join-Path $here '..\..\..')
+$env:ODIN_ROOT = $repo
 $odin     = Join-Path $repo 'odin.exe'
 $work     = Join-Path $here '.work'
 $manifest = Join-Path $work 'uw.manifest'

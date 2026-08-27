@@ -4,6 +4,32 @@ Live++-style in-process hot reload for the Odin compiler. Windows / x64.
 Status as of this branch. See `README.md` for how to run it and how it works.
 
 ## NEW TODOs
+- [x] **Robust across MANY reloads: the type baseline now advances every reload (and the reflection
+      swap actually fires).** Two coupled defects made everything type-related correct only for the
+      FIRST reload:
+      - **Frozen type baseline.** The loader diffed each reload's fresh type-info against a map built
+        ONCE from the exe's baked table (`hr_exe_types_cache`, never updated) — unlike the per-proc
+        `_hr_cur` hash baseline, which already advanced each reload. So on reload #2+ every
+        `Type_Change.old` was the *app-start* layout, never the previous reload's — a `@(pre/post_
+        patch_hook)` reflecting via `old` corrupted state; a type changed on reload N and untouched
+        after was re-flagged (and re-migrated from the wrong layout) every later reload; and a type
+        *added* on reload N was treated brand-new forever, so a later change to it was silently
+        skipped. **Fix:** `hr_exe_types_cache` → `_hr_live_types`, seeded from the exe once then
+        rebuilt from each reload's fresh, complete table (`hr_advance_live_types`, called after the
+        `runtime.type_table` swap, world resumed — it allocates). `old` is now what `type_info_of`
+        returns in hot code: the last reload's layout.
+      - **Reflection swap silently never fired.** `hr_resolve_pdb("__odin_hot_reload_type_table_ref")`
+        returned nil on this toolchain — that constant *pointer* global is not surfaced by the exe's
+        PDB symbol enumeration (the sibling `__odin_hot_reload_type_infos` *slice* global is), so the
+        table was never swapped and reflection (and, gated on the swap, the baseline advance) did
+        nothing. `reflect_test` was FAILING. **Fix:** fall back to resolving `runtime.type_table`
+        directly by its enumerated link name (`HR_TYPE_TABLE_SYM`) when the ref global is absent.
+      Verified: new `examples/hot_reload/migrate_twice` (exe v1, reloads v2 then v3) asserts reload
+      #2's `State.old.size` equals the v2 (last-reload) size not the v1 app-start size, that a
+      type changed only at v2 is NOT re-flagged at v3, and that a type added at v2 IS flagged when it
+      changes at v3; `reflect_test` now PASSES; `migrate`/`migrate_full`/`migrate_enum`/`hook`/
+      `rodata`/`mt`/`free`/`multipkg` still PASS. (`newglobal`/`unwind` scripts hardcode a foreign
+      absolute path and fail before building — unrelated, pre-existing.)
 - [x] **Reloading broke static string literals (garbage / wrong strings after a reload)** and, once
       that was fixed over-broadly, **broke `@(pre/post_patch_hook)` globals**. Both come from how the
       loader decides "share with the exe by name" vs "use the reload object's own fresh copy."
@@ -589,7 +615,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       hot-detection heuristic assumes the compiler's 16-byte prefix is literal `0x90` NOPs
       (a future LLVM multi-byte-NOP prefix would break detection — now at least it fails
       loudly via the empty-`hot_names` path, not silently). **Fixed since:** the loader's
-      process-lifetime state (`_hr_syms`/`_hr_cur`/`hr_exe_types_cache` + their string keys) is
+      process-lifetime state (`_hr_syms`/`_hr_cur`/`_hr_live_types` + their string keys) is
       pinned to `runtime.heap_allocator()` so it no longer aliases the first caller's allocator
       (F13); all per-call scratch runs on a private heap-backed `runtime.Arena` instead of the
       app's `context.temp_allocator`; and a `_hr_busy` atomic guard makes a concurrent/nested
@@ -864,7 +890,7 @@ approximate against `core/sys/hot_reload/hot_reload.odin` unless noted.
 - [ ] **F11 — LOW.** Symbols dropped on UTF-8 conversion / empty name are silent (consider
       logging in debug builds).
 - [x] **F13 — LOW/MEDIUM — process-lifetime state aliased the caller's allocator.** `_hr_syms`,
-      `_hr_cur`, and `hr_exe_types_cache` (backing store **and** string keys) were allocated from
+      `_hr_cur`, and `_hr_live_types` (backing store **and** string keys) were allocated from
       whatever `context.allocator` the first `apply()` caller had installed; a scoped/temporary
       allocator would free them under the loader (use-after-free on the next reload). FIX: all
       three are pinned to `runtime.heap_allocator()` (OS heap, caller-independent). Additionally,
