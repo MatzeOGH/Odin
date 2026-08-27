@@ -27,7 +27,7 @@ State :: struct {
 // The procedure under test. The BASELINE body adds 1; run_mt_test.ps1 builds the
 // reload object from an edited copy whose body adds 100, so a successful patch is
 // directly observable. Workers call this concurrently while the main thread reloads.
-@(hot_reload)
+// Under -hot-reload every procedure is hot-reloadable automatically (no tag needed).
 work :: proc(s: ^State) {
 	s.n += 1
 }

@@ -4148,13 +4148,15 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 			}
 		}
 		return true;
-	} else if (name == "hot_reload") {
+	} else if (name == "no_hot_reload") {
+		// Under -hot-reload every eligible procedure is made hot-patchable automatically;
+		// this opts a specific procedure OUT (keeps it inlinable/optimized and unpatched).
 		if (value == nullptr) {
-			ac->hot_reload = true;
+			ac->no_hot_reload = true;
 		} else {
 			ExactValue ev = check_decl_attribute_value(c, value);
 			if (ev.kind == ExactValue_Bool) {
-				ac->hot_reload = ev.value_bool;
+				ac->no_hot_reload = ev.value_bool;
 			} else {
 				error(elem, "Expected a boolean value for '%.*s' or no value whatsoever", LIT(name));
 			}

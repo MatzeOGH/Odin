@@ -1424,10 +1424,14 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_HotReload:
 							// Emit the hot-reload support symbols (arena + TLS accessors) for an
-							// in-process hot-reload loader; the loader resolves running-exe symbols
-							// from the PDB, so this also requires -debug (checked post-parse).
-							// Force a single module so all procedures share one .text.
+							// in-process hot-reload loader. The loader resolves running-exe symbols
+							// from the PDB, so -hot-reload IMPLIES -debug (a PDB next to the exe).
+							// Enabling it here also pins base and reload builds to the same
+							// optimization level (-o:none, derived from ODIN_DEBUG), which the
+							// per-function change-detection hashes rely on to match. Force a single
+							// module so all procedures share one .text.
 							build_context.hot_reload = true;
+							build_context.ODIN_DEBUG = true;
 							build_context.use_single_module = true;
 							if (build_context.hot_reload_arena_size == 0) {
 								build_context.hot_reload_arena_size = 256*1024; // default new-global arena
@@ -2049,13 +2053,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 			// the wrong image. (Multiple-module / DLL hosts are future work.)
 			gb_printf_err("-hot-reload host must be an executable (-build-mode:exe); reload objects use -build-mode:obj\n");
 			bad_flags = true;
-		} else if (build_context.build_mode == BuildMode_Executable && !build_context.ODIN_DEBUG) {
-			// The loader resolves the running exe's procedures and globals from its PDB
-			// (DbgHelp) instead of a baked symbol table, so a PDB must exist next to it.
-			// Without -debug there is no PDB and no reload can bind.
-			gb_printf_err("-hot-reload requires -debug (the reload loader resolves the running exe's symbols from its PDB)\n");
-			bad_flags = true;
 		}
+		// Note: -hot-reload implies -debug (set in the flag handler) so a PDB exists next
+		// to the exe and base/reload builds share the same optimization level.
 	}
 
 	if ((!(build_context.export_timings_format == TimingsExportUnspecified)) && (build_context.export_timings_file.len == 0)) {

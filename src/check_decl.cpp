@@ -1341,12 +1341,11 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 	if (ac.set_cold) {
 		e->flags |= EntityFlag_Cold;
 	}
-	if (ac.hot_reload) {
-		e->Procedure.is_hot_reload = true;
-		// Hot-reloadable procedures must be exported so the reload object exposes a
-		// stable, unmangled symbol the loader can find and patch. Route through
-		// ac.is_export so the normal export path applies (it is consumed below).
-		ac.is_export = true;
+	if (ac.no_hot_reload) {
+		// Opt this procedure OUT of automatic -hot-reload patchability (keeps it
+		// inlinable/optimized and never patched). No export is forced — the reload
+		// loader resolves running procedures from the exe's PDB by their link name.
+		e->Procedure.no_hot_reload = true;
 	}
 	if (ac.pre_patch_hook || ac.post_patch_hook) {
 		if (!build_context.hot_reload) {

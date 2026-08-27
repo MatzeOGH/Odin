@@ -406,6 +406,67 @@ Hr_Obj_Ref :: struct {
 	section_bases: []rawptr,
 }
 
+// One entry of the compiler-emitted `__odin_hot_reload_func_hashes` table: a procedure's
+// change-detection hashes. `name_hash` is FNV-1a-64 of the link name (see `hr_fnv64`);
+// `content_hash` is a debug-normalized hash of the procedure's code. The loader patches a
+// hot procedure only when its `content_hash` differs from the currently-live one. Layout
+// must match the C++ emitter (`lb_hot_reload_emit_func_hashes`) in src/llvm_backend.cpp.
+Func_Hash :: struct {
+	name_hash:    u64,
+	content_hash: u64,
+}
+
+// FNV-1a-64 over `s` — must match the compiler's `fnv64a` used for `Func_Hash.name_hash`.
+@(private)
+hr_fnv64 :: proc(s: string) -> u64 {
+	h: u64 = 0xcbf29ce484222325
+	for i in 0 ..< len(s) {
+		h = (h ~ u64(s[i])) * 0x100000001b3
+	}
+	return h
+}
+
+// name_hash -> content_hash of every hot procedure currently LIVE in the process. Seeded
+// once from the exe's baseline `__odin_hot_reload_func_hashes` and updated after each
+// successful reload, so a reload patches only procedures whose content hash changed.
+@(private)
+_hr_cur: map[u64]u64
+@(private)
+_hr_cur_ready: bool
+
+// Read a `__odin_hot_reload_func_hashes` table (layout { i64 count; Func_Hash[count] })
+// at `addr` into `dst`. The entries are plain integers (no relocations), so this is valid
+// on both the exe's copy (PDB address) and the reload object's mapped copy.
+@(private)
+hr_read_func_hashes :: proc(addr: rawptr, dst: ^map[u64]u64) {
+	if addr == nil {
+		return
+	}
+	count := (^i64)(addr)^
+	entries := ([^]Func_Hash)(rawptr(uintptr(addr) + 8))
+	for k in 0 ..< int(count) {
+		e := entries[k]
+		dst[e.name_hash] = e.content_hash
+	}
+}
+
+// Whether hot procedure `name` should be patched: true iff its incoming content hash
+// differs from the currently-live one. Missing hashes (older object, or a name not yet
+// tracked) are treated as changed, which is always safe (at worst re-patches unchanged code).
+@(private)
+hr_proc_changed :: proc(name: string, obj_hashes: map[u64]u64, have_obj_hashes: bool) -> bool {
+	if !have_obj_hashes {
+		return true
+	}
+	nh := hr_fnv64(name)
+	obj_ch, has_obj := obj_hashes[nh]
+	cur, has_cur := _hr_cur[nh]
+	if has_obj && has_cur {
+		return obj_ch != cur
+	}
+	return true
+}
+
 // Reload `obj_path` into this running process, patching every `@(hot_reload)`
 // procedure to its fresh implementation. The set of procedures to patch is
 // discovered structurally from the running exe (see `hr_is_hot_entry`), so the
@@ -454,6 +515,19 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	}
 	hot_names := make([dynamic]string, context.temp_allocator)
 	tls_cache := make(map[string]uintptr, context.temp_allocator)
+
+	// Change detection: seed the live-hash baseline from the exe's func-hash table once,
+	// then diff this reload object's hashes against it so only procedures whose code
+	// changed are patched (unchanged procs — including the whole runtime and this loader —
+	// are skipped). If either table is missing (older exe/object), every eligible procedure
+	// is treated as changed, matching the pre-change-detection behaviour.
+	if !_hr_cur_ready {
+		_hr_cur = make(map[u64]u64)
+		hr_read_func_hashes(hr_resolve_pdb("__odin_hot_reload_func_hashes"), &_hr_cur)
+		_hr_cur_ready = true
+	}
+	obj_hashes := make(map[u64]u64, context.temp_allocator)
+	have_obj_hashes := false // set once the object's table is located (after sections map)
 
 	section_header :: proc(data: []byte, sec_off, i: int) -> ^Coff_Section_Header {
 		return (^Coff_Section_Header)(raw_data(data[sec_off + i*SECTION_HDR_SIZE:]))
@@ -504,6 +578,13 @@ load_and_patch :: proc(obj_path: string) -> bool {
 		}
 	}
 
+	// This reload object's per-procedure content hashes (plain integers, no relocations),
+	// for change detection in the resolution loop below.
+	if tbl, ok := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, "__odin_hot_reload_func_hashes"); ok {
+		hr_read_func_hashes(tbl, &obj_hashes)
+		have_obj_hashes = len(obj_hashes) > 0
+	}
+
 	// 2) Resolve every symbol slot to a runtime address.
 	//    - defined & hot (patchable prologue in exe) -> the object's fresh copy (new code)
 	//    - defined & present in the exe (via PDB)     -> the exe's address (reuse / preserve globals)
@@ -538,14 +619,16 @@ load_and_patch :: proc(obj_path: string) -> bool {
 				// dereferencing a data global that happens to sit next to an unmapped page.
 				sh := section_header(data, sec_off, sn - 1)
 				is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
-				if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) {
-					// A `@(hot_reload)` procedure: run this object's fresh copy and
+				if exe_addr != nil && is_code && hr_is_hot_entry(exe_addr) && hr_proc_changed(name, obj_hashes, have_obj_hashes) {
+					// A hot procedure whose code CHANGED: run this object's fresh copy and
 					// redirect the exe's entry to it (patched in step 4).
 					resolved[i] = obj_addr
 					append(&hot_names, name)
 				} else if exe_addr != nil {
-					// A pre-existing procedure/global: reuse the exe's copy so global
-					// state is preserved and non-hot code is not duplicated.
+					// Pre-existing and unchanged (or a non-hot proc / global): reuse the
+					// exe's copy. Global state is preserved, unchanged code is not
+					// re-patched, and an unchanged proc whose exe entry is already a
+					// trampoline from a prior reload still reaches the current version.
 					resolved[i] = exe_addr
 				} else {
 					// Object-local: a new proc/global, a string constant, a label.
@@ -739,7 +822,17 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	//    threads suspended and only once no thread is parked in a region we overwrite —
 	//    so a concurrent thread never executes a half-written instruction.
 	if len(hot_names) == 0 {
-		fmt.eprintln("[hot] no @(hot_reload) procedures found in the running exe (build it with -hot-reload -debug)")
+		if have_obj_hashes {
+			// Change detection: no procedure's code changed since the currently-live
+			// version — a valid no-op reload (e.g. only comments/data changed, or a new
+			// proc nothing calls yet). Refresh the baseline and succeed.
+			for k, v in obj_hashes {
+				_hr_cur[k] = v
+			}
+			fmt.println("[hot] no changed procedures to patch")
+			return true
+		}
+		fmt.eprintln("[hot] no hot-reloadable procedures found in the running exe (build it with -hot-reload -debug)")
 		return false
 	}
 	Target :: struct {
@@ -803,6 +896,13 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	hr_resume(handles)
 	if patched != len(targets) {
 		return false
+	}
+
+	// The reload object is now the live version: update the change-detection baseline
+	// so the next reload diffs against it (patched procs get their new hash; unchanged
+	// procs keep theirs; newly added procs are recorded).
+	for k, v in obj_hashes {
+		_hr_cur[k] = v
 	}
 
 	// 5) Fire the autowired post-patch hooks — NEW code: each is resolved to its

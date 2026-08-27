@@ -3304,6 +3304,130 @@ gb_internal void hot_reload_manifest_write(HotReloadManifest *hm) {
 // A procedure's `@(hot_reload)`-ness and a thread-local's identity are recovered by
 // the loader structurally (the patchable prologue) and by naming convention (the
 // accessor name), respectively, so no metadata section is needed.
+// A stable, debug-normalized content hash of a procedure's emitted code, used for
+// hot-reload change detection. We hash the function's LLVM IR text with debug info
+// removed: skip debug-record lines and truncate each line at its first " !" (metadata
+// operand). This is SOUND for change detection — a real instruction/operand change alters
+// the kept text, so the hash differs — while debug-only differences (which do not change
+// machine code) and metadata-ID renumbering from unrelated edits hash equal, so an
+// unchanged procedure keeps the same hash across builds.
+gb_internal u64 lb_hot_reload_proc_content_hash(lbProcedure *p) {
+	char *ir = LLVMPrintValueToString(p->value);
+	if (ir == nullptr) {
+		return 0;
+	}
+	// Compiler-generated constant globals (string backing stores etc.) are named
+	// `<prefix>$<module_name>$<hex-index>` (llvm_backend_general.cpp), where BOTH the
+	// module name (from -out) and the atomic index vary between builds. A procedure that
+	// references a string literal would otherwise hash differently every build. Strip the
+	// build-specific `$<module_name>$<hex>` suffix wherever it appears so such references
+	// canonicalize (the referenced length stays, so a length change is still detected).
+	char const *mod = p->module ? p->module->module_name : nullptr;
+	isize mod_len = (mod != nullptr) ? cast(isize)gb_strlen(mod) : 0;
+
+	gbString norm = gb_string_make(temporary_allocator(), "");
+	char const *s = ir;
+	while (*s) {
+		char const *line = s;
+		char const *nl = line;
+		while (*nl && *nl != '\n') { nl++; }
+		isize line_len = nl - line;
+
+		// Drop debug-record lines entirely (llvm.dbg.* intrinsics / #dbg_ records).
+		bool is_dbg = false;
+		for (isize i = 0; i < line_len; i++) {
+			if (line[i] == '#' && (line_len - i) >= 5 && gb_strncmp(line+i, "#dbg_", 5) == 0) { is_dbg = true; break; }
+			if (line[i] == 'l' && (line_len - i) >= 9 && gb_strncmp(line+i, "llvm.dbg.", 9) == 0) { is_dbg = true; break; }
+		}
+		if (!is_dbg) {
+			// Truncate at the first " !" or " #": in LLVM IR text '!' introduces trailing
+			// metadata operands (e.g. `, !dbg !12`) and '#' introduces attribute-group
+			// references (e.g. `... #0 ...`). Both are module-globally numbered and renumber
+			// between builds when unrelated code is added/removed, so an unchanged procedure
+			// would otherwise hash differently. Instruction operands always precede them, so
+			// truncating keeps the semantically-relevant prefix.
+			isize keep = line_len;
+			for (isize i = 0; i + 1 < line_len; i++) {
+				if (line[i] == ' ' && (line[i+1] == '!' || line[i+1] == '#')) { keep = i; break; }
+			}
+			// Trim trailing spaces/commas left where metadata was stripped, so a -debug
+			// instruction (`br label %e, !dbg !N` -> `br label %e,`) hashes identically to
+			// its non-debug counterpart (`br label %e`). The base exe is built -debug while
+			// the reload object usually is not, so the two forms must reconcile.
+			while (keep > 0 && (line[keep-1] == ' ' || line[keep-1] == ',')) {
+				keep--;
+			}
+			// Append the kept text, collapsing any `$<module_name>$<hex>` run (the
+			// build-specific tail of a compiler-generated constant global's name).
+			isize i = 0;
+			while (i < keep) {
+				if (mod_len > 0 && line[i] == '$' && (keep - i) >= (mod_len + 2) &&
+				    gb_strncmp(line + i + 1, mod, mod_len) == 0 && line[i + 1 + mod_len] == '$') {
+					isize j = i + 1 + mod_len + 1; // past "$<module_name>$"
+					while (j < keep) {
+						char c = line[j];
+						bool is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+						if (!is_hex) { break; }
+						j++;
+					}
+					i = j; // drop "$<module_name>$<hex>" entirely
+				} else {
+					norm = gb_string_append_length(norm, line + i, 1);
+					i++;
+				}
+			}
+			norm = gb_string_appendc(norm, "\n");
+		}
+		s = (*nl == '\n') ? nl+1 : nl;
+	}
+	u64 h = fnv64a(norm, gb_string_length(norm));
+	LLVMDisposeMessage(ir);
+	return h;
+}
+
+// Emit `__odin_hot_reload_func_hashes` — a table of {u64 name_hash, u64 content_hash} for
+// every hot-reloadable procedure (same set the patchable prologue is emitted for). It carries
+// NO addresses and roots nothing, so dead-code elimination stays enabled. The reload loader
+// reads the exe's copy (via the PDB) as the change-detection baseline and the reload object's
+// copy (via its COFF symbol) each reload, and patches only procedures whose content hash
+// changed. `name_hash` is FNV-1a-64 of the link name (matches the loader's `hr_fnv64`).
+gb_internal void lb_hot_reload_emit_func_hashes(lbGenerator *gen) {
+	lbModule *m = &gen->default_module;
+
+	LLVMTypeRef u64t = lb_type(m, t_u64);
+	LLVMTypeRef i64t = lb_type(m, t_i64);
+	LLVMTypeRef entry_field_types[2] = { u64t, u64t }; // { name_hash, content_hash }
+	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 2, false);
+
+	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
+	for (lbProcedure *p : m->generated_procedures) {
+		if (!lb_proc_is_hot_reloadable(p)) {
+			continue;
+		}
+		u64 name_hash    = fnv64a(p->name.text, p->name.len);
+		u64 content_hash = lb_hot_reload_proc_content_hash(p);
+		LLVMValueRef fields[2] = {
+			LLVMConstInt(u64t, name_hash,    false),
+			LLVMConstInt(u64t, content_hash, false),
+		};
+		array_add(&entries, LLVMConstStructInContext(m->ctx, fields, 2, false));
+	}
+
+	LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entries.count);
+	LLVMValueRef arr  = LLVMConstArray(entry_t, entries.data, cast(unsigned)entries.count);
+
+	LLVMTypeRef tbl_field_types[2] = { i64t, arr_t }; // { count, entries[] }
+	LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
+	LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entries.count, false), arr };
+	LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
+
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_hot_reload_func_hashes");
+	LLVMSetInitializer(tbl, tbl_val);
+	LLVMSetGlobalConstant(tbl, true);
+	LLVMSetLinkage(tbl, LLVMExternalLinkage); // public: PDB-resolvable baseline in the exe
+	lb_append_to_used(m, tbl);                // survive DCE; the loader reads it by name
+}
+
 gb_internal void lb_hot_reload_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 	LLVMTypeRef rawptr_llvm = lb_type(m, t_rawptr);
@@ -4125,6 +4249,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		// and the post set (from the object) after, passing the changed-type set.
 		lb_hot_reload_emit_patch_hook_table(gen, info, true,  "__odin_hot_reload_pre_patch_hooks");
 		lb_hot_reload_emit_patch_hook_table(gen, info, false, "__odin_hot_reload_post_patch_hooks");
+
+		// Change-detection baseline/delta: a per-procedure content-hash table so the loader
+		// patches only procedures whose code actually changed (see lb_hot_reload_emit_func_hashes).
+		// Emitted here, after all procedures are generated, so every proc is included.
+		lb_hot_reload_emit_func_hashes(gen);
 
 		// Emit the once-only init descriptor table for new globals (file-scope and
 		// local `@(static)`) with constant initializers. Layout: { i64 count;

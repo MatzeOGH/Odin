@@ -21,13 +21,12 @@ hits: i64
 
 
 
-// A `@(hot_reload)` procedure. With the exe built `-hot-reload`, its body may call
-// other procedures, read/write globals, reference brand-new globals and procedures
-// that did not exist when the exe was built, and — since the loader resolves C-runtime
-// and Windows-API symbols against the running process — call `fmt` and the rest of the
-// standard library. Edit it (see demo.ps1 / README.md), rebuild the object, then press
-// `r` to replace it in place.
-@(hot_reload)
+// With the exe built `-hot-reload`, EVERY procedure is hot-reloadable automatically (no
+// tag needed). Its body may call other procedures, read/write globals, reference brand-new
+// globals and procedures that did not exist when the exe was built, and — since the loader
+// resolves C-runtime and Windows-API symbols against the running process — call `fmt` and
+// the rest of the standard library. Edit it (see demo.ps1 / README.md), rebuild the object,
+// then press `r`; the loader patches only the procedures whose code changed.
 update :: proc(s: ^State) {
 	// ---- EDIT HERE, then recompile (ctrl-alt-r) and press `r` in the run terminal ----
 	// Try: change the numbers, print something new, add a global/proc above and use it.
