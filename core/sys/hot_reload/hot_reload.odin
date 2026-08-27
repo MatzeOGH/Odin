@@ -125,7 +125,9 @@ Type_Change :: struct {
 
 // A `@(pre_patch_hook)` / `@(post_patch_hook)` procedure. Called by the loader with
 // the set of types whose layout changed this reload. Signature enforced by the
-// compiler (see check_decl.cpp).
+// compiler (see check_decl.cpp). A hook runs inside the reload call, so its
+// `context.temp_allocator` is the loader's private per-reload arena (freed when the
+// reload returns) — do not stash temp allocations expected to outlive the call.
 Patch_Hook :: #type proc(changed: []Type_Change)
 
 // One entry of the compiler-emitted `__odin_hot_reload_{pre,post}_patch_hooks` table
@@ -282,12 +284,13 @@ hr_exe_types_by_name :: proc() -> map[string]^runtime.Type_Info {
 	}
 	hr_exe_types_built = true
 	old_tis := hr_read_type_infos(hr_resolve_pdb(HR_TYPE_INFOS_SYM))
-	// Qualified-name keys are strdup'd so they don't alias the temp allocator.
-	hr_exe_types_cache = make(map[string]^runtime.Type_Info)
+	// Process-lifetime map + keys: pin to the OS heap so they never alias the caller's
+	// (possibly scoped/temporary) allocator — see the allocator note on `apply`.
+	hr_exe_types_cache = make(map[string]^runtime.Type_Info, runtime.heap_allocator())
 	for ti in old_tis {
 		if ti == nil { continue }
 		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
-			key := strings.clone(hr_qualified_name(named))
+			key := strings.clone(hr_qualified_name(named), runtime.heap_allocator())
 			hr_exe_types_cache[key] = ti
 		}
 	}
@@ -468,12 +471,24 @@ hr_proc_changed :: proc(name: string, obj_hashes: map[u64]u64, have_obj_hashes: 
 	return true
 }
 
+// Guards against a concurrent or nested reload. `apply`/`load_and_patch` are NOT
+// re-entrant or thread-safe: they mutate process-lifetime state (`_hr_syms`, `_hr_cur`,
+// the DbgHelp session) with no synchronization. The guard makes a second overlapping
+// reload fail loudly instead of corrupting that state (finding F14).
+@(private) _hr_busy: b32
+
 // Reload `obj_path` into this running process, patching every `@(hot_reload)`
 // procedure to its fresh implementation. The set of procedures to patch is
 // discovered structurally from the running exe (see `hr_is_hot_entry`), so the
 // caller does not have to list them. Returns true if every hot procedure was
 // patched. The exe must have been built with `-hot-reload -debug` (a PDB next to
 // the exe), which the loader uses to resolve the running exe's symbols.
+//
+// Call from a SINGLE thread, one reload at a time (not re-entrant — see `_hr_busy`).
+// The loader is self-contained w.r.t. the caller's allocators: its process-lifetime
+// state is pinned to the OS heap (independent of `context.allocator`), and all of its
+// per-call scratch runs on a private arena, so it never touches the app's
+// `context.temp_allocator`.
 apply :: proc(obj_path: string) -> bool {
 	return load_and_patch(obj_path)
 }
@@ -482,6 +497,25 @@ apply :: proc(obj_path: string) -> bool {
 // `@(hot_reload)` procedure with its fresh implementation. Returns true if every
 // hot procedure was patched.
 load_and_patch :: proc(obj_path: string) -> bool {
+	// Refuse a concurrent/nested reload rather than corrupt the shared loader state.
+	if _, swapped := intrinsics.atomic_compare_exchange_strong(&_hr_busy, false, true); !swapped {
+		fmt.eprintln("[hot] a reload is already in progress; apply()/load_and_patch() must be called from one thread, one reload at a time")
+		return false
+	}
+	defer intrinsics.atomic_store(&_hr_busy, false)
+
+	// Run ALL per-call scratch on a private, heap-backed arena instead of the app's
+	// `context.temp_allocator`, so a whole-program reload never spikes (or on a fixed
+	// `mem.Scratch_Allocator`, overflows) the application's temp arena. `context` is
+	// per-call, so this override reaches every callee below and auto-restores on return;
+	// `arena_destroy` frees this reload's scratch back to the heap. NOTE: user pre/post-
+	// patch hooks run within this extent and thus inherit this arena as their temp
+	// allocator — a hook must not rely on temp memory surviving past the reload call.
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	context.temp_allocator = runtime.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
+
 	data, err := os.read_entire_file(obj_path, context.allocator)
 	if err != nil {
 		fmt.eprintln("[hot] could not read object:", obj_path, err)
@@ -523,7 +557,7 @@ load_and_patch :: proc(obj_path: string) -> bool {
 	// are skipped). If either table is missing (older exe/object), every eligible procedure
 	// is treated as changed, matching the pre-change-detection behaviour.
 	if !_hr_cur_ready {
-		_hr_cur = make(map[u64]u64)
+		_hr_cur = make(map[u64]u64, runtime.heap_allocator()) // process-lifetime: pin to the OS heap
 		hr_read_func_hashes(hr_resolve_pdb("__odin_hot_reload_func_hashes"), &_hr_cur)
 		_hr_cur_ready = true
 	}
@@ -1384,7 +1418,8 @@ hr_enum_cb :: proc "system" (pSym: win.PSYMBOL_INFOW, size: win.ULONG, user: win
 	n := int(pSym.NameLen)
 	if n > 0 {
 		wname := ([^]u16)(&pSym.Name[0])
-		if name, err := win.utf16_to_utf8(wname[:n], context.allocator); err == nil && len(name) > 0 {
+		// Keys live for the process lifetime alongside `_hr_syms`: pin to the OS heap.
+		if name, err := win.utf16_to_utf8(wname[:n], runtime.heap_allocator()); err == nil && len(name) > 0 {
 			// Keep the first address seen for a name; ignore later duplicates.
 			if _, exists := st.syms[name]; !exists {
 				st.syms[name] = rawptr(uintptr(pSym.Address))
@@ -1411,7 +1446,7 @@ hr_dbghelp_ensure :: proc() -> bool {
 		return false
 	}
 	win.SymSetOptions(win.SYMOPT_DEFERRED_LOADS)
-	_hr_syms = make(map[string]rawptr)
+	_hr_syms = make(map[string]rawptr, runtime.heap_allocator()) // process-lifetime: pin to the OS heap
 	base := win.ULONG64(uintptr(win.GetModuleHandleW(nil))) // the exe's image base
 	st := Hr_Enum_State{syms = &_hr_syms, ctx = context}
 	// Mask nil -> every symbol in the exe module. Exact names go into the map.

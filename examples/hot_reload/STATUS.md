@@ -388,9 +388,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       first-seen-wins on duplicate enumerated names (no section/tag disambiguation); the
       hot-detection heuristic assumes the compiler's 16-byte prefix is literal `0x90` NOPs
       (a future LLVM multi-byte-NOP prefix would break detection — now at least it fails
-      loudly via the empty-`hot_names` path, not silently); `_hr_syms` is allocated from the
-      first `apply()` caller's `context.allocator` (call `apply` under a persistent
-      allocator); `apply()` is not re-entrant (call from one thread).
+      loudly via the empty-`hot_names` path, not silently). **Fixed since:** the loader's
+      process-lifetime state (`_hr_syms`/`_hr_cur`/`hr_exe_types_cache` + their string keys) is
+      pinned to `runtime.heap_allocator()` so it no longer aliases the first caller's allocator
+      (F13); all per-call scratch runs on a private heap-backed `runtime.Arena` instead of the
+      app's `context.temp_allocator`; and a `_hr_busy` atomic guard makes a concurrent/nested
+      `apply()` fail loudly instead of corrupting shared state (F14).
 
 
 ### Tier 4 — workflow / reach
@@ -598,11 +601,21 @@ approximate against `core/sys/hot_reload/hot_reload.odin` unless noted.
       requested auto-NOREF for whole-lib calls); documented under the Tier 3 `/OPT` item.
 - [x] **F12 — LOW — `ADDR32NB` assumed every target in-block, unchecked.** FIX: an
       out-of-block target is now refused (counted unresolved) instead of writing a wrapped RVA.
-- [ ] **F11 / F13 / F14 — LOW.** F11: symbols dropped on UTF-8 conversion / empty name are
-      silent (consider logging in debug builds). F13: `_hr_syms` and its keys are allocated
-      from the first `apply()` caller's `context.allocator` — call `apply` under a persistent
-      allocator, or pin the map to an explicit heap allocator. F14: `apply()` is not
-      re-entrant / thread-safe — call it from one thread only.
+- [ ] **F11 — LOW.** Symbols dropped on UTF-8 conversion / empty name are silent (consider
+      logging in debug builds).
+- [x] **F13 — LOW/MEDIUM — process-lifetime state aliased the caller's allocator.** `_hr_syms`,
+      `_hr_cur`, and `hr_exe_types_cache` (backing store **and** string keys) were allocated from
+      whatever `context.allocator` the first `apply()` caller had installed; a scoped/temporary
+      allocator would free them under the loader (use-after-free on the next reload). FIX: all
+      three are pinned to `runtime.heap_allocator()` (OS heap, caller-independent). Additionally,
+      the loader's per-call scratch was moved off the app's `context.temp_allocator` onto a private
+      heap-backed `runtime.Arena` (overridden once at the top of `load_and_patch`, freed each
+      reload), so a whole-program reload no longer spikes/overflows the application's temp arena.
+- [x] **F14 — LOW/MEDIUM — `apply()` not re-entrant / thread-safe.** FIX: a `_hr_busy` atomic
+      compare-exchange guard at the reload entry refuses a concurrent or nested reload with a clear
+      message instead of corrupting the shared maps + DbgHelp session. (Still call it from one
+      thread, one reload at a time — the guard makes a violation fail loudly, it does not make
+      concurrent reloads work.)
 
 ### What's still missing (independent of the TODO tiers above)
 
