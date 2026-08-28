@@ -56,10 +56,10 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	Checker *c = m->checker;
 	m->info = &c->info;
 
-	// NOTE(mh): do we fix optimization_level? Should this be taken from the cli? 
-	if (build_context.livepatch) {
-		bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
-		m->optimization_level = is_builtin ? 2 : -1; // -1 == -o:none
+	// disable optimization for patchable module
+	bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
+	if (build_context.livepatch && !is_builtin) {
+		m->optimization_level = -1; // -1 == -o:none
 	} else {
 		m->optimization_level = build_context.optimization_level;
 	}

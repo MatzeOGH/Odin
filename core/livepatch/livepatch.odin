@@ -1344,6 +1344,12 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	//    and fresh (object) address first, then patch the whole batch with all other threads
 	//    suspended and only once no thread is parked in a region we overwrite.
 	if len(hot_names) == 0 && len(refresh_targets) == 0 && !swap_type_table {
+		// Fire the post-patch hooks even on a no-op reload, so a hook that refreshes derived state
+		// (e.g. re-decoding a texture, per-reload bookkeeping) runs after EVERY successful patch,
+		// not only when code/data/types changed. Resolved object-local (all_defs) and called here,
+		// BEFORE the blocks their bodies live in are freed just below. `changed` is empty (nothing
+		// changed); the freshly-mapped blocks are still executable (RWX) at this point.
+		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
 		// Nothing will jump into or point at this reload's freshly-mapped blocks, and no thread
 		// is inside them (nothing was patched), so free them immediately instead of leaking — a
 		// no-op reload (the common change-detection case) otherwise leaked one block per reload.

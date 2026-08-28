@@ -69,28 +69,15 @@ gb_internal void lb_mem_copy_non_overlapping(lbProcedure *p, lbValue dst, lbValu
 	lb_call_intrinsic(p, name, args, gb_count_of(args), types, gb_count_of(types));
 }
 
-
-// Path byte compare, '/'=='\\' and case-insensitive (Windows paths).
-gb_internal bool lb_path_char_eq(u8 a, u8 b) {
-	if (a == '/') { a = '\\'; }
-	if (b == '/') { b = '\\'; }
-	if (a >= 'A' && a <= 'Z') { a = cast(u8)(a + 32); }
-	if (b >= 'A' && b <= 'Z') { b = cast(u8)(b + 32); }
-	return a == b;
-}
-
-// True iff `fullpath` is at or under directory `dir` (path boundary after `dir`). See tech_design.md §7.
 gb_internal bool lb_path_under_dir(String fullpath, String dir) {
 	while (dir.len > 0 && (dir.text[dir.len-1] == '/' || dir.text[dir.len-1] == '\\')) {
-		dir.len -= 1; // ignore any trailing separator on the collection path
+		dir.len -= 1;
 	}
 	if (dir.len == 0 || fullpath.len < dir.len) {
 		return false;
 	}
-	for (isize i = 0; i < dir.len; i++) {
-		if (!lb_path_char_eq(fullpath.text[i], dir.text[i])) {
-			return false;
-		}
+	if (!str_eq_ignore_case(substring(fullpath, 0, dir.len), dir)) {
+		return false;
 	}
 	if (fullpath.len == dir.len) {
 		return true;
@@ -99,8 +86,6 @@ gb_internal bool lb_path_under_dir(String fullpath, String dir) {
 	return c == '/' || c == '\\';
 }
 
-// True iff `fullpath` is under a shipped builtin collection (base/core/vendor), by the
-// `builtin` flag (not collection name). See tech_design.md §7.
 gb_internal bool lb_path_is_stdlib(String fullpath) {
 	for (auto const &lc : library_collections) {
 		if (lc.builtin && lb_path_under_dir(fullpath, lc.path)) {
@@ -110,8 +95,6 @@ gb_internal bool lb_path_is_stdlib(String fullpath) {
 	return false;
 }
 
-// Whether `p` is auto hot-patchable under -livepatch. Same predicate is used to stamp the
-// patchable attributes and to emit the change-detection hashes. See tech_design.md §7.
 gb_internal bool lb_proc_is_livepatchable(lbProcedure *p) {
 	if (!build_context.livepatch) {
 		return false;

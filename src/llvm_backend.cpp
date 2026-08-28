@@ -185,6 +185,8 @@ gb_internal GB_COMPARE_PROC(foreign_library_cmp) {
 	return i32_cmp(x->token.pos.offset, y->token.pos.offset);
 }
 
+gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl); // defined below; used by the linkage-correction pass
+
 gb_internal void lb_set_entity_from_other_modules_linkage_correctly(lbModule *other_module, Entity *e, String const &name) {
 	if (other_module == nullptr) {
 		return;
@@ -199,9 +201,13 @@ gb_internal void lb_correct_entity_linkage(lbGenerator *gen) {
 		if (ec.e->kind == Entity_Variable) {
 			other_global = LLVMGetNamedGlobal(ec.other_module->mod, ec.cname);
 			if (other_global && (LLVMGetInitializer(other_global) != nullptr || LLVMIsExternallyInitialized(other_global))) {
-				LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
-				if (!ec.e->Variable.is_export && !ec.e->Variable.is_foreign) {
-					LLVMSetVisibility(other_global, LLVMHiddenVisibility);
+				if (build_context.livepatch && lb_is_livepatch_refresh_global(ec.e, decl_info_of_entity(ec.e))) {
+					LLVMSetLinkage(other_global, LLVMExternalLinkage);
+				} else {
+					LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
+					if (!ec.e->Variable.is_export && !ec.e->Variable.is_foreign) {
+						LLVMSetVisibility(other_global, LLVMHiddenVisibility);
+					}
 				}
 			}
 		} else if (ec.e->kind == Entity_Procedure) {
@@ -2818,8 +2824,6 @@ gb_internal void lb_add_foreign_library_paths(lbGenerator *gen) {
 	}
 }
 
-// On a reload build, skip emitting an object for a builtin-collection module or an unchanged
-// user module (both are still in the exe). Minimal-object emission; see tech_design.md §6.
 gb_internal bool lb_livepatch_skip_object(lbModule *m) {
 	if (!(build_context.livepatch && build_context.livepatch_is_reload && build_context.build_mode == BuildMode_Object)) {
 		return false;
@@ -3092,12 +3096,6 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 	array_add(&m->generated_procedures, p);
 }
 
-
-// ---------------------------------------------------------------------------
-// Livepatch: arena for new globals + build-to-build manifest.
-// See tech_design.md §4 (arena) and §3 (manifest).
-// ---------------------------------------------------------------------------
-
 gb_internal u64 lb_livepatch_parse_u64(String s) {
 	u64 v = 0;
 	for (isize i = 0; i < s.len; i++) {
@@ -3108,7 +3106,6 @@ gb_internal u64 lb_livepatch_parse_u64(String s) {
 	return v;
 }
 
-// The reserved arena new globals are placed into. See tech_design.md §4.
 gb_internal LLVMValueRef lb_livepatch_arena(lbModule *m) {
 	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_livepatch_global_arena");
 	if (existing != nullptr) {
@@ -3145,7 +3142,6 @@ gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *p
 	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
 }
 
-// Per-thread reserved storage for new thread-locals across a reload. See tech_design.md §5.
 gb_internal LLVMValueRef lb_livepatch_tls_arena(lbModule *m) {
 	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_livepatch_tls_arena");
 	if (existing != nullptr) {
@@ -3198,8 +3194,6 @@ gb_internal void livepatch_manifest_read(LivePatchManifest *hm) {
 	if (build_context.livepatch_manifest.len == 0) {
 		return;
 	}
-	// Only a reload build (-build-mode:obj) reads the baseline; the base exe build writes it
-	// fresh. Build-mode keys base-vs-reload, not file presence. See tech_design.md §3.
 	if (build_context.build_mode != BuildMode_Object) {
 		return;
 	}
@@ -3291,7 +3285,6 @@ gb_internal void livepatch_manifest_write(LivePatchManifest *hm) {
 	if (build_context.livepatch_manifest.len == 0) {
 		return;
 	}
-	// Do not persist a rejected build (a bad sig/offsets would make guards sticky). See tech_design.md §3.
 	if (any_errors()) {
 		return;
 	}
@@ -3352,15 +3345,11 @@ gb_internal String lb_call_basic_directive_name(Ast *expr) {
 	return str_lit("");
 }
 
-// Whether `expr` is an embedded-data directive (#load/#load_directory/#hash/#load_hash) whose
-// result is refreshed on reload. See tech_design.md §10.
 gb_internal bool lb_is_load_directive_expr(Ast *expr) {
 	String n = lb_call_basic_directive_name(expr);
 	return n == "load" || n == "load_directory" || n == "hash" || n == "load_hash";
 }
 
-// Build the constant `[]Load_Directory_File` slice for a module-scope `#load_directory(call)`,
-// so a livepatch global carries a real header the loader can repoint. See tech_design.md §10.
 gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 	TEMPORARY_ALLOCATOR_GUARD();
 	LoadDirectoryCache *cache = map_must_get(&m->info->load_directory_map, call);
@@ -3391,8 +3380,6 @@ gb_internal lbValue lb_const_load_directory_slice(lbModule *m, Ast *call) {
 	return res;
 }
 
-// Whether a global holds immutable embedded data (@(rodata) or a #load initializer) that the
-// loader refreshes rather than preserves. See tech_design.md §10.
 gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl) {
 	if (e != nullptr && e->kind == Entity_Variable && e->Variable.is_rodata) {
 		return true;
@@ -3400,15 +3387,12 @@ gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl) {
 	return decl != nullptr && lb_is_load_directive_expr(decl->init_expr);
 }
 
-// Stable, debug-normalized hash of a proc's emitted IR text, for change detection. See tech_design.md §6.
 gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
-	TEMPORARY_ALLOCATOR_GUARD(); // free the per-proc norm scratch; else it accumulates program-wide
+	TEMPORARY_ALLOCATOR_GUARD();
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
 		return 0;
 	}
-	// Collapse the build-specific `$<module_name>$<hex>` suffix of generated const globals so
-	// references to them canonicalize across builds. See tech_design.md §6.
 	char const *mod = p->module ? p->module->module_name : nullptr;
 	isize mod_len = (mod != nullptr) ? cast(isize)gb_strlen(mod) : 0;
 
@@ -3427,17 +3411,13 @@ gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 			if (line[i] == 'l' && (line_len - i) >= 9 && gb_strncmp(line+i, "llvm.dbg.", 9) == 0) { is_dbg = true; break; }
 		}
 		if (!is_dbg) {
-			// Truncate at the first " !" (metadata) or " #" (attr group): both renumber between
-			// builds. Instruction operands precede them. See tech_design.md §6.
 			isize keep = line_len;
 			for (isize i = 0; i + 1 < line_len; i++) {
 				if (line[i] == ' ' && (line[i+1] == '!' || line[i+1] == '#')) { keep = i; break; }
 			}
-			// Trim trailing spaces/commas so a -debug instruction hashes as its non-debug form.
 			while (keep > 0 && (line[keep-1] == ' ' || line[keep-1] == ',')) {
 				keep--;
 			}
-			// Append the kept text, collapsing any `$<module_name>$<hex>` run.
 			isize i = 0;
 			while (i < keep) {
 				if (mod_len > 0 && line[i] == '$' && (keep - i) >= (mod_len + 2) &&
@@ -3449,7 +3429,7 @@ gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 						if (!is_hex) { break; }
 						j++;
 					}
-					i = j; // drop "$<module_name>$<hex>" entirely
+					i = j;
 				} else {
 					norm = gb_string_append_length(norm, line + i, 1);
 					i++;
@@ -3464,8 +3444,6 @@ gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 	return h;
 }
 
-// Emit `__odin_livepatch_func_hashes`, the {name_hash, content_hash} change-detection table
-// over every livepatchable proc. See tech_design.md §6.
 gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
@@ -3476,8 +3454,7 @@ gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 
 	LivePatchManifest &hm = gen->livepatch_manifest;
 	auto entries = array_make<LLVMValueRef>(temporary_allocator(), 0, 1024);
-	// Gather hot procs from every module (they live in per-package modules); the table is
-	// still defined in default_module.
+	// Gather hot procs from every module 
 	auto hot_procs = array_make<lbProcedure *>(temporary_allocator(), 0, 1024);
 	for (auto const &entry : gen->modules) {
 		lbModule *mod = entry.value;
@@ -3491,10 +3468,8 @@ gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 		u64 name_hash    = fnv64a(p->name.text, p->name.len);
 		u64 content_hash = lb_livepatch_proc_content_hash(p);
 
-		// Minimal object emission: mark this proc's module changed if its hash differs from the
-		// baseline (read before the overwrite below). See tech_design.md §6.
 		if (!hm.exists) {
-			p->module->livepatch_changed = true; // base build: no baseline, treat as changed
+			p->module->livepatch_changed = true;
 		} else {
 			u64 *base = string_map_get(&hm.fhash, p->name);
 			if (base == nullptr || *base != content_hash) {
@@ -3502,17 +3477,15 @@ gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 			}
 		}
 
-		string_map_set(&hm.fhash, p->name, content_hash); // persist this build's per-proc baseline
+		string_map_set(&hm.fhash, p->name, content_hash);
 
-		// Signature ABI guard (F8): a hot proc's parameter/return types must not change across a
-		// reload (the frozen host calls it with the original ABI). See tech_design.md §6.
 		if (p->type != nullptr) {
 			u64 sig_hash = type_hash_canonical_type(p->type);
 			if (hm.exists) {
 				u64 *prev = string_map_get(&hm.sig, p->name);
 				if (prev != nullptr && *prev != sig_hash) {
 					Token tok = (p->entity != nullptr) ? p->entity->token : empty_token;
-					error(tok, "livepatch: procedure '%.*s' changed its signature (parameter/return types); the frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
+					error(tok, "livepatch: procedure '%.*s' changed its signature. The frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
 				}
 			}
 			string_map_set(&hm.sig, p->name, sig_hash);
@@ -3539,14 +3512,11 @@ gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 	lb_append_to_used(m, tbl);                // survive DCE; the loader reads it by name
 }
 
-// Emit `__odin_livepatch_build_id : u64`, the layout fingerprint the loader checks to refuse a
-// stale object (F6). Call after emit_func_hashes so `sig` is complete. See tech_design.md §6.
 gb_internal void lb_livepatch_emit_build_id(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 	LivePatchManifest &hm = gen->livepatch_manifest;
 
 	if (!hm.exists) {
-		// Base build: derive the id from the layout, folded commutatively (order-independent).
 		u64 id = 0;
 		id += 0x9E3779B97F4A7C15ull ^ cast(u64)hm.arena_size;
 		id += 0xC2B2AE3D27D4EB4Full ^ cast(u64)hm.tls_arena_size;
@@ -3560,36 +3530,30 @@ gb_internal void lb_livepatch_emit_build_id(lbGenerator *gen) {
 		}
 		hm.build_id = id;
 	}
-	// Reload build: hm.build_id already holds the exe's value from the manifest.
 
 	LLVMTypeRef u64t = lb_type(m, t_u64);
 	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_livepatch_build_id");
 	LLVMSetInitializer(g, LLVMConstInt(u64t, hm.build_id, false));
 	LLVMSetGlobalConstant(g, true);
-	LLVMSetLinkage(g, LLVMExternalLinkage); // public: PDB-resolvable in the exe, defined in the object
-	lb_append_to_used(m, g);                // survive DCE; the loader reads it by name
+	LLVMSetLinkage(g, LLVMExternalLinkage);
+	lb_append_to_used(m, g);
 }
 
-// Emit the support symbols the loader resolves by name (arena, TLS arena, TLS accessors). See
-// tech_design.md §5, §13.
 gb_internal void lb_livepatch_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
-	// Reserve the per-thread TLS arena and record it for an accessor. See tech_design.md §5.
 	if (build_context.livepatch_tls_arena_size > 0) {
 		LLVMValueRef tls_arena = lb_livepatch_tls_arena(m);
 		lbLivePatchStaticSym s = {str_lit("__odin_livepatch_tls_arena"), tls_arena, 0, m};
 		array_add(&gen->livepatch_tls_syms, s);
 	}
 
-	// Emit a `__odin_lptls$<link-name>() -> rawptr { return &var }` accessor for each thread-local
-	// so the loader can resolve SECREL references to the exe's TLS block. See tech_design.md §5.
 	{
 		for (lbLivePatchStaticSym const &s : gen->livepatch_tls_syms) {
 			if (s.name.len == 0 || s.value == nullptr) {
 				continue;
 			}
-			// Emit into the module that defines the thread-local (LLVM forbids cross-module refs).
+			// Emit into the module that defines the thread-local
 			lbModule *am = (s.module != nullptr) ? s.module : m;
 			LLVMTypeRef acc_ty = LLVMFunctionType(lb_type(am, t_rawptr), nullptr, 0, false);
 			char const *acc_name = gb_bprintf("__odin_lptls$%.*s", LIT(s.name));
@@ -3612,8 +3576,6 @@ gb_internal void lb_livepatch_emit_support(lbGenerator *gen) {
 	}
 }
 
-// Emit a patch-hook name table (the exported symbol name of each @(pre/post_patch_hook)). The
-// loader resolves each name itself: pre against the exe, post against the object. See tech_design.md §11.
 gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
 	lbModule *m = &gen->default_module;
 	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
@@ -3652,7 +3614,6 @@ gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInf
 	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, sym_name);
 	LLVMSetInitializer(tbl, tbl_val);
 	LLVMSetGlobalConstant(tbl, true);
-	// External + llvm.used so it survives linker DCE and lands in the exe's PDB.
 	LLVMSetLinkage(tbl, LLVMExternalLinkage);
 	lb_append_to_used(m, tbl);
 }
@@ -3778,7 +3739,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	for (auto const &entry : gen->modules) {
 		lbModule *m = entry.value;
 
-		// Per-module codegen opt level (see lb_init_module_worker_proc; tech_design.md §8).
 		LLVMCodeGenOptLevel code_gen_level = LLVMCodeGenLevelNone;
 		switch (m->optimization_level) {
 		default:/*fallthrough*/
@@ -3978,9 +3938,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	auto global_variables = array_make<lbGlobalVariable>(permanent_allocator(), 0, global_variable_max_count);
 
-	// Under -livepatch, load the manifest to tell original globals from new ones. These
-	// generator-scoped lists are also filled by lb_build_static_variables (thread pool), and the
-	// manifest/init table are written after all procedures. See tech_design.md §3, §4.
 	LivePatchManifest &livepatch_manifest = gen->livepatch_manifest;
 	Array<LivePatchInitEntry> &livepatch_inits = gen->livepatch_inits;
 	if (build_context.livepatch) {
@@ -4029,8 +3986,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (build_context.livepatch && !is_foreign) {
 			bool is_refresh = lb_is_livepatch_refresh_global(e, decl);
 			if (is_refresh) {
-				// Immutable embedded data (@(rodata)/#load): normal global, recorded for the
-				// loader to repoint. See tech_design.md §10.
 				lbLivePatchRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
 				array_add(&gen->livepatch_refresh_syms, rs);
 			}
@@ -4038,14 +3993,12 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 				u64 th = type_hash_canonical_type(e->type);
 				u64 *orig_th = string_map_get(&livepatch_manifest.orig, name);
 				if (orig_th != nullptr) {
-					// Original global: emit normally below; the loader preserves/repoints it.
 					if (*orig_th != th) {
-						error(e->token, "livepatch: global '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
+						error(e->token, "livepatch: global '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
 					}
 				} else if (is_refresh) {
-					// New refresh global: emit object-local below, resolved fresh each reload.
 				} else if (e->Variable.thread_local_model.len != 0) {
-					// New thread-local -> per-thread TLS arena. See tech_design.md §5.
+					// New thread-local -> per-thread TLS arena
 					i64 offset = 0;
 					LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.tls_newg, name);
 					if (ne != nullptr) {
@@ -4075,8 +4028,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 					lb_add_member(m, name, g);
 					continue;
 				} else {
-					// New global -> arena. Initializer: zero/const (loader copies once) or
-					// runtime (unsupported). See tech_design.md §4.
+					// New global
 					bool has_const_init = false;
 					bool runtime_init   = false;
 					lbValue init = {};
@@ -4100,7 +4052,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 						}
 					}
 					if (runtime_init) {
-						error(e->token, "livepatch: new global '%.*s' has a non-constant initializer; only compile-time constant initializers are supported for a global introduced across a reload (runtime initializers and new @(init) are not yet supported)", LIT(name));
+						error(e->token, "livepatch: new global '%.*s' has a non-constant initializer. Only compile-time constant initializers are supported for a global introduced across a reload", LIT(name));
 					}
 
 					i64 offset   = 0;
@@ -4110,7 +4062,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 						offset   = ne->offset;
 						flag_off = ne->init_flag_offset;
 						if (ne->type_hash != th) {
-							error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
+							error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
 						}
 					} else {
 						i64 al = gb_max(type_align_of(e->type), 1);
@@ -4162,7 +4114,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (decl->init_expr != nullptr) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
 			if (build_context.livepatch && lb_call_basic_directive_name(decl->init_expr) == "load_directory") {
-				// Bake the #load_directory const slice so the object carries a repointable header. See tech_design.md §10.
 				lbValue init = lb_const_load_directory_slice(m, unparen_expr(decl->init_expr));
 				LLVMDeleteGlobal(g.value);
 				g.value = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), alloc_cstring(permanent_allocator(), name));
@@ -4216,6 +4167,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (is_export) {
 			LLVMSetLinkage(g.value, LLVMDLLExportLinkage);
 			LLVMSetDLLStorageClass(g.value, LLVMDLLExportStorageClass);
+		} else if (build_context.livepatch && !is_foreign && lb_is_livepatch_refresh_global(e, decl)) {
+			LLVMSetLinkage(g.value, LLVMExternalLinkage);
 		} else if (!is_foreign) {
 			LLVM_SET_INTERNAL_WEAK_LINKAGE(g.value);
 		}
@@ -4229,8 +4182,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, g.value);
 		}
 
-		// Livepatch: record the raw thread_local global for a later TLS accessor thunk. See
-		// tech_design.md §5. `g.value` is still the raw global here, before the cast below.
 		if (build_context.livepatch && !is_foreign && e->Variable.thread_local_model.len != 0) {
 			lbLivePatchStaticSym s = {name, g.value, type_hash_canonical_type(e->type), m};
 			array_add(&gen->livepatch_tls_syms, s);
@@ -4249,15 +4200,13 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 				u32 align_in_bits = cast(u32)(8*type_align_of(e->type));
 
-				// Under -livepatch use the link name as the debug name so a reloaded global
-				// resolves to the exe's copy via the PDB. See tech_design.md §9.
 				String dbg_name = build_context.livepatch ? name : global_name;
 				char const *link_name = build_context.livepatch ? cast(char const *)name.text : "";
 				isize       link_len  = build_context.livepatch ? name.len                  : 0;
 				LLVMMetadataRef global_variable_metadata = LLVMDIBuilderCreateGlobalVariableExpression(
 					m->debug_builder, llvm_scope,
 					cast(char const *)dbg_name.text, dbg_name.len,
-					link_name, link_len, // linkage name (PDB-resolvable under -livepatch)
+					link_name, link_len,
 					llvm_file, e->token.pos.line,
 					lb_debug_type(m, e->type),
 					local_to_unit,
@@ -4361,14 +4310,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		TIME_SECTION("LLVM Livepatch Support Symbols");
 		lb_livepatch_emit_support(gen);
 
-		// Patch-hook name tables (§11). Change-detection hashes (§6). Build-id (§6). All after
-		// procedure generation so every proc/static is included.
 		lb_livepatch_emit_patch_hook_table(gen, info, true,  "__odin_livepatch_pre_patch_hooks");
 		lb_livepatch_emit_patch_hook_table(gen, info, false, "__odin_livepatch_post_patch_hooks");
 		lb_livepatch_emit_func_hashes(gen);
-		lb_livepatch_emit_build_id(gen); // after func hashes: needs the complete `sig` map
+		lb_livepatch_emit_build_id(gen);
 
-		// Once-only init table for new globals with const initializers. See tech_design.md §4, §13.
 		if (livepatch_inits.count > 0) {
 			lbModule *m = &gen->default_module;
 			LLVMTypeRef i64t = lb_type(m, t_i64);
@@ -4397,11 +4343,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			LLVMSetInitializer(tbl, tbl_val);
 			LLVMSetGlobalConstant(tbl, true);
 			LLVMSetLinkage(tbl, LLVMInternalLinkage);
-			lb_append_to_compiler_used(m, tbl); // the loader reads it by name; keep it from being stripped
+			lb_append_to_compiler_used(m, tbl); 
 		}
 
-		// Refresh table for @(rodata)/#load globals: a self-contained blob [count]{size,name_len,name}.
-		// See tech_design.md §10, §13.
 		if (gen->livepatch_refresh_syms.count > 0) {
 			lbModule *m = &gen->default_module;
 			auto buf = array_make<u8>(heap_allocator(), 0, 256);
@@ -4423,7 +4367,6 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			array_free(&buf);
 		}
 
-		// Persist the manifest (originals + assigned arena offsets). See tech_design.md §3.
 		livepatch_manifest_write(&livepatch_manifest);
 		array_free(&livepatch_inits);
 		array_free(&gen->livepatch_refresh_syms);
