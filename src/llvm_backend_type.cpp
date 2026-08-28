@@ -1123,6 +1123,25 @@ gb_internal void lb_setup_type_info_data_giant_array(lbModule *m, i64 global_typ
 }
 
 
+// lb_livepatch_emit_type_table_syms emits the two externals the loader needs to refresh reflection
+// after a reload: __odin_livepatch_type_infos (the reload's complete []^Type_Info slice value) and
+// __odin_livepatch_type_table_ref (a pointer to the live runtime.type_table slice header to swap).
+gb_internal void lb_livepatch_emit_type_table_syms(lbModule *m, lbValue global_type_table, LLVMValueRef slice) {
+	Type *slice_type = type_deref(global_type_table.type);
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_livepatch_type_infos");
+	LLVMSetInitializer(tbl, slice);
+	LLVMSetGlobalConstant(tbl, true);
+	LLVMSetLinkage(tbl, LLVMExternalLinkage);
+	lb_append_to_used(m, tbl);
+
+	LLVMTypeRef ref_ty = LLVMPointerType(lb_type(m, slice_type), 0);
+	LLVMValueRef ref = LLVMAddGlobal(m->mod, ref_ty, "__odin_livepatch_type_table_ref");
+	LLVMSetInitializer(ref, global_type_table.value);
+	LLVMSetGlobalConstant(ref, true);
+	LLVMSetLinkage(ref, LLVMExternalLinkage);
+	lb_append_to_used(m, ref);
+}
+
 gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup type_info data
 	if (build_context.no_rtti) {
 		return;
@@ -1154,18 +1173,6 @@ gb_internal void lb_setup_type_info_data(lbModule *m) { // NOTE(bill): Setup typ
 	LLVMSetGlobalConstant(global_type_table.value, true);
 
 	if (build_context.livepatch) {
-		Type *slice_type = type_deref(global_type_table.type);
-		LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_livepatch_type_infos");
-		LLVMSetInitializer(tbl, slice);
-		LLVMSetGlobalConstant(tbl, true);
-		LLVMSetLinkage(tbl, LLVMExternalLinkage);
-		lb_append_to_used(m, tbl);
-		
-		LLVMTypeRef ref_ty = LLVMPointerType(lb_type(m, slice_type), 0);
-		LLVMValueRef ref = LLVMAddGlobal(m->mod, ref_ty, "__odin_livepatch_type_table_ref");
-		LLVMSetInitializer(ref, global_type_table.value);
-		LLVMSetGlobalConstant(ref, true);
-		LLVMSetLinkage(ref, LLVMExternalLinkage);
-		lb_append_to_used(m, ref);
+		lb_livepatch_emit_type_table_syms(m, global_type_table, slice);
 	}
 }

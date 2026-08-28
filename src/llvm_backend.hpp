@@ -272,6 +272,7 @@ struct lbGenerator : LinkerData {
 
 gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal LLVMValueRef lb_livepatch_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+gb_internal u64 lb_livepatch_layout_hash(Type *t);
 gb_internal bool lb_is_load_directive_expr(Ast *expr);
 gb_internal String lb_call_basic_directive_name(Ast *expr);
 

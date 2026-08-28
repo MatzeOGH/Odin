@@ -145,6 +145,13 @@ lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
 			if sa.names[i] != sb.names[i] || sa.offsets[i] != sb.offsets[i] {
 				return true
 			}
+			// A field retyped to a same-size type (e.g. i32 -> f32) keeps its offset but
+			// changes how the bytes are interpreted; compare the field type identity too,
+			// otherwise reflection would keep showing the old field type after a reload.
+			fa, fb := sa.types[i], sb.types[i]
+			if fa != nil && fb != nil && fa.id != fb.id {
+				return true
+			}
 		}
 		return false
 	}
@@ -303,6 +310,12 @@ lp_type_table_needs_swap :: proc(data: []byte, sym_off, n_syms, strtab_off: int,
 	return false
 }
 
+// lp_contains_changed reports whether `ti` is, or transitively embeds BY VALUE, a directly
+// changed type. It deliberately recurses only through value-embedding aggregates (struct fields,
+// (enumerated) array elements, union variants) — the same set as the compiler-side
+// lb_livepatch_layout_hash and lp_layout_differs. It intentionally does NOT follow pointers,
+// slices, maps or dynamic arrays: their header layout is unaffected by the pointee/element type
+// changing, and stopping there also keeps the recursion finite.
 @(private)
 lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[string]bool, memo: ^map[rawptr]bool) -> bool {
 	if ti == nil {
@@ -641,6 +654,28 @@ apply_many :: proc(obj_paths: []string) -> bool {
 
 	objs := make([dynamic]Obj, 0, len(obj_paths), context.temp_allocator)
 
+	// Until we start modifying the running image (refresh/type-table swap/patch), the obj
+	// blocks + their registered unwind tables are owned by nobody, so any early `return false`
+	// (bad read, alloc failure, build-id mismatch, unresolved symbol, ...) would leak them and
+	// leave stale RtlAddFunctionTable registrations — very common in an edit loop. This defer
+	// reclaims them on every such path. Once patching begins we set `committed = true`: from
+	// that point the running exe may reference the blocks (patched jumps, swapped type_table),
+	// so they must NOT be freed here — they are handed to a reload generation instead.
+	committed := false
+	defer if !committed {
+		for &o in objs {
+			for p in o.pdata_regs {
+				win.RtlDeleteFunctionTable(p)
+			}
+			if o.block != nil {
+				win.VirtualFree(o.block, 0, win.MEM_RELEASE)
+			}
+			if o.near_arena.block != nil {
+				win.VirtualFree(o.near_arena.block, 0, win.MEM_RELEASE)
+			}
+		}
+	}
+
 	for path in obj_paths {
 		data, err := os.read_entire_file(path, context.temp_allocator)
 		if err != nil {
@@ -741,6 +776,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	all_defs := make(map[string]rawptr, context.temp_allocator)
 	Hot :: struct { name: string, obj: int }
 	hot_names := make([dynamic]Hot, context.temp_allocator)
+	hot_detect_misses := 0 // changed, existing, livepatchable procs whose prologue failed pad detection
 	for &o, oi in objs {
 		i := 0
 		for i < o.n_syms {
@@ -757,9 +793,21 @@ apply_many :: proc(obj_paths: []string) -> bool {
 					if _, seen := all_syms[name]; !seen {
 						exe_addr := lp_resolve_pdb(name)
 						is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
-						if exe_addr != nil && is_code && lp_is_hot_entry(exe_addr) && lp_proc_changed(name, obj_hashes, have_obj_hashes) {
-							all_syms[name] = obj_addr
-							append(&hot_names, Hot{name, oi})
+						if exe_addr != nil && is_code {
+							changed := lp_proc_changed(name, obj_hashes, have_obj_hashes)
+							hot := lp_is_hot_entry(exe_addr)
+							if changed && hot {
+								all_syms[name] = obj_addr
+								append(&hot_names, Hot{name, oi})
+							} else {
+								// A known-livepatchable (present in the func-hash table), existing,
+								// changed proc that fails pad detection means the structural pad
+								// heuristic likely broke — surface it rather than silently skipping.
+								if !hot && changed && have_obj_hashes && lp_fnv64(name) in obj_hashes {
+									hot_detect_misses += 1
+								}
+								all_syms[name] = exe_addr
+							}
 						} else if exe_addr != nil {
 							all_syms[name] = exe_addr
 						} else {
@@ -770,6 +818,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			}
 			i += 1 + int(sym.number_of_aux_symbols)
 		}
+	}
+
+	if hot_detect_misses > 0 {
+		fmt.eprintfln("[livepatch] WARNING: %d changed livepatchable procedure(s) exist in the running exe but their prologue did not match a patch pad; hot-proc detection may be broken (did the compiler's patchable-function-prefix NOP encoding change?). These procedures were NOT patched.", hot_detect_misses)
 	}
 
 	unresolved, unsupported := 0, 0
@@ -1004,17 +1056,8 @@ apply_many :: proc(obj_paths: []string) -> bool {
 
 	if len(hot_names) == 0 && len(refresh_targets) == 0 && !swap_type_table {
 		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
-		for &o in objs {
-			for p in o.pdata_regs {
-				win.RtlDeleteFunctionTable(p)
-			}
-			if o.block != nil {
-				win.VirtualFree(o.block, 0, win.MEM_RELEASE)
-			}
-			if o.near_arena.block != nil {
-				win.VirtualFree(o.near_arena.block, 0, win.MEM_RELEASE)
-			}
-		}
+		// Nothing was patched, so the obj blocks + their unwind registrations are reclaimed by
+		// the early-return cleanup defer (committed is still false on this no-patch path).
 		if have_obj_hashes {
 			for k, v in obj_hashes {
 				_lp_cur[k] = v
@@ -1074,6 +1117,11 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	_lp_serial += 1
 	gen_serial := _lp_serial
 	gen_owned := make([dynamic]uintptr, runtime.heap_allocator())
+
+	// From here on the running image may reference the obj blocks (refreshed data is copied,
+	// but the type_table swap and patched jumps point INTO them). The blocks are handed to a
+	// reload generation below; the early-return cleanup defer must no longer free them.
+	committed = true
 
 	for r in refresh_targets {
 		old: win.DWORD
@@ -1203,18 +1251,65 @@ PAD_LEN   :: 16
 
 LP_DEBUG_PAD :: #config(LP_DEBUG_PAD, false)
 
+// The compiler-emitted patch pad is a PAD_LEN-byte `patchable-function-prefix`, filled by LLVM's
+// NOP emitter. That is NOT guaranteed to be a run of single-byte 0x90s — LLVM emits multi-byte
+// NOP encodings (`0F 1F ...`, with `66` operand-size prefixes for longer forms). Decoding the pad
+// as a NOP sled (rather than hard-coding 0x90) keeps hot-proc detection working across LLVM
+// NOP-encoding changes. lp_nop_len decodes ONE x86-64 NOP at p and returns its byte length (0 if
+// not a NOP); lp_is_nop_sled checks that exactly n bytes decode as back-to-back NOPs.
+@(private)
+lp_nop_len :: proc(p: [^]u8, max: int) -> int {
+	i := 0
+	for i < max && p[i] == 0x66 { // operand-size prefixes pad out the longer NOP forms
+		i += 1
+	}
+	if i >= max {
+		return 0
+	}
+	if p[i] == 0x90 { // 1-byte NOP (with any leading 0x66 prefixes)
+		return i + 1
+	}
+	if i + 2 < max && p[i] == 0x0F && p[i + 1] == 0x1F { // multi-byte NOP: 0F 1F /0 r/m
+		modrm := p[i + 2]
+		n := i + 3
+		mod := modrm >> 6
+		rm  := modrm & 0x7
+		if rm == 0x4 { // SIB byte follows
+			n += 1
+		}
+		switch mod {
+		case 1: n += 1 // disp8
+		case 2: n += 4 // disp32
+		case 0:
+			if rm == 0x5 { n += 4 } // disp32
+		}
+		if n <= max {
+			return n
+		}
+	}
+	return 0
+}
+
+@(private)
+lp_is_nop_sled :: proc(pb: [^]u8, n: int) -> bool {
+	i := 0
+	for i < n {
+		l := lp_nop_len(([^]u8)(&pb[i]), n - i)
+		if l <= 0 {
+			return false
+		}
+		i += l
+	}
+	return i == n
+}
+
 @(private)
 lp_has_patch_pad :: proc(entry: rawptr) -> bool {
 	pb := ([^]u8)(rawptr(uintptr(entry) - PAD_LEN))
-	if pb[0] == 0xFF && pb[1] == 0x25 {
+	if pb[0] == 0xFF && pb[1] == 0x25 { // an abs jump we already installed
 		return true
 	}
-	for i in 0 ..< PATCH_LEN {
-		if pb[i] != 0x90 && pb[i] != 0xCC {
-			return false
-		}
-	}
-	return true
+	return lp_is_nop_sled(pb, PAD_LEN)
 }
 
 @(private)
@@ -1226,12 +1321,7 @@ lp_is_hot_entry :: proc(entry: rawptr) -> bool {
 	if pb[0] == 0xFF && pb[1] == 0x25 {
 		return true
 	}
-	for i in 0 ..< PAD_LEN {
-		if pb[i] != 0x90 {
-			return false
-		}
-	}
-	return true
+	return lp_is_nop_sled(pb, PAD_LEN)
 }
 
 @(private)

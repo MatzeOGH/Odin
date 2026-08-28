@@ -3376,6 +3376,75 @@ gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl) {
 	return decl != nullptr && lb_is_load_directive_expr(decl->init_expr);
 }
 
+gb_internal u64 lb_livepatch_hash_mix(u64 h, u64 v) {
+	h ^= v;
+	h *= 0x100000001b3ull; // FNV-1a 64-bit prime
+	return h;
+}
+
+// lb_livepatch_layout_hash returns a hash of a type's *transitive in-memory layout*, unlike
+// the nominal `type_hash_canonical_type` (which, for a named struct, writes only `pkg.Name` and
+// so does NOT change when the struct gains/reorders/retypes a field). The livepatch guards use
+// this so that changing the layout of a struct held BY VALUE in a preserved/new global is
+// detected and rejected (its frozen storage cannot be reinterpreted safely).
+//
+// It recurses only through *value-embedding* aggregates — struct fields, fixed arrays, and union
+// variants — mixing in size/align/offsets at each level. It STOPS at pointers, slices, maps,
+// dynamic arrays and proc values: those are fixed-size headers whose own storage does not change
+// when the pointee/element layout changes (this is what keeps a `state: rawptr` global — the
+// pattern the migration examples rely on — from being flagged). Stopping at pointers also makes
+// the recursion acyclic (a struct cannot embed itself by value).
+gb_internal u64 lb_livepatch_layout_hash(Type *t) {
+	if (t == nullptr) {
+		return 0;
+	}
+	u64 h = 0xcbf29ce484222325ull; // FNV-1a 64-bit offset basis
+	h = lb_livepatch_hash_mix(h, cast(u64)type_size_of(t));
+	h = lb_livepatch_hash_mix(h, cast(u64)type_align_of(t));
+
+	Type *b = base_type(t);
+	if (b == nullptr) {
+		return h;
+	}
+	switch (b->kind) {
+	case Type_Struct:
+		h = lb_livepatch_hash_mix(h, cast(u64)(b->Struct.is_packed ? 1 : 0));
+		h = lb_livepatch_hash_mix(h, cast(u64)(b->Struct.is_raw_union ? 2 : 0));
+		h = lb_livepatch_hash_mix(h, cast(u64)b->Struct.fields.count);
+		for_array(i, b->Struct.fields) {
+			Entity *f = b->Struct.fields[i];
+			h = lb_livepatch_hash_mix(h, fnv64a(f->token.string.text, f->token.string.len));
+			if (b->Struct.offsets != nullptr) {
+				h = lb_livepatch_hash_mix(h, cast(u64)b->Struct.offsets[i]);
+			}
+			h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(f->type));
+		}
+		break;
+	case Type_Array:
+		h = lb_livepatch_hash_mix(h, cast(u64)b->Array.count);
+		h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->Array.elem));
+		break;
+	case Type_EnumeratedArray:
+		h = lb_livepatch_hash_mix(h, cast(u64)b->EnumeratedArray.count);
+		h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->EnumeratedArray.elem));
+		break;
+	case Type_Union:
+		h = lb_livepatch_hash_mix(h, cast(u64)b->Union.variants.count);
+		for_array(i, b->Union.variants) {
+			h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->Union.variants[i]));
+		}
+		break;
+	default:
+		// Basic, Enum (canonical string already encodes names+values), Bit_Set/Bit_Field
+		// (encoded structurally), and all indirection kinds (Pointer/Slice/Map/Dynamic_Array/
+		// Proc/...) whose header storage is layout-stable. The nominal canonical hash captures
+		// identity + enum/bit reordering without following indirection.
+		h = lb_livepatch_hash_mix(h, type_hash_canonical_type(b));
+		break;
+	}
+	return h;
+}
+
 gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 	TEMPORARY_ALLOCATOR_GUARD();
 	char *ir = LLVMPrintValueToString(p->value);
@@ -3603,6 +3672,210 @@ gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInf
 	LLVMSetGlobalConstant(tbl, true);
 	LLVMSetLinkage(tbl, LLVMExternalLinkage);
 	lb_append_to_used(m, tbl);
+}
+
+// Emits __odin_livepatch_new_global_inits: {i64 count, {i64 arena_offset, i64 flag_offset,
+// i64 size, rawptr blob}[]} — the const initializers the loader copies into fresh arena slots.
+gb_internal void lb_livepatch_emit_new_global_inits(lbGenerator *gen) {
+	if (gen->livepatch_inits.count == 0) {
+		return;
+	}
+	lbModule *m = &gen->default_module;
+	LLVMTypeRef i64t = lb_type(m, t_i64);
+	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
+	LLVMTypeRef entry_field_types[4] = { i64t, i64t, i64t, ptrt };
+	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 4, false);
+
+	auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, gen->livepatch_inits.count);
+	for (LivePatchInitEntry const &ie : gen->livepatch_inits) {
+		LLVMValueRef fields[4] = {};
+		fields[0] = LLVMConstInt(i64t, cast(u64)ie.arena_offset, false);
+		fields[1] = LLVMConstInt(i64t, cast(u64)ie.flag_offset, false);
+		fields[2] = LLVMConstInt(i64t, cast(u64)ie.size, false);
+		fields[3] = LLVMConstPointerCast(ie.blob, ptrt);
+		array_add(&entry_vals, LLVMConstStructInContext(m->ctx, fields, 4, false));
+	}
+	LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entry_vals.count);
+	LLVMValueRef arr = LLVMConstArray(entry_t, entry_vals.data, cast(unsigned)entry_vals.count);
+
+	LLVMTypeRef tbl_field_types[2] = { i64t, arr_t };
+	LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
+	LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
+	LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
+
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_livepatch_new_global_inits");
+	LLVMSetInitializer(tbl, tbl_val);
+	LLVMSetGlobalConstant(tbl, true);
+	LLVMSetLinkage(tbl, LLVMInternalLinkage);
+	lb_append_to_compiler_used(m, tbl);
+}
+
+// Emits __odin_livepatch_refresh_syms: a length-prefixed blob {u64 count, {u64 size, u64 name_len,
+// name bytes}[]} naming the @(rodata)/#load globals the loader refreshes in place.
+gb_internal void lb_livepatch_emit_refresh_syms(lbGenerator *gen) {
+	if (gen->livepatch_refresh_syms.count == 0) {
+		return;
+	}
+	lbModule *m = &gen->default_module;
+	auto buf = array_make<u8>(heap_allocator(), 0, 256);
+	lb_livepatch_put_u64_le(&buf, cast(u64)gen->livepatch_refresh_syms.count);
+	for (lbLivePatchRefreshSym const &rs : gen->livepatch_refresh_syms) {
+		lb_livepatch_put_u64_le(&buf, cast(u64)rs.size);
+		lb_livepatch_put_u64_le(&buf, cast(u64)rs.name.len);
+		for (isize i = 0; i < rs.name.len; i++) {
+			array_add(&buf, rs.name.text[i]);
+		}
+	}
+	LLVMValueRef blob = LLVMConstStringInContext(m->ctx, cast(char const *)buf.data, cast(unsigned)buf.count, true);
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_livepatch_refresh_syms");
+	LLVMSetInitializer(tbl, blob);
+	LLVMSetGlobalConstant(tbl, true);
+	LLVMSetLinkage(tbl, LLVMInternalLinkage);
+	LLVMSetAlignment(tbl, 8);
+	lb_append_to_compiler_used(m, tbl);
+	array_free(&buf);
+}
+
+// lb_livepatch_handle_global emits a package-scope global under -livepatch. It records refresh
+// globals + the base-build layout baseline, enforces the reload layout guard, and routes NEW
+// globals / thread-locals introduced by a reload into the persistent (TLS) arena. Returns true
+// if it fully emitted the global (the caller should `continue`); false if the caller should fall
+// through to normal emission (base build, a preserved global, or a refresh global). Assumes
+// build_context.livepatch && !is_foreign. This keeps the ~120-line livepatch block out of the
+// general lb_generate_code loop; the @(static) path mirrors it in lb_build_static_variables.
+gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entity *e, DeclInfo *decl, String name, Array<lbGlobalVariable> *global_variables) {
+	LivePatchManifest &livepatch_manifest = gen->livepatch_manifest;
+
+	bool is_refresh = lb_is_livepatch_refresh_global(e, decl);
+	if (is_refresh) {
+		lbLivePatchRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
+		array_add(&gen->livepatch_refresh_syms, rs);
+	}
+
+	if (!livepatch_manifest.exists) {
+		// base build: record the layout baseline (layout hash so a struct field change is detected)
+		string_map_set(&livepatch_manifest.orig, name, lb_livepatch_layout_hash(e->type));
+		return false;
+	}
+
+	u64 th = lb_livepatch_layout_hash(e->type);
+	u64 *orig_th = string_map_get(&livepatch_manifest.orig, name);
+	if (orig_th != nullptr) {
+		if (*orig_th != th) {
+			error(e->token, "livepatch: global '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
+		}
+		return false;
+	}
+	if (is_refresh) {
+		return false;
+	}
+
+	if (e->Variable.thread_local_model.len != 0) {
+		i64 offset = 0;
+		LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.tls_newg, name);
+		if (ne != nullptr) {
+			offset = ne->offset;
+			if (ne->type_hash != th) {
+				error(e->token, "livepatch: new thread-local '%.*s' changed type/layout across a reload. Its TLS arena storage cannot be reinterpreted safely", LIT(name));
+			}
+		} else {
+			i64 al = gb_max(type_align_of(e->type), 1);
+			i64 sz = gb_max(type_size_of(e->type), 1);
+			offset = align_formula(livepatch_manifest.tls_next_free, al);
+			livepatch_manifest.tls_next_free = offset + sz;
+			if (livepatch_manifest.tls_next_free > livepatch_manifest.tls_arena_size) {
+				error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)livepatch_manifest.tls_next_free, cast(long long)livepatch_manifest.tls_arena_size);
+			}
+			LivePatchNewEntry added = {offset, th, -1};
+			string_map_set(&livepatch_manifest.tls_newg, name, added);
+		}
+
+		lbGlobalVariable var = {};
+		var.decl = decl;
+		lbValue g = {};
+		g.type  = alloc_type_pointer(e->type);
+		g.value = lb_livepatch_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
+		var.is_initialized = true;
+		var.var = g;
+		array_add(global_variables, var);
+		lb_add_entity(m, e, g);
+		lb_add_member(m, name, g);
+		return true;
+	}
+
+	// New global introduced by the reload -> persistent arena slot.
+	bool has_const_init = false;
+	bool runtime_init   = false;
+	lbValue init = {};
+	if (decl->init_expr != nullptr) {
+		if (is_type_any(e->type)) {
+			runtime_init = true;
+		} else {
+			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
+			if (tav.mode != Addressing_Invalid && tav.value.kind != ExactValue_Invalid) {
+				if (!is_type_untyped_nil(tav.type)) {
+					auto cc = LB_CONST_CONTEXT_DEFAULT;
+					cc.allow_local = false;
+					init = lb_const_value(m, e->type, tav.value, cc);
+					if (init.value != nullptr && !LLVMIsNull(init.value)) {
+						has_const_init = true;
+					}
+				}
+			} else {
+				runtime_init = true;
+			}
+		}
+	}
+	if (runtime_init) {
+		error(e->token, "livepatch: new global '%.*s' has a non-constant initializer. Only compile-time constant initializers are supported for a global introduced across a reload", LIT(name));
+	}
+
+	i64 offset   = 0;
+	i64 flag_off = -1;
+	LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.newg, name);
+	if (ne != nullptr) {
+		offset   = ne->offset;
+		flag_off = ne->init_flag_offset;
+		if (ne->type_hash != th) {
+			error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
+		}
+	} else {
+		i64 al = gb_max(type_align_of(e->type), 1);
+		i64 sz = gb_max(type_size_of(e->type), 1);
+		offset = align_formula(livepatch_manifest.next_free, al);
+		livepatch_manifest.next_free = offset + sz;
+		if (has_const_init) {
+			flag_off = livepatch_manifest.next_free;
+			livepatch_manifest.next_free = flag_off + 1;
+		}
+		if (livepatch_manifest.next_free > livepatch_manifest.arena_size) {
+			error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). rebuild the exe with a larger -livepatch-arena-size", cast(long long)livepatch_manifest.next_free, cast(long long)livepatch_manifest.arena_size);
+		}
+		LivePatchNewEntry added = {offset, th, flag_off};
+		string_map_set(&livepatch_manifest.newg, name, added);
+
+		if (has_const_init) {
+			char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->livepatch_inits.count);
+			LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), blob_name);
+			LLVMSetInitializer(blob, init.value);
+			LLVMSetGlobalConstant(blob, true);
+			LLVMSetLinkage(blob, LLVMPrivateLinkage);
+			LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
+			array_add(&gen->livepatch_inits, ie);
+		}
+	}
+
+	lbGlobalVariable var = {};
+	var.decl = decl;
+	lbValue g = {};
+	g.type  = alloc_type_pointer(e->type);
+	g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
+	var.is_initialized = true;
+	var.var = g;
+	array_add(global_variables, var);
+	lb_add_entity(m, e, g);
+	lb_add_member(m, name, g);
+	return true;
 }
 
 gb_internal bool lb_generate_code(lbGenerator *gen) {
@@ -3971,123 +4244,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		var.decl = decl;
 
 		if (build_context.livepatch && !is_foreign) {
-			bool is_refresh = lb_is_livepatch_refresh_global(e, decl);
-			if (is_refresh) {
-				lbLivePatchRefreshSym rs = { name, gb_max(type_size_of(e->type), 1) };
-				array_add(&gen->livepatch_refresh_syms, rs);
-			}
-			if (livepatch_manifest.exists) {
-				u64 th = type_hash_canonical_type(e->type);
-				u64 *orig_th = string_map_get(&livepatch_manifest.orig, name);
-				if (orig_th != nullptr) {
-					if (*orig_th != th) {
-						error(e->token, "livepatch: global '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
-					}
-				} else if (is_refresh) {
-				} else if (e->Variable.thread_local_model.len != 0) {
-					i64 offset = 0;
-					LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.tls_newg, name);
-					if (ne != nullptr) {
-						offset = ne->offset;
-						if (ne->type_hash != th) {
-							error(e->token, "livepatch: new thread-local '%.*s' changed type/layout across a reload. Ilts TLS arena storage cannot be reinterpreted safely", LIT(name));
-						}
-					} else {
-						i64 al = gb_max(type_align_of(e->type), 1);
-						i64 sz = gb_max(type_size_of(e->type), 1);
-						offset = align_formula(livepatch_manifest.tls_next_free, al);
-						livepatch_manifest.tls_next_free = offset + sz;
-						if (livepatch_manifest.tls_next_free > livepatch_manifest.tls_arena_size) {
-							error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)livepatch_manifest.tls_next_free, cast(long long)livepatch_manifest.tls_arena_size);
-						}
-						LivePatchNewEntry added = {offset, th, -1};
-						string_map_set(&livepatch_manifest.tls_newg, name, added);
-					}
-
-					lbValue g = {};
-					g.type  = alloc_type_pointer(e->type);
-					g.value = lb_livepatch_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
-					var.is_initialized = true;
-					var.var = g;
-					array_add(&global_variables, var);
-					lb_add_entity(m, e, g);
-					lb_add_member(m, name, g);
-					continue;
-				} else {
-					// New global
-					bool has_const_init = false;
-					bool runtime_init   = false;
-					lbValue init = {};
-					if (decl->init_expr != nullptr) {
-						if (is_type_any(e->type)) {
-							runtime_init = true;
-						} else {
-							TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
-							if (tav.mode != Addressing_Invalid && tav.value.kind != ExactValue_Invalid) {
-								if (!is_type_untyped_nil(tav.type)) {
-									auto cc = LB_CONST_CONTEXT_DEFAULT;
-									cc.allow_local = false;
-									init = lb_const_value(m, e->type, tav.value, cc);
-									if (init.value != nullptr && !LLVMIsNull(init.value)) {
-										has_const_init = true;
-									}
-								}
-							} else {
-								runtime_init = true;
-							}
-						}
-					}
-					if (runtime_init) {
-						error(e->token, "livepatch: new global '%.*s' has a non-constant initializer. Only compile-time constant initializers are supported for a global introduced across a reload", LIT(name));
-					}
-
-					i64 offset   = 0;
-					i64 flag_off = -1;
-					LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.newg, name);
-					if (ne != nullptr) {
-						offset   = ne->offset;
-						flag_off = ne->init_flag_offset;
-						if (ne->type_hash != th) {
-							error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
-						}
-					} else {
-						i64 al = gb_max(type_align_of(e->type), 1);
-						i64 sz = gb_max(type_size_of(e->type), 1);
-						offset = align_formula(livepatch_manifest.next_free, al);
-						livepatch_manifest.next_free = offset + sz;
-						if (has_const_init) {
-							flag_off = livepatch_manifest.next_free;
-							livepatch_manifest.next_free = flag_off + 1;
-						}
-						if (livepatch_manifest.next_free > livepatch_manifest.arena_size) {
-							error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). rebuild the exe with a larger -livepatch-arena-size", cast(long long)livepatch_manifest.next_free, cast(long long)livepatch_manifest.arena_size);
-						}
-						LivePatchNewEntry added = {offset, th, flag_off};
-						string_map_set(&livepatch_manifest.newg, name, added);
-
-						if (has_const_init) {
-							char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)livepatch_inits.count);
-							LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), blob_name);
-							LLVMSetInitializer(blob, init.value);
-							LLVMSetGlobalConstant(blob, true);
-							LLVMSetLinkage(blob, LLVMPrivateLinkage);
-							LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
-							array_add(&livepatch_inits, ie);
-						}
-					}
-
-					lbValue g = {};
-					g.type  = alloc_type_pointer(e->type);
-					g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
-					var.is_initialized = true;
-					var.var = g;
-					array_add(&global_variables, var);
-					lb_add_entity(m, e, g);
-					lb_add_member(m, name, g);
-					continue;
-				}
-			} else {
-				string_map_set(&livepatch_manifest.orig, name, type_hash_canonical_type(e->type)); // base build: record as original
+			if (lb_livepatch_handle_global(gen, m, e, decl, name, &global_variables)) {
+				continue;
 			}
 		}
 
@@ -4299,57 +4457,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_livepatch_emit_func_hashes(gen);
 		lb_livepatch_emit_build_id(gen);
 
-		if (livepatch_inits.count > 0) {
-			lbModule *m = &gen->default_module;
-			LLVMTypeRef i64t = lb_type(m, t_i64);
-			LLVMTypeRef ptrt = lb_type(m, t_rawptr);
-			LLVMTypeRef entry_field_types[4] = { i64t, i64t, i64t, ptrt };
-			LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 4, false);
-
-			auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, livepatch_inits.count);
-			for (LivePatchInitEntry const &ie : livepatch_inits) {
-				LLVMValueRef fields[4] = {};
-				fields[0] = LLVMConstInt(i64t, cast(u64)ie.arena_offset, false);
-				fields[1] = LLVMConstInt(i64t, cast(u64)ie.flag_offset, false);
-				fields[2] = LLVMConstInt(i64t, cast(u64)ie.size, false);
-				fields[3] = LLVMConstPointerCast(ie.blob, ptrt);
-				array_add(&entry_vals, LLVMConstStructInContext(m->ctx, fields, 4, false));
-			}
-			LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entry_vals.count);
-			LLVMValueRef arr = LLVMConstArray(entry_t, entry_vals.data, cast(unsigned)entry_vals.count);
-
-			LLVMTypeRef tbl_field_types[2] = { i64t, arr_t };
-			LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
-			LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
-			LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
-
-			LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_livepatch_new_global_inits");
-			LLVMSetInitializer(tbl, tbl_val);
-			LLVMSetGlobalConstant(tbl, true);
-			LLVMSetLinkage(tbl, LLVMInternalLinkage);
-			lb_append_to_compiler_used(m, tbl); 
-		}
-
-		if (gen->livepatch_refresh_syms.count > 0) {
-			lbModule *m = &gen->default_module;
-			auto buf = array_make<u8>(heap_allocator(), 0, 256);
-			lb_livepatch_put_u64_le(&buf, cast(u64)gen->livepatch_refresh_syms.count);
-			for (lbLivePatchRefreshSym const &rs : gen->livepatch_refresh_syms) {
-				lb_livepatch_put_u64_le(&buf, cast(u64)rs.size);
-				lb_livepatch_put_u64_le(&buf, cast(u64)rs.name.len);
-				for (isize i = 0; i < rs.name.len; i++) {
-					array_add(&buf, rs.name.text[i]);
-				}
-			}
-			LLVMValueRef blob = LLVMConstStringInContext(m->ctx, cast(char const *)buf.data, cast(unsigned)buf.count, true);
-			LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_livepatch_refresh_syms");
-			LLVMSetInitializer(tbl, blob);
-			LLVMSetGlobalConstant(tbl, true);
-			LLVMSetLinkage(tbl, LLVMInternalLinkage);
-			LLVMSetAlignment(tbl, 8);
-			lb_append_to_compiler_used(m, tbl);
-			array_free(&buf);
-		}
+		lb_livepatch_emit_new_global_inits(gen);
+		lb_livepatch_emit_refresh_syms(gen);
 
 		livepatch_manifest_write(&livepatch_manifest);
 		array_free(&livepatch_inits);

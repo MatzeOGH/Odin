@@ -3123,6 +3123,24 @@ gb_internal void generate_minimum_dependency_set_internal(Checker *c, Entity *st
 	}
 }
 
+// Under -livepatch, force type_info for every entity (and its recorded type-info deps) into the
+// minimum dependency set, so the frozen exe's runtime.type_table is complete enough for reflection
+// over — and migration of — types a later reload edits. Pairs with lb_livepatch_emit_type_table_syms.
+gb_internal void generate_livepatch_type_info_deps(Checker *c) {
+	for (Entity *e : c->info.entities) {
+		if (e == nullptr || e->type == nullptr) {
+			continue;
+		}
+		add_min_dep_type_info(c, e->type);
+		DeclInfo *d = decl_info_of_entity(e);
+		if (d != nullptr) {
+			for (TypeInfoPair const tt : d->type_info_deps) {
+				add_min_dep_type_info(c, tt.type);
+			}
+		}
+	}
+}
+
 gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 #define FORCE_ADD_RUNTIME_ENTITIES(condition, ...) do {                                              \
 	if (condition) {                                                                             \
@@ -3225,19 +3243,7 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 	thread_pool_wait();
 
 	if (build_context.livepatch && !build_context.no_rtti) {
-		// emit type_info for livepatch
-		for (Entity *e : c->info.entities) {
-			if (e == nullptr || e->type == nullptr) {
-				continue;
-			}
-			add_min_dep_type_info(c, e->type);
-			DeclInfo *d = decl_info_of_entity(e);
-			if (d != nullptr) {
-				for (TypeInfoPair const tt : d->type_info_deps) {
-					add_min_dep_type_info(c, tt.type);
-				}
-			}
-		}
+		generate_livepatch_type_info_deps(c);
 	}
 
 

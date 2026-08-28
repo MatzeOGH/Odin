@@ -2413,6 +2413,118 @@ gb_internal void lb_build_type_switch_stmt(lbProcedure *p, AstTypeSwitchStmt *ss
 }
 
 
+// lb_livepatch_handle_static_variable is the @(static)-local mirror of lb_livepatch_handle_global:
+// it enforces the reload layout guard and routes NEW @(static) vars / thread-locals into the
+// persistent (TLS) arena, keyed by their mangled name. Returns true if it fully emitted the
+// variable (caller should `continue`), false to fall through to normal @(static) emission
+// (base build, preserved var, refresh var). Takes gen->livepatch_mutex internally.
+gb_internal bool lb_livepatch_handle_static_variable(lbGenerator *gen, lbModule *m, Entity *e, String name, String mangled_name, lbValue value, bool is_thread_local, bool is_refresh) {
+	LivePatchManifest &hm = gen->livepatch_manifest;
+	u64 th = lb_livepatch_layout_hash(e->type);
+
+	bool is_new = false;
+	mutex_lock(&gen->livepatch_mutex);
+	if (is_refresh) {
+		lbLivePatchRefreshSym rs = { mangled_name, gb_max(type_size_of(e->type), 1) };
+		array_add(&gen->livepatch_refresh_syms, rs);
+	}
+	if (hm.exists) {
+		u64 *orig_th = string_map_get(&hm.orig, mangled_name);
+		if (orig_th != nullptr) {
+			if (*orig_th != th) {
+				error(e->token, "livepatch: @(static) variable '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
+			}
+		} else {
+			is_new = true;
+		}
+	} else {
+		string_map_set(&hm.orig, mangled_name, th);
+	}
+
+	if (is_thread_local && is_new) {
+		i64 offset = 0;
+		LivePatchNewEntry *ne = string_map_get(&hm.tls_newg, mangled_name);
+		if (ne != nullptr) {
+			offset = ne->offset;
+			if (ne->type_hash != th) {
+				error(e->token, "livepatch: new thread-local @(static) variable '%.*s' changed type/layout across a reload. Its TLS arena storage cannot be reinterpreted safely", LIT(name));
+			}
+		} else {
+			i64 al = gb_max(type_align_of(e->type), 1);
+			i64 sz = gb_max(type_size_of(e->type), 1);
+			offset = align_formula(hm.tls_next_free, al);
+			hm.tls_next_free = offset + sz;
+			if (hm.tls_next_free > hm.tls_arena_size) {
+				error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)hm.tls_next_free, cast(long long)hm.tls_arena_size);
+			}
+			LivePatchNewEntry added = {offset, th, -1};
+			string_map_set(&hm.tls_newg, mangled_name, added);
+		}
+		mutex_unlock(&gen->livepatch_mutex);
+
+		lbValue g = {};
+		g.type  = alloc_type_pointer(e->type);
+		g.value = lb_livepatch_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
+		lb_add_entity(m, e, g);
+		lb_add_member(m, mangled_name, g);
+		return true;
+	} else if (is_thread_local) {
+		mutex_unlock(&gen->livepatch_mutex);
+		return false;
+	} else if (is_new && !is_refresh) {
+		if (is_type_any(e->type)) {
+			error(e->token, "livepatch: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
+		}
+		bool has_const_init = value.value != nullptr && !LLVMIsNull(value.value);
+
+		i64 offset   = 0;
+		i64 flag_off = -1;
+		LivePatchNewEntry *ne = string_map_get(&hm.newg, mangled_name);
+		if (ne != nullptr) {
+			offset   = ne->offset;
+			flag_off = ne->init_flag_offset;
+			if (ne->type_hash != th) {
+				error(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
+			}
+		} else {
+			i64 al = gb_max(type_align_of(e->type), 1);
+			i64 sz = gb_max(type_size_of(e->type), 1);
+			offset = align_formula(hm.next_free, al);
+			hm.next_free = offset + sz;
+			if (has_const_init) {
+				flag_off = hm.next_free;
+				hm.next_free = flag_off + 1;
+			}
+			if (hm.next_free > hm.arena_size) {
+				error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
+			}
+			LivePatchNewEntry added = {offset, th, flag_off};
+			string_map_set(&hm.newg, mangled_name, added);
+
+			if (has_const_init) {
+				char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->livepatch_inits.count);
+				LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(value.value), blob_name);
+				LLVMSetInitializer(blob, value.value);
+				LLVMSetGlobalConstant(blob, true);
+				LLVMSetLinkage(blob, LLVMPrivateLinkage);
+				LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
+				array_add(&gen->livepatch_inits, ie);
+			}
+		}
+		mutex_unlock(&gen->livepatch_mutex);
+
+		lbValue g = {};
+		g.type  = alloc_type_pointer(e->type);
+		g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
+		lb_add_entity(m, e, g);
+		lb_add_member(m, mangled_name, g);
+		return true;
+	} else {
+		mutex_unlock(&gen->livepatch_mutex);
+		return false;
+	}
+}
+
 gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 	lbModule *m = p->module;
 	lbGenerator *gen = m->gen;
@@ -2466,111 +2578,11 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 		}
 
 		if (livepatch) {
-			u64 th = type_hash_canonical_type(e->type);
-			LivePatchManifest &hm = gen->livepatch_manifest;
-
 			String init_dir = vd->values.count > 0 ? lb_call_basic_directive_name(vd->values[i]) : str_lit("");
 			bool is_refresh = e->Variable.is_rodata ||
 			                  init_dir == "load" || init_dir == "hash" || init_dir == "load_hash";
-
-			bool is_new = false;
-			mutex_lock(&gen->livepatch_mutex);
-			if (is_refresh) {
-				lbLivePatchRefreshSym rs = { mangled_name, gb_max(type_size_of(e->type), 1) };
-				array_add(&gen->livepatch_refresh_syms, rs);
-			}
-			if (hm.exists) {
-				u64 *orig_th = string_map_get(&hm.orig, mangled_name);
-				if (orig_th != nullptr) {
-					if (*orig_th != th) {
-						error(e->token, "livepatch: @(static) variable '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
-					}
-				} else {
-					is_new = true;
-				}
-			} else {
-				string_map_set(&hm.orig, mangled_name, th); 
-			}
-
-			if (is_thread_local && is_new) {
-				i64 offset = 0;
-				LivePatchNewEntry *ne = string_map_get(&hm.tls_newg, mangled_name);
-				if (ne != nullptr) {
-					offset = ne->offset;
-					if (ne->type_hash != th) {
-						error(e->token, "livepatch: new thread-local @(static) variable '%.*s' changed type/layout across a reload. Its TLS arena storage cannot be reinterpreted safely", LIT(name));
-					}
-				} else {
-					i64 al = gb_max(type_align_of(e->type), 1);
-					i64 sz = gb_max(type_size_of(e->type), 1);
-					offset = align_formula(hm.tls_next_free, al);
-					hm.tls_next_free = offset + sz;
-					if (hm.tls_next_free > hm.tls_arena_size) {
-						error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)hm.tls_next_free, cast(long long)hm.tls_arena_size);
-					}
-					LivePatchNewEntry added = {offset, th, -1};
-					string_map_set(&hm.tls_newg, mangled_name, added);
-				}
-				mutex_unlock(&gen->livepatch_mutex);
-
-				lbValue g = {};
-				g.type  = alloc_type_pointer(e->type);
-				g.value = lb_livepatch_tls_arena_ptr(m, offset, alloc_type_pointer(e->type));
-				lb_add_entity(m, e, g);
-				lb_add_member(m, mangled_name, g);
+			if (lb_livepatch_handle_static_variable(gen, m, e, name, mangled_name, value, is_thread_local, is_refresh)) {
 				continue;
-			} else if (is_thread_local) {
-				mutex_unlock(&gen->livepatch_mutex);
-			} else if (is_new && !is_refresh) {
-				if (is_type_any(e->type)) {
-					error(e->token, "livepatch: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
-				}
-				bool has_const_init = value.value != nullptr && !LLVMIsNull(value.value);
-
-				i64 offset   = 0;
-				i64 flag_off = -1;
-				LivePatchNewEntry *ne = string_map_get(&hm.newg, mangled_name);
-				if (ne != nullptr) {
-					offset   = ne->offset;
-					flag_off = ne->init_flag_offset;
-					if (ne->type_hash != th) {
-						error(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
-					}
-				} else {
-					i64 al = gb_max(type_align_of(e->type), 1);
-					i64 sz = gb_max(type_size_of(e->type), 1);
-					offset = align_formula(hm.next_free, al);
-					hm.next_free = offset + sz;
-					if (has_const_init) {
-						flag_off = hm.next_free;
-						hm.next_free = flag_off + 1;
-					}
-					if (hm.next_free > hm.arena_size) {
-						error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
-					}
-					LivePatchNewEntry added = {offset, th, flag_off};
-					string_map_set(&hm.newg, mangled_name, added);
-
-					if (has_const_init) {
-						char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->livepatch_inits.count);
-						LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(value.value), blob_name);
-						LLVMSetInitializer(blob, value.value);
-						LLVMSetGlobalConstant(blob, true);
-						LLVMSetLinkage(blob, LLVMPrivateLinkage);
-						LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
-						array_add(&gen->livepatch_inits, ie);
-					}
-				}
-				mutex_unlock(&gen->livepatch_mutex);
-
-				lbValue g = {};
-				g.type  = alloc_type_pointer(e->type);
-				g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
-				lb_add_entity(m, e, g);
-				lb_add_member(m, mangled_name, g);
-				continue;
-			} else {
-				mutex_unlock(&gen->livepatch_mutex);
 			}
 		}
 
