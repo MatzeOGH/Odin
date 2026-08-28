@@ -3597,6 +3597,27 @@ gb_internal void lb_livepatch_emit_build_id(lbGenerator *gen) {
 	lb_append_to_used(m, g);
 }
 
+gb_internal void lb_livepatch_emit_type_table_hash(lbGenerator *gen) {
+	lbModule *m = &gen->default_module;
+	u64 agg = 0;
+	if (m->info != nullptr) {
+		for (auto const &tt : m->info->type_info_types_hash_map) {
+			if (tt.hash == 0 || tt.type == nullptr) {
+				continue; // empty slot in the open-addressed table
+			}
+			u64 term = (type_hash_canonical_type(tt.type) * 1099511628211ull) ^ lb_livepatch_layout_hash(tt.type);
+			agg += term;
+		}
+	}
+
+	LLVMTypeRef u64t = lb_type(m, t_u64);
+	LLVMValueRef g = LLVMAddGlobal(m->mod, u64t, "__odin_livepatch_type_table_hash");
+	LLVMSetInitializer(g, LLVMConstInt(u64t, agg, false));
+	LLVMSetGlobalConstant(g, true);
+	LLVMSetLinkage(g, LLVMExternalLinkage);
+	lb_append_to_used(m, g);
+}
+
 gb_internal void lb_livepatch_emit_support(lbGenerator *gen) {
 	lbModule *m = &gen->default_module;
 
@@ -4456,6 +4477,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_livepatch_emit_patch_hook_table(gen, info, false, "__odin_livepatch_post_patch_hooks");
 		lb_livepatch_emit_func_hashes(gen);
 		lb_livepatch_emit_build_id(gen);
+		lb_livepatch_emit_type_table_hash(gen);
 
 		lb_livepatch_emit_new_global_inits(gen);
 		lb_livepatch_emit_refresh_syms(gen);

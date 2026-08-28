@@ -587,14 +587,12 @@ struct BuildContext {
 	bool   use_single_module;
 	bool   use_separate_modules;
 
-	// BEGIN LIVEPATCH
 	bool   livepatch;
 	bool   livepatch_patch;
 	bool   livepatch_is_reload;
 	i64    livepatch_arena_size; // bytes for new globals
 	i64    livepatch_tls_arena_size; // bytes for new tls 
 	String livepatch_manifest;
-	// END LIVEPATCH
 
 	LTOKind lto_kind;
 	bool   module_per_file;

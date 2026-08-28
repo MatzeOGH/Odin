@@ -7,53 +7,18 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:thread"
 import "core:time"
 import win "core:sys/windows"
 
-Coff_File_Header :: struct #packed {
-	machine:                 u16le,
-	number_of_sections:      u16le,
-	time_date_stamp:         u32le,
-	pointer_to_symbol_table: u32le,
-	number_of_symbols:       u32le,
-	size_of_optional_header: u16le,
-	characteristics:         u16le,
-}
-
-Coff_Section_Header :: struct #packed {
-	name:                    [8]u8,
-	virtual_size:            u32le,
-	virtual_address:         u32le,
-	size_of_raw_data:        u32le,
-	pointer_to_raw_data:     u32le,
-	pointer_to_relocations:  u32le,
-	pointer_to_line_numbers: u32le,
-	number_of_relocations:   u16le,
-	number_of_line_numbers:  u16le,
-	characteristics:         u32le,
-}
-
-Coff_Symbol :: struct #packed {
-	name:                  [8]u8,
-	value:                 u32le,
-	section_number:        i16le,
-	type:                  u16le,
-	storage_class:         u8,
-	number_of_aux_symbols: u8,
-}
-
-Coff_Reloc :: struct #packed {
-	virtual_address:    u32le,
-	symbol_table_index: u32le,
-	type:               u16le,
-}
+LP_TYPE_INFOS_SYM :: "__odin_livepatch_type_infos"
+LP_TYPE_TABLE_SYM :: "runtime::type_table"
+LP_CONST_SECTION :: ".odinti"
 
 IMAGE_FILE_MACHINE_AMD64 :: 0x8664
 IMAGE_SCN_MEM_EXECUTE       :: 0x20000000
 IMAGE_SCN_MEM_WRITE         :: 0x80000000
 IMAGE_SCN_LNK_NRELOC_OVFL   :: 0x01000000
-
-LP_CONST_SECTION :: ".odinti"
 
 IMAGE_REL_AMD64_ADDR64   :: 0x01
 IMAGE_REL_AMD64_ADDR32NB :: 0x03
@@ -109,17 +74,13 @@ lp_call_patch_hooks :: proc(tbl_addr: rawptr, changed: []Type_Change, resolve: p
 		name := string(e.name[:e.name_len])
 		addr := resolve(name, ctx)
 		if addr == nil {
-			fmt.eprintfln("[livepatch] could not resolve patch hook %q; skipping", name)
+			fmt.eprintfln("[livepatch] could not resolve patch hook %q. skipping", name)
 			continue
 		}
 		hook := (Patch_Hook)(addr)
 		hook(changed)
 	}
 }
-
-LP_TYPE_INFOS_SYM :: "__odin_livepatch_type_infos"
-
-LP_TYPE_TABLE_SYM :: "runtime::type_table"
 
 @(private)
 lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
@@ -145,9 +106,6 @@ lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
 			if sa.names[i] != sb.names[i] || sa.offsets[i] != sb.offsets[i] {
 				return true
 			}
-			// A field retyped to a same-size type (e.g. i32 -> f32) keeps its offset but
-			// changes how the bytes are interpreted; compare the field type identity too,
-			// otherwise reflection would keep showing the old field type after a reload.
 			fa, fb := sa.types[i], sb.types[i]
 			if fa != nil && fb != nil && fa.id != fb.id {
 				return true
@@ -185,7 +143,7 @@ lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
 		for i in 0 ..< len(ua.variants) {
 			na, _ := ua.variants[i].variant.(runtime.Type_Info_Named)
 			nb, _ := ub.variants[i].variant.(runtime.Type_Info_Named)
-			if lp_qualified_name(na) != lp_qualified_name(nb) {
+			if na.pkg != nb.pkg || na.name != nb.name { // compare fields; no need to build strings
 				return true
 			}
 		}
@@ -204,27 +162,31 @@ lp_read_type_infos :: proc(tbl_addr: rawptr) -> []^runtime.Type_Info {
 }
 
 @(private)
-lp_qualified_name :: proc(named: runtime.Type_Info_Named) -> string {
-	return fmt.tprintf("%s.%s", named.pkg, named.name)
+Qual :: struct {
+	pkg, name: string,
 }
 
-@(private) _lp_live_types: map[string]^runtime.Type_Info
+@(private)
+lp_qual :: proc(named: runtime.Type_Info_Named) -> Qual {
+	return {named.pkg, named.name}
+}
+
+@(private) _lp_live_types: map[Qual]^runtime.Type_Info
 @(private) _lp_live_types_ready: bool
 
 @(private)
 lp_fill_live_types :: proc(tis: []^runtime.Type_Info) {
-	_lp_live_types = make(map[string]^runtime.Type_Info, runtime.heap_allocator())
+	_lp_live_types = make(map[Qual]^runtime.Type_Info, runtime.heap_allocator())
 	for ti in tis {
 		if ti == nil { continue }
 		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
-			key := strings.clone(lp_qualified_name(named), runtime.heap_allocator())
-			_lp_live_types[key] = ti
+			_lp_live_types[lp_qual(named)] = ti
 		}
 	}
 }
 
 @(private)
-lp_live_types_by_name :: proc() -> map[string]^runtime.Type_Info {
+lp_live_types_by_name :: proc() -> map[Qual]^runtime.Type_Info {
 	if _lp_live_types_ready {
 		return _lp_live_types
 	}
@@ -240,9 +202,6 @@ lp_advance_live_types :: proc(new_hdr: rawptr) {
 		return
 	}
 	if _lp_live_types_ready {
-		for k in _lp_live_types {
-			delete(k, runtime.heap_allocator())
-		}
 		delete(_lp_live_types)
 	}
 	lp_fill_live_types(new_tis)
@@ -250,74 +209,55 @@ lp_advance_live_types :: proc(new_hdr: rawptr) {
 }
 
 @(private)
-lp_build_type_changes :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> []Type_Change {
-	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, LP_TYPE_INFOS_SYM)
-	new_tis := lp_read_type_infos(new_addr)
+lp_analyze_types :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr, want_changes: bool) -> (needs_swap: bool, changes: []Type_Change, new_hdr: rawptr) {
+	new_hdr, _ = find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, LP_TYPE_INFOS_SYM)
+	new_tis := lp_read_type_infos(new_hdr)
 	if len(new_tis) == 0 {
-		return nil
+		return false, nil, new_hdr
 	}
 	old_by_name := lp_live_types_by_name()
 	if len(old_by_name) == 0 {
-		return nil
+		return false, nil, new_hdr
 	}
 
-	direct := make(map[string]bool, context.temp_allocator)
+	direct := make(map[Qual]bool, context.temp_allocator)
 	for ti in new_tis {
 		if ti == nil { continue }
 		named, ok := ti.variant.(runtime.Type_Info_Named)
 		if !ok { continue }
-		q := lp_qualified_name(named)
-		if old_ti, found := old_by_name[q]; found && lp_layout_differs(old_ti, ti) {
-			direct[q] = true
+		old_ti, found := old_by_name[lp_qual(named)]
+		if !found {
+			needs_swap = true
+			if !want_changes { break }
+			continue
 		}
+		if lp_layout_differs(old_ti, ti) {
+			needs_swap = true
+			if !want_changes { break }
+			direct[lp_qual(named)] = true
+		}
+	}
+	if !want_changes {
+		return needs_swap, nil, new_hdr
 	}
 
 	memo := make(map[rawptr]bool, context.temp_allocator)
-	changes := make([dynamic]Type_Change, context.allocator)
+	ch := make([dynamic]Type_Change, context.allocator)
 	for ti in new_tis {
 		if ti == nil { continue }
 		named, ok := ti.variant.(runtime.Type_Info_Named)
 		if !ok { continue }
-		old_ti, found := old_by_name[lp_qualified_name(named)]
+		old_ti, found := old_by_name[lp_qual(named)]
 		if !found { continue }
 		if lp_contains_changed(ti, direct, &memo) {
-			append(&changes, Type_Change{old = old_ti, new = ti})
+			append(&ch, Type_Change{old = old_ti, new = ti})
 		}
 	}
-	return changes[:]
+	return needs_swap, ch[:], new_hdr
 }
 
 @(private)
-lp_type_table_needs_swap :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr) -> bool {
-	new_addr, _ := find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, LP_TYPE_INFOS_SYM)
-	new_tis := lp_read_type_infos(new_addr)
-	if len(new_tis) == 0 {
-		return false
-	}
-	old_by_name := lp_live_types_by_name()
-	for ti in new_tis {
-		if ti == nil { continue }
-		named, ok := ti.variant.(runtime.Type_Info_Named)
-		if !ok { continue }
-		old_ti, found := old_by_name[lp_qualified_name(named)]
-		if !found {
-			return true
-		}
-		if lp_layout_differs(old_ti, ti) {
-			return true
-		}
-	}
-	return false
-}
-
-// lp_contains_changed reports whether `ti` is, or transitively embeds BY VALUE, a directly
-// changed type. It deliberately recurses only through value-embedding aggregates (struct fields,
-// (enumerated) array elements, union variants) — the same set as the compiler-side
-// lb_livepatch_layout_hash and lp_layout_differs. It intentionally does NOT follow pointers,
-// slices, maps or dynamic arrays: their header layout is unaffected by the pointee/element type
-// changing, and stopping there also keeps the recursion finite.
-@(private)
-lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[string]bool, memo: ^map[rawptr]bool) -> bool {
+lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[Qual]bool, memo: ^map[rawptr]bool) -> bool {
 	if ti == nil {
 		return false
 	}
@@ -328,7 +268,7 @@ lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[string]bool, mem
 
 	result := false
 	if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
-		if direct[lp_qualified_name(named)] {
+		if direct[lp_qual(named)] {
 			result = true
 		}
 	}
@@ -385,6 +325,10 @@ lp_fnv64 :: proc(s: string) -> u64 {
 _lp_cur: map[u64]u64
 @(private)
 _lp_cur_ready: bool
+@(private)
+_lp_cur_type_hash: u64
+@(private)
+_lp_cur_type_hash_ready: bool
 
 @(private)
 lp_read_func_hashes :: proc(addr: rawptr, dst: ^map[u64]u64) {
@@ -414,6 +358,7 @@ lp_proc_changed :: proc(name: string, obj_hashes: map[u64]u64, have_obj_hashes: 
 }
 
 @(private) _lp_busy: b32
+@(private) _lp_build_busy: b32
 
 Lp_Range :: struct {
 	lo, hi: uintptr,
@@ -427,12 +372,12 @@ Lp_Generation :: struct {
 }
 @(private) _lp_generations: [dynamic]Lp_Generation
 @(private) _lp_serial: int
+@(private) _lp_owner: map[uintptr]int
 
 live_generations :: proc() -> int {
 	when !ODIN_LIVEPATCH { return 0 }
 	return len(_lp_generations)
 }
-@(private) _lp_owner: map[uintptr]int
 
 @(private)
 lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
@@ -471,13 +416,11 @@ lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
 }
 
 @(private)
-lp_try_free_old_generations :: proc(handles: [dynamic]win.HANDLE) {
-	if len(_lp_generations) == 0 {
-		return
-	}
-	kept := make([dynamic]Lp_Generation, 0, len(_lp_generations), runtime.heap_allocator())
-	freed := 0
-	for gen in _lp_generations {
+lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
+	for gen, i in _lp_generations {
+		if i >= len(freeable) {
+			break
+		}
 		referenced := false
 		for e in gen.owned {
 			if _lp_owner[e] == gen.serial {
@@ -486,7 +429,6 @@ lp_try_free_old_generations :: proc(handles: [dynamic]win.HANDLE) {
 			}
 		}
 		if referenced {
-			append(&kept, gen)
 			continue
 		}
 		in_use := false
@@ -496,21 +438,33 @@ lp_try_free_old_generations :: proc(handles: [dynamic]win.HANDLE) {
 				break
 			}
 		}
-		if in_use {
+		freeable[i] = !in_use
+	}
+}
+
+@(private)
+lp_free_marked :: proc(freeable: []bool) {
+	if len(_lp_generations) == 0 {
+		return
+	}
+	kept := make([dynamic]Lp_Generation, 0, len(_lp_generations), runtime.heap_allocator())
+	freed := 0
+	for gen, i in _lp_generations {
+		if i < len(freeable) && freeable[i] {
+			for p in gen.pdata {
+				win.RtlDeleteFunctionTable(p)
+			}
+			for b in gen.blocks {
+				win.VirtualFree(b, 0, win.MEM_RELEASE)
+			}
+			delete(gen.blocks)
+			delete(gen.pdata)
+			delete(gen.ranges)
+			delete(gen.owned)
+			freed += 1
+		} else {
 			append(&kept, gen)
-			continue
 		}
-		for p in gen.pdata {
-			win.RtlDeleteFunctionTable(p)
-		}
-		for b in gen.blocks {
-			win.VirtualFree(b, 0, win.MEM_RELEASE)
-		}
-		delete(gen.blocks)
-		delete(gen.pdata)
-		delete(gen.ranges)
-		delete(gen.owned)
-		freed += 1
 	}
 	delete(_lp_generations)
 	_lp_generations = kept
@@ -526,6 +480,10 @@ apply :: proc(obj_path: string) -> bool {
 
 apply_dir :: proc(dir := "hot_objs") -> bool {
 	when !ODIN_LIVEPATCH { return false }
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	context.temp_allocator = runtime.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
 	pattern := fmt.tprintf("%s/*.obj", dir)
 	matches, err := filepath.glob(pattern, context.temp_allocator)
 	if err != nil || len(matches) == 0 {
@@ -537,6 +495,12 @@ apply_dir :: proc(dir := "hot_objs") -> bool {
 
 build_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> bool {
 	when !ODIN_LIVEPATCH { return false }
+
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	context.temp_allocator = runtime.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
+
 	pkg_dir, ok := lp_manifest_pkg_dir(manifest)
 	if !ok {
 		fmt.eprintfln("[livepatch] build_patch: no pkg_dir in manifest %q (build the exe with -livepatch first)", manifest)
@@ -547,6 +511,10 @@ build_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: 
 
 apply_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> bool {
 	when !ODIN_LIVEPATCH { return false }
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	context.temp_allocator = runtime.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
 	pkg_dir, ok := lp_manifest_pkg_dir(manifest)
 	if !ok {
 		fmt.eprintfln("[livepatch] apply_patch: no pkg_dir in manifest %q (build the exe with -livepatch first)", manifest)
@@ -559,9 +527,74 @@ apply_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: 
 	return apply_dir(objs_dir)
 }
 
+
+Async_Build :: struct {
+	th:       ^thread.Thread,
+	done:     b32, // atomic: set by the worker when the build finishes
+	ok:       b32, // valid once done: whether the build succeeded
+	odin:     string,
+	manifest: string,
+	env:      []string,
+	objs_dir: string, // resolved at spawn so apply doesn't need the manifest again
+}
+
+
+build_patch_async :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> ^Async_Build {
+	when !ODIN_LIVEPATCH { return nil }
+
+	if _, ok := intrinsics.atomic_compare_exchange_strong(&_lp_build_busy, false, true); !ok {
+		fmt.eprintln("[livepatch] a patch build/apply is already in progress.")
+		return nil
+	}
+
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	context.temp_allocator = runtime.arena_allocator(&scratch)
+	defer runtime.arena_destroy(&scratch)
+
+	ab := new(Async_Build)
+	ab.odin = strings.clone(odin)
+	ab.manifest = strings.clone(manifest)
+	ab.env = env
+
+	if pkg_dir, ok := lp_manifest_pkg_dir(manifest); ok {
+		ab.objs_dir = filepath.join({pkg_dir, "hot_objs"}) or_else strings.clone("hot_objs")
+	} else {
+		ab.objs_dir = strings.clone("hot_objs")
+	}
+	ab.th = thread.create_and_start_with_poly_data(ab, proc(ab: ^Async_Build) {
+		ok := build_patch(ab.odin, ab.manifest, ab.env)
+		intrinsics.atomic_store(&ab.ok, b32(ok))
+		intrinsics.atomic_store(&ab.done, true)
+	})
+	return ab
+}
+
+try_apply_async :: proc(ab: ^Async_Build) -> (applied: bool, still_building: bool) {
+	when !ODIN_LIVEPATCH { return false, false }
+	if ab == nil {
+		return false, false
+	}
+	if intrinsics.atomic_load(&ab.done) == false {
+		return false, true
+	}
+	thread.join(ab.th)
+	if bool(ab.ok) {
+		applied = apply_dir(ab.objs_dir)
+	}
+	thread.destroy(ab.th)
+	delete(ab.odin)
+	delete(ab.manifest)
+	delete(ab.objs_dir)
+	free(ab)
+	intrinsics.atomic_store(&_lp_build_busy, false)
+	return applied, false
+}
+
 @(private)
 lp_run_patch_build :: proc(odin: string, pkg_dir: string, env: []string) -> bool {
 	cmd := []string{odin, "build", pkg_dir, "-livepatch-patch"}
+
 	fmt.printfln("[livepatch] rebuilding patch: %s build %q -livepatch-patch", odin, pkg_dir)
 	state, sout, serr, err := os.process_exec({command = cmd, env = env}, context.temp_allocator)
 	if err != nil {
@@ -571,7 +604,7 @@ lp_run_patch_build :: proc(odin: string, pkg_dir: string, env: []string) -> bool
 	if len(sout) > 0 { fmt.print(string(sout)) }
 	if len(serr) > 0 { fmt.eprint(string(serr)) }
 	if state.exit_code != 0 {
-		fmt.eprintfln("[livepatch] patch build failed (exit %d) — not reloading, running code left as-is", state.exit_code)
+		fmt.eprintfln("[livepatch] patch build failed (exit %d) running code left as-is", state.exit_code)
 		return false
 	}
 	return true
@@ -583,29 +616,46 @@ lp_manifest_pkg_dir :: proc(manifest_path: string) -> (string, bool) {
 	if err != nil {
 		return "", false
 	}
+
 	content := string(data)
-	for line in strings.split_lines_iterator(&content) {
-		l := strings.trim_space(line)
-		if strings.has_prefix(l, "pkg_dir ") {
-			pd := strings.trim_space(l[len("pkg_dir "):])
-			if len(pd) > 0 {
-				return pd, true
-			}
-		}
+	prefix :: "pkg_dir "
+
+	i := strings.index(content, prefix)
+	if i < 0 {
+		return "", false
 	}
-	return "", false
+
+	start := i + len(prefix)
+	end := strings.index(content[start:], "\n")
+	if end < 0 {
+		end = len(content)
+	} else {
+		end += start
+	}
+
+	pkg_dir := strings.trim_space(content[start:end])
+	return pkg_dir, len(pkg_dir) > 0
 }
 
 apply_many :: proc(obj_paths: []string) -> bool {
 	when !ODIN_LIVEPATCH { return false }
 	if _, swapped := intrinsics.atomic_compare_exchange_strong(&_lp_busy, false, true); !swapped {
-		fmt.eprintln("[livepatch] a reload is already in progress; apply()/apply_many() must be called from one thread, one reload at a time")
+		fmt.eprintln("[livepatch] a reload is already in progress")
 		return false
 	}
 	defer intrinsics.atomic_store(&_lp_busy, false)
 
 	start := time.tick_now()
 	defer fmt.printfln("[livepatch] apply_many took %v", time.tick_since(start))
+
+	mark := start
+	lp_phase :: proc(name: string, mark: ^time.Tick) {
+		when LP_TIMING {
+			now := time.tick_now()
+			fmt.printfln("[livepatch]   %-8s %v", name, time.tick_since(mark^))
+			mark^ = now
+		}
+	}
 
 	scratch: runtime.Arena
 	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
@@ -627,6 +677,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		lp_read_func_hashes(lp_resolve_pdb("__odin_livepatch_func_hashes"), &_lp_cur)
 		_lp_cur_ready = true
 	}
+	lp_phase("dbghelp", &mark)
 
 	section_header :: proc(data: []byte, sec_off, i: int) -> ^Coff_Section_Header {
 		return (^Coff_Section_Header)(raw_data(data[sec_off + i*SECTION_HDR_SIZE:]))
@@ -654,13 +705,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 
 	objs := make([dynamic]Obj, 0, len(obj_paths), context.temp_allocator)
 
-	// Until we start modifying the running image (refresh/type-table swap/patch), the obj
-	// blocks + their registered unwind tables are owned by nobody, so any early `return false`
-	// (bad read, alloc failure, build-id mismatch, unresolved symbol, ...) would leak them and
-	// leave stale RtlAddFunctionTable registrations — very common in an edit loop. This defer
-	// reclaims them on every such path. Once patching begins we set `committed = true`: from
-	// that point the running exe may reference the blocks (patched jumps, swapped type_table),
-	// so they must NOT be freed here — they are handed to a reload generation instead.
 	committed := false
 	defer if !committed {
 		for &o in objs {
@@ -747,6 +791,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		o.pdata_regs = make([dynamic]win.PRUNTIME_FUNCTION, context.temp_allocator)
 		append(&objs, o)
 	}
+	lp_phase("read", &mark)
 
 	obj_hashes := make(map[u64]u64, context.temp_allocator)
 	have_obj_hashes := false
@@ -800,9 +845,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 								all_syms[name] = obj_addr
 								append(&hot_names, Hot{name, oi})
 							} else {
-								// A known-livepatchable (present in the func-hash table), existing,
-								// changed proc that fails pad detection means the structural pad
-								// heuristic likely broke — surface it rather than silently skipping.
 								if !hot && changed && have_obj_hashes && lp_fnv64(name) in obj_hashes {
 									hot_detect_misses += 1
 								}
@@ -821,8 +863,9 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 
 	if hot_detect_misses > 0 {
-		fmt.eprintfln("[livepatch] WARNING: %d changed livepatchable procedure(s) exist in the running exe but their prologue did not match a patch pad; hot-proc detection may be broken (did the compiler's patchable-function-prefix NOP encoding change?). These procedures were NOT patched.", hot_detect_misses)
+		fmt.eprintfln("[livepatch] WARNING: %d changed livepatchable procedure(s) exist in the running exe but their prologue did not match a patch pad. These procedures were NOT patched.", hot_detect_misses)
 	}
+	lp_phase("symbols", &mark)
 
 	unresolved, unsupported := 0, 0
 	unresolved_text := 0
@@ -970,6 +1013,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		fmt.eprintfln("[livepatch] aborting reload: %d unresolved relocation(s) in executable code (see names above)", unresolved_text)
 		return false
 	}
+	lp_phase("reloc", &mark)
 
 	meta_i := -1
 	for &o, oi in objs {
@@ -1001,11 +1045,28 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	pre_tbl := lp_resolve_pdb("__odin_livepatch_pre_patch_hooks")
 	post_tbl: rawptr
 	changed: []Type_Change
+	needs_swap_types := false
+	fresh_ti_hdr: rawptr
+	obj_type_hash: u64
+	have_obj_type_hash := false
 	if meta_i >= 0 {
 		mo := &objs[meta_i]
 		post_tbl, _ = find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_livepatch_post_patch_hooks")
-		if lp_hook_count(pre_tbl) > 0 || lp_hook_count(post_tbl) > 0 {
-			changed = lp_build_type_changes(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases)
+		if !_lp_cur_type_hash_ready {
+			if a := lp_resolve_pdb("__odin_livepatch_type_table_hash"); a != nil {
+				_lp_cur_type_hash = (^u64)(a)^
+				_lp_cur_type_hash_ready = true
+			}
+		}
+		if a, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_livepatch_type_table_hash"); ok {
+			obj_type_hash = (^u64)(a)^
+			have_obj_type_hash = true
+		}
+		skip_type_walk := _lp_cur_type_hash_ready && have_obj_type_hash && obj_type_hash == _lp_cur_type_hash
+
+		if !skip_type_walk {
+			want_changes := lp_hook_count(pre_tbl) > 0 || lp_hook_count(post_tbl) > 0
+			needs_swap_types, changed, fresh_ti_hdr = lp_analyze_types(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, want_changes)
 		}
 	}
 	defer delete(changed)
@@ -1036,28 +1097,18 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 
 	swap_type_table := false
-	tt_ref:       rawptr
-	fresh_ti_hdr: rawptr
-	if meta_i >= 0 {
-		mo := &objs[meta_i]
-		if lp_type_table_needs_swap(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases) {
-			hdr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, LP_TYPE_INFOS_SYM)
-			if ref := lp_resolve_pdb("__odin_livepatch_type_table_ref"); ref != nil {
-				tt_ref = (^rawptr)(ref)^
-			} else {
-				tt_ref = lp_resolve_pdb(LP_TYPE_TABLE_SYM)
-			}
-			if ok {
-				fresh_ti_hdr = hdr
-				swap_type_table = tt_ref != nil
-			}
+	tt_ref: rawptr
+	if needs_swap_types && fresh_ti_hdr != nil {
+		if ref := lp_resolve_pdb("__odin_livepatch_type_table_ref"); ref != nil {
+			tt_ref = (^rawptr)(ref)^
+		} else {
+			tt_ref = lp_resolve_pdb(LP_TYPE_TABLE_SYM)
 		}
+		swap_type_table = tt_ref != nil
 	}
 
 	if len(hot_names) == 0 && len(refresh_targets) == 0 && !swap_type_table {
 		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
-		// Nothing was patched, so the obj blocks + their unwind registrations are reclaimed by
-		// the early-return cleanup defer (committed is still false on this no-patch path).
 		if have_obj_hashes {
 			for k, v in obj_hashes {
 				_lp_cur[k] = v
@@ -1077,13 +1128,13 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		original := lp_resolve_pdb(h.name)
 		fresh, found := all_syms[h.name]
 		if original == nil || !found {
-			fmt.eprintfln("[livepatch] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v); nothing patched", h.name, original != nil, found)
+			fmt.eprintfln("[livepatch] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v). nothing patched", h.name, original != nil, found)
 			return false
 		}
 		if !lp_has_patch_pad(original) {
 			gap := lp_next_symbol_after(uintptr(original)) - uintptr(original)
 			if gap < PATCH_LEN {
-				fmt.eprintfln("[livepatch] aborting reload: hot procedure %q has no patch pad and only %d bytes to its next symbol (need %d); nothing patched", h.name, gap, PATCH_LEN)
+				fmt.eprintfln("[livepatch] aborting reload: hot procedure %q has no patch pad and only %d bytes to its next symbol (need %d). nothing patched", h.name, gap, PATCH_LEN)
 				return false
 			}
 		}
@@ -1096,11 +1147,22 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		lo = lo >= PAD_LEN ? lo - PAD_LEN : 0
 		regions[i] = Patch_Region{lo, uintptr(t.original) + PATCH_LEN}
 	}
+	lp_phase("meta", &mark)
+
+	owner_bound := len(refresh_targets) + len(targets) + 1
+	_lp_serial += 1
+	gen_serial := _lp_serial
+	gen_owned := make([dynamic]uintptr, 0, owner_bound, runtime.heap_allocator())
+	reserve(&_lp_owner, len(_lp_owner) + owner_bound)
+	freeable := make([]bool, len(_lp_generations), context.temp_allocator)
+	refresh_ok := make([]bool, len(refresh_targets), context.temp_allocator)
+	patch_ok := make([]bool, len(targets), context.temp_allocator)
+	patch_atomic := make([]bool, len(targets), context.temp_allocator)
 
 	MAX_ATTEMPTS :: 100
 	handles: [dynamic]win.HANDLE
 	for attempt := 0; ; attempt += 1 {
-		handles = lp_suspend_others()
+		handles = lp_suspend_other_threads()
 		if !lp_ip_conflicts(handles, regions) {
 			break
 		}
@@ -1111,19 +1173,14 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		}
 		win.Sleep(1)
 	}
+	lp_phase("suspend", &mark)
 
-	lp_try_free_old_generations(handles)
+	lp_scan_freeable(handles, freeable)
+	lp_phase("freegen", &mark)
 
-	_lp_serial += 1
-	gen_serial := _lp_serial
-	gen_owned := make([dynamic]uintptr, runtime.heap_allocator())
-
-	// From here on the running image may reference the obj blocks (refreshed data is copied,
-	// but the type_table swap and patched jumps point INTO them). The blocks are handed to a
-	// reload generation below; the early-return cleanup defer must no longer free them.
 	committed = true
 
-	for r in refresh_targets {
+	for r, i in refresh_targets {
 		old: win.DWORD
 		if win.VirtualProtect(r.exe, win.SIZE_T(r.size), win.PAGE_READWRITE, &old) {
 			intrinsics.mem_copy(r.exe, r.obj, r.size)
@@ -1131,12 +1188,8 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			win.VirtualProtect(r.exe, win.SIZE_T(r.size), old, &restored)
 			_lp_owner[uintptr(r.exe)] = gen_serial
 			append(&gen_owned, uintptr(r.exe))
-		} else {
-			fmt.eprintfln("[livepatch] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
+			refresh_ok[i] = true
 		}
-	}
-	if len(refresh_targets) > 0 {
-		fmt.printfln("[livepatch] refreshed %d @(rodata)/#load global(s)", len(refresh_targets))
 	}
 
 	did_swap := false
@@ -1150,23 +1203,46 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			_lp_owner[uintptr(tt_ref)] = gen_serial
 			append(&gen_owned, uintptr(tt_ref))
 			did_swap = true
-			fmt.println("[livepatch] refreshed reflection type_table (edited/new types now visible)")
-		} else {
-			fmt.eprintln("[livepatch] could not make runtime.type_table writable to refresh reflection")
 		}
 	}
 
 	patched := 0
-	for t in targets {
+	for t, i in targets {
 		ok, atomic := patch_jump(t.original, t.fresh)
 		if ok {
-			fmt.printfln("[livepatch] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, atomic ? "atomic" : "overwrite")
+			patch_ok[i] = true
+			patch_atomic[i] = atomic
 			patched += 1
 			_lp_owner[uintptr(t.original)] = gen_serial
 			append(&gen_owned, uintptr(t.original))
 		}
 	}
 	lp_resume(handles)
+	lp_free_marked(freeable)
+
+	refreshed := 0
+	for r, i in refresh_targets {
+		if refresh_ok[i] {
+			refreshed += 1
+		} else {
+			fmt.eprintfln("[livepatch] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
+		}
+	}
+	if refreshed > 0 {
+		fmt.printfln("[livepatch] refreshed %d @(rodata)/#load global(s)", refreshed)
+	}
+	if swap_type_table {
+		if did_swap {
+			fmt.println("[livepatch] refreshed reflection type_table (edited/new types now visible)")
+		} else {
+			fmt.eprintln("[livepatch] could not make runtime.type_table writable to refresh reflection")
+		}
+	}
+	for t, i in targets {
+		if patch_ok[i] {
+			fmt.printfln("[livepatch] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, patch_atomic[i] ? "atomic" : "overwrite")
+		}
+	}
 	for &o in objs {
 		for i in 0 ..< o.n_sections {
 			if o.offsets[i + 1] < 0 {
@@ -1190,6 +1266,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			win.VirtualProtect(base, psize, prot, &old)
 		}
 	}
+	lp_phase("patch", &mark)
 
 	if patched != len(targets) {
 		return false
@@ -1201,6 +1278,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 
 	if did_swap {
 		lp_advance_live_types(fresh_ti_hdr)
+		if have_obj_type_hash {
+			_lp_cur_type_hash = obj_type_hash
+			_lp_cur_type_hash_ready = true
+		}
 	}
 
 	lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
@@ -1250,13 +1331,8 @@ PATCH_LEN :: 14
 PAD_LEN   :: 16
 
 LP_DEBUG_PAD :: #config(LP_DEBUG_PAD, false)
+LP_TIMING :: #config(LP_TIMING, false)
 
-// The compiler-emitted patch pad is a PAD_LEN-byte `patchable-function-prefix`, filled by LLVM's
-// NOP emitter. That is NOT guaranteed to be a run of single-byte 0x90s — LLVM emits multi-byte
-// NOP encodings (`0F 1F ...`, with `66` operand-size prefixes for longer forms). Decoding the pad
-// as a NOP sled (rather than hard-coding 0x90) keeps hot-proc detection working across LLVM
-// NOP-encoding changes. lp_nop_len decodes ONE x86-64 NOP at p and returns its byte length (0 if
-// not a NOP); lp_is_nop_sled checks that exactly n bytes decode as back-to-back NOPs.
 @(private)
 lp_nop_len :: proc(p: [^]u8, max: int) -> int {
 	i := 0
@@ -1393,36 +1469,49 @@ Patch_Region :: struct {
 	lo, hi: uintptr,
 }
 
-@(private)
-lp_suspend_others :: proc() -> [dynamic]win.HANDLE {
-	handles := make([dynamic]win.HANDLE, context.temp_allocator)
-	me_pid := win.GetCurrentProcessId()
-	me_tid := win.GetCurrentThreadId()
-	snap := win.CreateToolhelp32Snapshot(win.TH32CS_SNAPTHREAD, 0)
-	if snap == win.INVALID_HANDLE_VALUE {
-		return handles
-	}
-	defer win.CloseHandle(snap)
 
-	te: win.THREADENTRY32
-	te.dwSize = size_of(win.THREADENTRY32)
-	ok := win.Thread32First(snap, &te)
-	for ok {
-		if te.th32OwnerProcessID == me_pid && te.th32ThreadID != me_tid {
-			h := win.OpenThread(
-				win.THREAD_SUSPEND_RESUME | win.THREAD_GET_CONTEXT | win.THREAD_SET_CONTEXT,
-				win.FALSE, te.th32ThreadID,
-			)
-			if h != nil {
-				if win.SuspendThread(h) != ~win.DWORD(0) {
-					append(&handles, h)
-				} else {
-					win.CloseHandle(h)
-				}
+foreign import lp_ntdll "system:ntdll.lib"
+foreign import lp_kernel32 "system:kernel32.lib"
+@(default_calling_convention="system")
+foreign lp_ntdll {
+	NtGetNextThread :: proc(ProcessHandle, ThreadHandle: win.HANDLE, DesiredAccess: win.ACCESS_MASK, HandleAttributes, Flags: win.ULONG, NewThreadHandle: ^win.HANDLE) -> win.NTSTATUS ---
+}
+@(default_calling_convention="system")
+foreign lp_kernel32 {
+	GetThreadId :: proc(Thread: win.HANDLE) -> win.DWORD ---
+}
+
+@(private)
+lp_suspend_other_threads :: proc() -> [dynamic]win.HANDLE {
+	handles := make([dynamic]win.HANDLE, context.temp_allocator)
+	me_tid := win.GetCurrentThreadId()
+	proc_h := win.GetCurrentProcess()
+	// QUERY_LIMITED_INFORMATION is needed so GetThreadId works to skip our own thread.
+	ACCESS :: win.ACCESS_MASK(win.THREAD_SUSPEND_RESUME | win.THREAD_GET_CONTEXT | win.THREAD_SET_CONTEXT | win.THREAD_QUERY_LIMITED_INFORMATION)
+
+	// NtGetNextThread reads `cursor` only to locate the next thread; it never closes it. So a
+	// handle stays valid as the cursor for exactly one more call, after which we close it unless
+	// we kept it (suspended, to be resumed later). nil cursor starts the enumeration.
+	cursor: win.HANDLE = nil
+	cursor_keep := false
+	for {
+		next: win.HANDLE
+		st := NtGetNextThread(proc_h, cursor, ACCESS, 0, 0, &next)
+		if cursor != nil && !cursor_keep {
+			win.CloseHandle(cursor)
+		}
+		if st != 0 { // STATUS_SUCCESS == 0; NO_MORE_ENTRIES (or any error) ends iteration
+			break
+		}
+		keep := false
+		if tid := GetThreadId(next); tid != 0 && tid != me_tid {
+			if win.SuspendThread(next) != ~win.DWORD(0) {
+				append(&handles, next)
+				keep = true
 			}
 		}
-		te.dwSize = size_of(win.THREADENTRY32)
-		ok = win.Thread32Next(snap, &te)
+		cursor = next
+		cursor_keep = keep
 	}
 	return handles
 }
@@ -1688,8 +1777,9 @@ coff_symbol :: proc(data: []byte, sym_off, i: int) -> ^Coff_Symbol {
 }
 
 section_name :: proc(sh: ^Coff_Section_Header) -> string {
+	max_len :: 8 // the buffe is 8 chars long
 	n := 0
-	for n < 8 && sh.name[n] != 0 {
+	for n < max_len && sh.name[n] != 0 {
 		n += 1
 	}
 	return string(sh.name[:n])
@@ -1700,9 +1790,12 @@ lp_is_object_local_const :: proc(sh: ^Coff_Section_Header) -> bool {
 }
 
 symbol_name :: proc(sym: ^Coff_Symbol, data: []byte, strtab_off: int) -> string {
-	if sym.name[0] == 0 && sym.name[1] == 0 && sym.name[2] == 0 && sym.name[3] == 0 {
-		off := int((^u32le)(&sym.name[4])^)
+
+	// if the first 4 byes are 0 use jump to longer name
+	if name_zeroes := (^u32le)(&sym.name[0])^; name_zeroes == 0 {
+		off := int((^u32le)(&sym.name[4])^) // offset
 		p := strtab_off + off
+
 		n := 0
 		for p + n < len(data) && data[p + n] != 0 {
 			n += 1
@@ -1715,3 +1808,4 @@ symbol_name :: proc(sym: ^Coff_Symbol, data: []byte, strtab_off: int) -> string 
 	}
 	return string(sym.name[:n])
 }
+
