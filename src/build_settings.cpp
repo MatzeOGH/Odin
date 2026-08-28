@@ -2102,8 +2102,11 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		}
 	}
 
-	//NOTE(mh): why !is_arch_wasm()?
-	if (bc->livepatch && !is_arch_wasm()) {
+	if (bc->livepatch) {
+		if (bc->metrics.os != TargetOs_windows) {
+			gb_printf_err("-livepatch is only supported on Windows\n");
+			gb_exit(1);
+		}
 		bc->use_separate_modules = true;
 	}
 
