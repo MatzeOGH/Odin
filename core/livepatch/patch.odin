@@ -10,8 +10,8 @@ PAD_LEN   :: 16
 
 LP_DEBUG_PAD :: #config(LP_DEBUG_PAD, false)
 
-@(private)
 // Returns the byte length of the NOP instruction at p, or 0 if it is not a NOP.
+@(private)
 lp_nop_len :: proc(p: [^]u8, max: int) -> int {
 	i := 0
 	for i < max && p[i] == 0x66 { // operand-size prefixes pad out the longer NOP forms
@@ -44,8 +44,8 @@ lp_nop_len :: proc(p: [^]u8, max: int) -> int {
 	return 0
 }
 
-@(private)
 // Reports whether the n bytes at pb are entirely NOP instructions.
+@(private)
 lp_is_nop_sled :: proc(pb: [^]u8, n: int) -> bool {
 	i := 0
 	for i < n {
@@ -58,8 +58,8 @@ lp_is_nop_sled :: proc(pb: [^]u8, n: int) -> bool {
 	return i == n
 }
 
-@(private)
 // Reports whether the bytes before an entry point hold a patch pad (a NOP sled or an already-installed jump).
+@(private)
 lp_has_patch_pad :: proc(entry: rawptr) -> bool {
 	pb := ([^]u8)(rawptr(uintptr(entry) - PAD_LEN))
 	if pb[0] == 0xFF && pb[1] == 0x25 { // an abs jump we already installed
@@ -68,8 +68,8 @@ lp_has_patch_pad :: proc(entry: rawptr) -> bool {
 	return lp_is_nop_sled(pb, PAD_LEN)
 }
 
-@(private)
 // Reports whether an entry point is livepatchable (sits above PAD_LEN and has a patch pad).
+@(private)
 lp_is_hot_entry :: proc(entry: rawptr) -> bool {
 	if uintptr(entry) < PAD_LEN {
 		return false
@@ -77,8 +77,8 @@ lp_is_hot_entry :: proc(entry: rawptr) -> bool {
 	return lp_has_patch_pad(entry)
 }
 
-@(private)
 // Writes a 14-byte absolute indirect jump to target at dst.
+@(private)
 lp_write_abs_jump :: proc(dst: [^]u8, target: rawptr) {
 	dst[0] = 0xFF; dst[1] = 0x25
 	dst[2] = 0x00; dst[3] = 0x00; dst[4] = 0x00; dst[5] = 0x00
@@ -86,6 +86,7 @@ lp_write_abs_jump :: proc(dst: [^]u8, target: rawptr) {
 }
 
 // Redirects original to target, preferring the atomic pad jump and falling back to an overwrite.
+@(private)
 patch_jump :: proc(original: rawptr, target: rawptr) -> (ok: bool, atomic: bool) {
 	if lp_patch_atomic(original, target) {
 		return true, true
@@ -127,8 +128,8 @@ lp_patch_atomic :: proc(original: rawptr, target: rawptr) -> bool {
 	return true
 }
 
-@(private)
 // Overwrites an entry point in place with an absolute jump to target (when there is no usable pad).
+@(private)
 lp_patch_overwrite :: proc(original: rawptr, target: rawptr) -> bool {
 	if gap := lp_next_symbol_after(uintptr(original)) - uintptr(original); gap < PATCH_LEN {
 		fmt.eprintfln("[livepatch] refusing overwrite patch: only %d bytes to next symbol (need %d)", gap, PATCH_LEN)

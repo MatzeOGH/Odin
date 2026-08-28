@@ -3376,73 +3376,52 @@ gb_internal bool lb_is_livepatch_refresh_global(Entity *e, DeclInfo *decl) {
 	return decl != nullptr && lb_is_load_directive_expr(decl->init_expr);
 }
 
-gb_internal u64 lb_livepatch_hash_mix(u64 h, u64 v) {
-	h ^= v;
-	h *= 0x100000001b3ull; // FNV-1a 64-bit prime
-	return h;
-}
-
-// lb_livepatch_layout_hash returns a hash of a type's *transitive in-memory layout*, unlike
-// the nominal `type_hash_canonical_type` (which, for a named struct, writes only `pkg.Name` and
-// so does NOT change when the struct gains/reorders/retypes a field). The livepatch guards use
-// this so that changing the layout of a struct held BY VALUE in a preserved/new global is
-// detected and rejected (its frozen storage cannot be reinterpreted safely).
-//
-// It recurses only through *value-embedding* aggregates — struct fields, fixed arrays, and union
-// variants — mixing in size/align/offsets at each level. It STOPS at pointers, slices, maps,
-// dynamic arrays and proc values: those are fixed-size headers whose own storage does not change
-// when the pointee/element layout changes (this is what keeps a `state: rawptr` global — the
-// pattern the migration examples rely on — from being flagged). Stopping at pointers also makes
-// the recursion acyclic (a struct cannot embed itself by value).
 gb_internal u64 lb_livepatch_layout_hash(Type *t) {
 	if (t == nullptr) {
 		return 0;
 	}
-	u64 h = 0xcbf29ce484222325ull; // FNV-1a 64-bit offset basis
-	h = lb_livepatch_hash_mix(h, cast(u64)type_size_of(t));
-	h = lb_livepatch_hash_mix(h, cast(u64)type_align_of(t));
+	TEMPORARY_ALLOCATOR_GUARD();
+
+	auto words = array_make<u64>(temporary_allocator(), 0, 8);
+	array_add(&words, cast(u64)type_size_of(t));
+	array_add(&words, cast(u64)type_align_of(t));
 
 	Type *b = base_type(t);
-	if (b == nullptr) {
-		return h;
-	}
-	switch (b->kind) {
-	case Type_Struct:
-		h = lb_livepatch_hash_mix(h, cast(u64)(b->Struct.is_packed ? 1 : 0));
-		h = lb_livepatch_hash_mix(h, cast(u64)(b->Struct.is_raw_union ? 2 : 0));
-		h = lb_livepatch_hash_mix(h, cast(u64)b->Struct.fields.count);
-		for_array(i, b->Struct.fields) {
-			Entity *f = b->Struct.fields[i];
-			h = lb_livepatch_hash_mix(h, fnv64a(f->token.string.text, f->token.string.len));
-			if (b->Struct.offsets != nullptr) {
-				h = lb_livepatch_hash_mix(h, cast(u64)b->Struct.offsets[i]);
+	if (b != nullptr) {
+		switch (b->kind) {
+		case Type_Struct:
+			array_add(&words, cast(u64)(b->Struct.is_packed ? 1 : 0));
+			array_add(&words, cast(u64)(b->Struct.is_raw_union ? 2 : 0));
+			array_add(&words, cast(u64)b->Struct.fields.count);
+			for_array(i, b->Struct.fields) {
+				Entity *f = b->Struct.fields[i];
+				array_add(&words, fnv64a(f->token.string.text, f->token.string.len));
+				if (b->Struct.offsets != nullptr) {
+					array_add(&words, cast(u64)b->Struct.offsets[i]);
+				}
+				array_add(&words, lb_livepatch_layout_hash(f->type));
 			}
-			h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(f->type));
+			break;
+		case Type_Array:
+			array_add(&words, cast(u64)b->Array.count);
+			array_add(&words, lb_livepatch_layout_hash(b->Array.elem));
+			break;
+		case Type_EnumeratedArray:
+			array_add(&words, cast(u64)b->EnumeratedArray.count);
+			array_add(&words, lb_livepatch_layout_hash(b->EnumeratedArray.elem));
+			break;
+		case Type_Union:
+			array_add(&words, cast(u64)b->Union.variants.count);
+			for_array(i, b->Union.variants) {
+				array_add(&words, lb_livepatch_layout_hash(b->Union.variants[i]));
+			}
+			break;
+		default:
+			array_add(&words, type_hash_canonical_type(b));
+			break;
 		}
-		break;
-	case Type_Array:
-		h = lb_livepatch_hash_mix(h, cast(u64)b->Array.count);
-		h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->Array.elem));
-		break;
-	case Type_EnumeratedArray:
-		h = lb_livepatch_hash_mix(h, cast(u64)b->EnumeratedArray.count);
-		h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->EnumeratedArray.elem));
-		break;
-	case Type_Union:
-		h = lb_livepatch_hash_mix(h, cast(u64)b->Union.variants.count);
-		for_array(i, b->Union.variants) {
-			h = lb_livepatch_hash_mix(h, lb_livepatch_layout_hash(b->Union.variants[i]));
-		}
-		break;
-	default:
-		// Basic, Enum (canonical string already encodes names+values), Bit_Set/Bit_Field
-		// (encoded structurally), and all indirection kinds (Pointer/Slice/Map/Dynamic_Array/
-		// Proc/...) whose header storage is layout-stable. The nominal canonical hash captures
-		// identity + enum/bit reordering without following indirection.
-		h = lb_livepatch_hash_mix(h, type_hash_canonical_type(b));
-		break;
 	}
-	return h;
+	return fnv64a(words.data, words.count * gb_size_of(u64));
 }
 
 gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
@@ -3757,13 +3736,6 @@ gb_internal void lb_livepatch_emit_refresh_syms(lbGenerator *gen) {
 	array_free(&buf);
 }
 
-// lb_livepatch_handle_global emits a package-scope global under -livepatch. It records refresh
-// globals + the base-build layout baseline, enforces the reload layout guard, and routes NEW
-// globals / thread-locals introduced by a reload into the persistent (TLS) arena. Returns true
-// if it fully emitted the global (the caller should `continue`); false if the caller should fall
-// through to normal emission (base build, a preserved global, or a refresh global). Assumes
-// build_context.livepatch && !is_foreign. This keeps the ~120-line livepatch block out of the
-// general lb_generate_code loop; the @(static) path mirrors it in lb_build_static_variables.
 gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entity *e, DeclInfo *decl, String name, Array<lbGlobalVariable> *global_variables) {
 	LivePatchManifest &livepatch_manifest = gen->livepatch_manifest;
 
@@ -3774,7 +3746,7 @@ gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entit
 	}
 
 	if (!livepatch_manifest.exists) {
-		// base build: record the layout baseline (layout hash so a struct field change is detected)
+		// record the layout baseline layout hash so a struct field change is detected
 		string_map_set(&livepatch_manifest.orig, name, lb_livepatch_layout_hash(e->type));
 		return false;
 	}

@@ -9,12 +9,10 @@ foreign import lp_ntdll "system:ntdll.lib"
 foreign import lp_kernel32 "system:kernel32.lib"
 @(default_calling_convention="system")
 foreign lp_ntdll {
-	// Enumerates the process's threads one at a time (no toolhelp snapshot needed).
 	NtGetNextThread :: proc(ProcessHandle, ThreadHandle: win.HANDLE, DesiredAccess: win.ACCESS_MASK, HandleAttributes, Flags: win.ULONG, NewThreadHandle: ^win.HANDLE) -> win.NTSTATUS ---
 }
 @(default_calling_convention="system")
 foreign lp_kernel32 {
-	// Returns a thread handle's thread id (used to skip our own thread).
 	GetThreadId :: proc(Thread: win.HANDLE) -> win.DWORD ---
 }
 
@@ -42,8 +40,8 @@ live_generations :: proc() -> int {
 	return len(_lp_generations)
 }
 
-@(private)
 // Walks a suspended thread's call stack, reporting whether any frame lies in the given code ranges.
+@(private)
 lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
 	ctx: win.CONTEXT
 	ctx.ContextFlags = win.CONTEXT_FULL
@@ -79,8 +77,8 @@ lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
 	return true
 }
 
-@(private)
 // Marks which past generations are unreferenced and untouched by any thread, so they can be freed.
+@(private)
 lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
 	for gen, i in _lp_generations {
 		if i >= len(freeable) {
@@ -107,8 +105,8 @@ lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
 	}
 }
 
-@(private)
 // Frees the generations flagged freeable, releasing their memory and unwind tables.
+@(private)
 lp_free_marked :: proc(freeable: []bool) {
 	if len(_lp_generations) == 0 {
 		return
@@ -139,8 +137,8 @@ lp_free_marked :: proc(freeable: []bool) {
 	}
 }
 
-@(private)
 // Suspends every thread except the caller's, returning their handles.
+@(private)
 lp_suspend_other_threads :: proc() -> [dynamic]win.HANDLE {
 	handles := make([dynamic]win.HANDLE, context.temp_allocator)
 	me_tid := win.GetCurrentThreadId()
@@ -175,8 +173,8 @@ lp_suspend_other_threads :: proc() -> [dynamic]win.HANDLE {
 	return handles
 }
 
-@(private)
 // Resumes and closes the previously suspended thread handles.
+@(private)
 lp_resume :: proc(handles: [dynamic]win.HANDLE) {
 	#reverse for h in handles {
 		win.ResumeThread(h)
@@ -184,8 +182,8 @@ lp_resume :: proc(handles: [dynamic]win.HANDLE) {
 	}
 }
 
-@(private)
 // Reports whether any suspended thread's instruction pointer sits in a region about to be patched.
+@(private)
 lp_ip_conflicts :: proc(handles: [dynamic]win.HANDLE, regions: []Lp_Range) -> bool {
 	for h in handles {
 		ctx: win.CONTEXT

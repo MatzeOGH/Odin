@@ -4,6 +4,7 @@ package livepatch
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
+import "core:hash"
 import "core:mem"
 import "core:os"
 import "core:time"
@@ -150,7 +151,7 @@ lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: 
 								all_syms[name] = obj_addr
 								append(&hot_names, Hot{name, oi})
 							} else {
-								if !hot && changed && have_obj_hashes && lp_fnv64(name) in obj_hashes {
+								if !hot && changed && have_obj_hashes && hash.fnv64a(transmute([]byte)name) in obj_hashes {
 									hot_detect_misses += 1
 								}
 								all_syms[name] = exe_addr

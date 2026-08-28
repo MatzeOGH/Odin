@@ -56,8 +56,8 @@ alloc_near :: proc(near: uintptr, size: int) -> rawptr {
 	return nil
 }
 
-@(private)
 // Returns the base of this thread's TLS block for the exe's TLS index.
+@(private)
 lp_tls_block_base :: proc "contextless" () -> uintptr {
 	read_teb_tls :: asm() -> (r: u64) { mov r, [%gs:0x58]; }
 	teb_tls := uintptr(read_teb_tls())
@@ -68,8 +68,8 @@ lp_tls_block_base :: proc "contextless" () -> uintptr {
 	return arr[_lp_tls_index]
 }
 
-@(private)
 // Resolves an external symbol, routing __imp_ imports through a near indirection cell.
+@(private)
 lp_resolve :: proc(name: string, na: ^Near_Arena) -> rawptr {
 	if p := lp_resolve_external(name); p != nil {
 		return p
@@ -84,8 +84,8 @@ lp_resolve :: proc(name: string, na: ^Near_Arena) -> rawptr {
 	return nil
 }
 
-@(private)
 // Resolves a symbol from the exe's exports, known specials, or the PDB.
+@(private)
 lp_resolve_external :: proc(name: string) -> rawptr {
 	if p := lp_resolve_exported(name); p != nil {
 		return p
@@ -99,8 +99,8 @@ lp_resolve_external :: proc(name: string) -> rawptr {
 	return nil
 }
 
-@(private)
 // Resolves a symbol exported by the exe or the common system DLLs.
+@(private)
 lp_resolve_exported :: proc(name: string) -> rawptr {
 	cname, err := strings.clone_to_cstring(name, context.temp_allocator)
 	if err != nil {
@@ -118,8 +118,8 @@ lp_resolve_exported :: proc(name: string) -> rawptr {
 	return nil
 }
 
-@(private)
 // SymEnumSymbolsW callback: records each address-bearing PDB symbol into the symbol map.
+@(private)
 lp_enum_cb :: proc "system" (pSym: win.PSYMBOL_INFOW, size: win.ULONG, user: win.PVOID) -> win.BOOL {
 	st := (^Lp_Enum_State)(user)
 	context = st.ctx
@@ -140,8 +140,8 @@ lp_enum_cb :: proc "system" (pSym: win.PSYMBOL_INFOW, size: win.ULONG, user: win
 	return win.TRUE
 }
 
-@(private)
 // Initializes DbgHelp and enumerates the exe's PDB symbols once; returns whether any were found.
+@(private)
 lp_dbghelp_ensure :: proc() -> bool {
 	if _lp_dbghelp_ready {
 		return len(_lp_syms) > 0
@@ -162,8 +162,8 @@ lp_dbghelp_ensure :: proc() -> bool {
 	return true
 }
 
-@(private)
 // Looks a symbol up in the exe's PDB symbol map.
+@(private)
 lp_resolve_pdb :: proc(name: string) -> rawptr {
 	if !lp_dbghelp_ensure() {
 		return nil
@@ -171,8 +171,8 @@ lp_resolve_pdb :: proc(name: string) -> rawptr {
 	return _lp_syms[name]
 }
 
-@(private)
 // Returns the address of the nearest PDB symbol after addr (max(uintptr) if none), to bound a proc's extent.
+@(private)
 lp_next_symbol_after :: proc(addr: uintptr) -> uintptr {
 	best := max(uintptr)
 	for _, v in _lp_syms {
@@ -184,8 +184,8 @@ lp_next_symbol_after :: proc(addr: uintptr) -> uintptr {
 	return best
 }
 
-@(private)
 // Resolves a thread-local's offset within the TLS block via its generated accessor (cached).
+@(private)
 lp_tls_offset :: proc(varname: string, cache: ^map[string]uintptr) -> (uintptr, bool) {
 	if off, ok := cache[varname]; ok {
 		return off, true
@@ -205,8 +205,8 @@ lp_tls_offset :: proc(varname: string, cache: ^map[string]uintptr) -> (uintptr, 
 	return off, true
 }
 
-@(private)
 // Bump-allocates n bytes from the near arena, reserving a new near block if needed.
+@(private)
 lp_near_bump :: proc(na: ^Near_Arena, n: int) -> rawptr {
 	if na.block == nil || na.used + n > na.cap {
 		blk := alloc_near(na.near, 0x1000)
@@ -222,8 +222,8 @@ lp_near_bump :: proc(na: ^Near_Arena, n: int) -> rawptr {
 	return p
 }
 
-@(private)
 // Returns (creating if needed) a near trampoline that absolute-jumps to an out-of-rel32-range target.
+@(private)
 lp_trampoline_for :: proc(na: ^Near_Arena, target: uintptr) -> rawptr {
 	if t, ok := na.tramps[target]; ok {
 		return t
@@ -237,8 +237,8 @@ lp_trampoline_for :: proc(na: ^Near_Arena, target: uintptr) -> rawptr {
 	return thunk
 }
 
-@(private)
 // Returns (creating if needed) a near indirection cell holding an imported symbol's address.
+@(private)
 lp_imp_cell :: proc(na: ^Near_Arena, addr: uintptr) -> rawptr {
 	if c, ok := na.cells[addr]; ok {
 		return c

@@ -16,17 +16,19 @@ Qual :: struct {
 	pkg, name: string,
 }
 
-@(private) _lp_live_types: map[Qual]^runtime.Type_Info
-@(private) _lp_live_types_ready: bool
+@(private) 
+_lp_live_types: map[Qual]^runtime.Type_Info
+@(private) 
+_lp_live_types_ready: bool
 
-@(private)
 // Builds a package-qualified key (pkg, name) from a named type info.
+@(private)
 lp_qual :: proc(named: runtime.Type_Info_Named) -> Qual {
 	return {named.pkg, named.name}
 }
 
-@(private)
 // Reports whether two type infos differ in memory layout (size, struct fields, enum/union members).
+@(private)
 lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
 	ba := runtime.type_info_base(a)
 	bb := runtime.type_info_base(b)
