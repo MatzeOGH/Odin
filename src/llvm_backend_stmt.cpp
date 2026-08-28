@@ -2445,8 +2445,6 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 
 		String mangled_name = {};
 		if (livepatch) {
-			// Source-stable, collision-free key `<proc>$static$<var>[$<occ>]` so the loader
-			// can match a static by name across a reload. See tech_design.md §4.
 			u32 *cnt = string_map_get(&p->livepatch_static_counts, name);
 			u32 occ = cnt ? *cnt : 0;
 			string_map_set(&p->livepatch_static_counts, name, occ + 1);
@@ -2467,14 +2465,10 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			mangled_name.len = gb_string_length(str);
 		}
 
-		// Livepatch: classify original (preserved) vs new (arena) vs refresh, mirroring the
-		// file-scope global fork in lb_generate_code. See tech_design.md §4, §5, §10.
 		if (livepatch) {
 			u64 th = type_hash_canonical_type(e->type);
 			LivePatchManifest &hm = gen->livepatch_manifest;
 
-			// Immutable embedded data (@(rodata) / #load / #hash / #load_hash): refreshed, not
-			// preserved. (#load_directory excluded: not baked to a const for a local @(static).)
 			String init_dir = vd->values.count > 0 ? lb_call_basic_directive_name(vd->values[i]) : str_lit("");
 			bool is_refresh = e->Variable.is_rodata ||
 			                  init_dir == "load" || init_dir == "hash" || init_dir == "load_hash";
@@ -2489,23 +2483,22 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				u64 *orig_th = string_map_get(&hm.orig, mangled_name);
 				if (orig_th != nullptr) {
 					if (*orig_th != th) {
-						error(e->token, "livepatch: @(static) variable '%.*s' changed type/layout across a reload; its preserved memory cannot be reinterpreted safely", LIT(name));
+						error(e->token, "livepatch: @(static) variable '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
 					}
 				} else {
 					is_new = true;
 				}
 			} else {
-				string_map_set(&hm.orig, mangled_name, th); // base build: record as original
+				string_map_set(&hm.orig, mangled_name, th); 
 			}
 
 			if (is_thread_local && is_new) {
-				// New thread-local static -> per-thread TLS arena. See tech_design.md §5.
 				i64 offset = 0;
 				LivePatchNewEntry *ne = string_map_get(&hm.tls_newg, mangled_name);
 				if (ne != nullptr) {
 					offset = ne->offset;
 					if (ne->type_hash != th) {
-						error(e->token, "livepatch: new thread-local @(static) variable '%.*s' changed type/layout across a reload; its TLS arena storage cannot be reinterpreted safely", LIT(name));
+						error(e->token, "livepatch: new thread-local @(static) variable '%.*s' changed type/layout across a reload. Its TLS arena storage cannot be reinterpreted safely", LIT(name));
 					}
 				} else {
 					i64 al = gb_max(type_align_of(e->type), 1);
@@ -2513,7 +2506,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 					offset = align_formula(hm.tls_next_free, al);
 					hm.tls_next_free = offset + sz;
 					if (hm.tls_next_free > hm.tls_arena_size) {
-						error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)hm.tls_next_free, cast(long long)hm.tls_arena_size);
+						error(e->token, "livepatch: new-thread-local TLS arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-tls-arena-size", cast(long long)hm.tls_next_free, cast(long long)hm.tls_arena_size);
 					}
 					LivePatchNewEntry added = {offset, th, -1};
 					string_map_set(&hm.tls_newg, mangled_name, added);
@@ -2528,9 +2521,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				continue;
 			} else if (is_thread_local) {
 				mutex_unlock(&gen->livepatch_mutex);
-				// Original thread-local static: normal emission; collected into tls_syms below.
 			} else if (is_new && !is_refresh) {
-				// New static -> arena, so its state survives reloads. See tech_design.md §4.
 				if (is_type_any(e->type)) {
 					error(e->token, "livepatch: new @(static) variable '%.*s' of type 'any' is not supported across a reload", LIT(name));
 				}
@@ -2543,7 +2534,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 					offset   = ne->offset;
 					flag_off = ne->init_flag_offset;
 					if (ne->type_hash != th) {
-						error(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload; its arena storage cannot be reinterpreted safely", LIT(name));
+						error(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
 					}
 				} else {
 					i64 al = gb_max(type_align_of(e->type), 1);
@@ -2555,7 +2546,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 						hm.next_free = flag_off + 1;
 					}
 					if (hm.next_free > hm.arena_size) {
-						error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes); rebuild the exe with a larger -livepatch-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
+						error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
 					}
 					LivePatchNewEntry added = {offset, th, flag_off};
 					string_map_set(&hm.newg, mangled_name, added);
@@ -2580,7 +2571,6 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 				continue;
 			} else {
 				mutex_unlock(&gen->livepatch_mutex);
-				// Normal emission: original static -> exe's copy; new refresh static -> object-local.
 			}
 		}
 
@@ -2635,7 +2625,6 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 		lb_add_member(p->module, mangled_name, global_val);
 
 		if (livepatch && is_thread_local) {
-			// Original thread-local static: record for a TLS accessor. See tech_design.md §5.
 			MUTEX_GUARD(&gen->livepatch_mutex);
 			lbLivePatchStaticSym s = {mangled_name, global, type_hash_canonical_type(e->type), p->module};
 			array_add(&gen->livepatch_tls_syms, s);

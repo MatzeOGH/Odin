@@ -96,8 +96,6 @@ gb_internal lbValue lb_type_info(lbProcedure *p, Type *type) {
 	lbModule *m = p->module;
 
 	if (build_context.livepatch) {
-		// Resolve through the exe's type_table by build-stable typeid, not a build-local index,
-		// so reflection in hot code lands on the exe's Type_Info. See tech_design.md §9.
 		auto args = array_make<lbValue>(permanent_allocator(), 1);
 		args[0] = lb_typeid(m, type);
 		return lb_emit_runtime_call(p, "__type_info_of", args);

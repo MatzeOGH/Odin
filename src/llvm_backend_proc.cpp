@@ -119,7 +119,6 @@ gb_internal bool lb_proc_is_livepatchable(lbProcedure *p) {
 	if (pt->Proc.calling_convention == ProcCC_Naked || pt->Proc.calling_convention == ProcCC_InlineAsm) {
 		return false;
 	}
-	// Only user packages are auto hot-patchable; skip the shipped stdlib. See tech_design.md §7.
 	AstPackage *pkg = e->pkg;
 	if (pkg == nullptr) {
 		return false;
@@ -311,8 +310,6 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "cold");
 	}
 
-	// -livepatch: make every eligible proc noinline + patchable, with a 16-byte prologue
-	// pad the loader parks its jump in. See tech_design.md §7.
 	if (lb_proc_is_livepatchable(p)) {
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 		lb_add_attribute_to_proc_with_string(m, p->value,
