@@ -3123,9 +3123,6 @@ gb_internal void generate_minimum_dependency_set_internal(Checker *c, Entity *st
 	}
 }
 
-// Under -livepatch, force type_info for every entity (and its recorded type-info deps) into the
-// minimum dependency set, so the frozen exe's runtime.type_table is complete enough for reflection
-// over — and migration of — types a later reload edits. Pairs with lb_livepatch_emit_type_table_syms.
 gb_internal void generate_livepatch_type_info_deps(Checker *c) {
 	for (Entity *e : c->info.entities) {
 		if (e == nullptr || e->type == nullptr) {
