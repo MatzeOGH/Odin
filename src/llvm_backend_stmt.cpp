@@ -2412,12 +2412,6 @@ gb_internal void lb_build_type_switch_stmt(lbProcedure *p, AstTypeSwitchStmt *ss
 	lb_close_scope(p, lbDeferExit_Default, done, ss->body);
 }
 
-
-// lb_livepatch_handle_static_variable is the @(static)-local mirror of lb_livepatch_handle_global:
-// it enforces the reload layout guard and routes NEW @(static) vars / thread-locals into the
-// persistent (TLS) arena, keyed by their mangled name. Returns true if it fully emitted the
-// variable (caller should `continue`), false to fall through to normal @(static) emission
-// (base build, preserved var, refresh var). Takes gen->livepatch_mutex internally.
 gb_internal bool lb_livepatch_handle_static_variable(lbGenerator *gen, lbModule *m, Entity *e, String name, String mangled_name, lbValue value, bool is_thread_local, bool is_refresh) {
 	LivePatchManifest &hm = gen->livepatch_manifest;
 	u64 th = lb_livepatch_layout_hash(e->type);

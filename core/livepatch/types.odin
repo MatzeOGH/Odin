@@ -16,16 +16,14 @@ Qual :: struct {
 	pkg, name: string,
 }
 
-@(private) 
-_lp_live_types: map[Qual]^runtime.Type_Info
-@(private) 
-_lp_live_types_ready: bool
-
-// Builds a package-qualified key (pkg, name) from a named type info.
 @(private)
-lp_qual :: proc(named: runtime.Type_Info_Named) -> Qual {
-	return {named.pkg, named.name}
-}
+_lp_live_types: map[Qual]^runtime.Type_Info
+@(private)
+_lp_live_types_ready: bool
+@(private)
+_lp_latest_ti_hdr: rawptr
+
+
 
 // Reports whether two type infos differ in memory layout (size, struct fields, enum/union members).
 @(private)
@@ -99,8 +97,8 @@ lp_layout_differs :: proc(a, b: ^runtime.Type_Info) -> bool {
 	return false
 }
 
-@(private)
 // Reads the []^Type_Info slice header stored at the given address.
+@(private)
 lp_read_type_infos :: proc(tbl_addr: rawptr) -> []^runtime.Type_Info {
 	if tbl_addr == nil {
 		return nil
@@ -108,50 +106,53 @@ lp_read_type_infos :: proc(tbl_addr: rawptr) -> []^runtime.Type_Info {
 	return (^[]^runtime.Type_Info)(tbl_addr)^
 }
 
-@(private)
 // (Re)builds the live named-type lookup map from a slice of type infos.
+@(private)
 lp_fill_live_types :: proc(tis: []^runtime.Type_Info) {
 	_lp_live_types = make(map[Qual]^runtime.Type_Info, runtime.heap_allocator())
 	for ti in tis {
 		if ti == nil { continue }
 		if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
-			_lp_live_types[lp_qual(named)] = ti
+			_lp_live_types[{named.pkg, named.name}] = ti
 		}
 	}
 }
 
-@(private)
 // Returns the live named-type map, lazily building it from the exe on first use.
+@(private)
 lp_live_types_by_name :: proc() -> map[Qual]^runtime.Type_Info {
 	if _lp_live_types_ready {
 		return _lp_live_types
 	}
 	_lp_live_types_ready = true
-	lp_fill_live_types(lp_read_type_infos(lp_resolve_pdb(LP_TYPE_INFOS_SYM)))
+	src := _lp_latest_ti_hdr != nil ? _lp_latest_ti_hdr : lp_resolve_pdb(LP_TYPE_INFOS_SYM)
+	lp_fill_live_types(lp_read_type_infos(src))
 	return _lp_live_types
 }
 
+// Invalidates the live named-type map after a type-table swap.
 @(private)
-// Replaces the live named-type map with the ones from a freshly loaded type table.
 lp_advance_live_types :: proc(new_hdr: rawptr) {
-	new_tis := lp_read_type_infos(new_hdr)
-	if len(new_tis) == 0 {
+	if lp_read_type_infos(new_hdr) == nil {
 		return
 	}
+	_lp_latest_ti_hdr = new_hdr
 	if _lp_live_types_ready {
 		delete(_lp_live_types)
+		_lp_live_types_ready = false
 	}
-	lp_fill_live_types(new_tis)
-	_lp_live_types_ready = true
 }
 
-@(private)
 // Compares the reload's types against the live ones, reporting whether a type-table swap is needed and (if wanted) which types changed.
+@(private)
 lp_analyze_types :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section_bases: []rawptr, want_changes: bool) -> (needs_swap: bool, changes: []Type_Change, new_hdr: rawptr) {
 	new_hdr, _ = find_symbol_address(data, sym_off, n_syms, strtab_off, section_bases, LP_TYPE_INFOS_SYM)
 	new_tis := lp_read_type_infos(new_hdr)
 	if len(new_tis) == 0 {
 		return false, nil, new_hdr
+	}
+	if !want_changes {
+		return true, nil, new_hdr
 	}
 	old_by_name := lp_live_types_by_name()
 	if len(old_by_name) == 0 {
@@ -163,20 +164,15 @@ lp_analyze_types :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section
 		if ti == nil { continue }
 		named, ok := ti.variant.(runtime.Type_Info_Named)
 		if !ok { continue }
-		old_ti, found := old_by_name[lp_qual(named)]
+		old_ti, found := old_by_name[{named.pkg, named.name}]
 		if !found {
 			needs_swap = true
-			if !want_changes { break }
 			continue
 		}
 		if lp_layout_differs(old_ti, ti) {
 			needs_swap = true
-			if !want_changes { break }
-			direct[lp_qual(named)] = true
+			direct[{named.pkg, named.name}] = true
 		}
-	}
-	if !want_changes {
-		return needs_swap, nil, new_hdr
 	}
 
 	memo := make(map[rawptr]bool, context.temp_allocator)
@@ -185,7 +181,7 @@ lp_analyze_types :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section
 		if ti == nil { continue }
 		named, ok := ti.variant.(runtime.Type_Info_Named)
 		if !ok { continue }
-		old_ti, found := old_by_name[lp_qual(named)]
+		old_ti, found := old_by_name[{named.pkg, named.name}]
 		if !found { continue }
 		if lp_contains_changed(ti, direct, &memo) {
 			append(&ch, Type_Change{old = old_ti, new = ti})
@@ -194,8 +190,8 @@ lp_analyze_types :: proc(data: []byte, sym_off, n_syms, strtab_off: int, section
 	return needs_swap, ch[:], new_hdr
 }
 
-@(private)
 // Recursively reports whether a type transitively contains any directly-changed type (memoized).
+@(private)
 lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[Qual]bool, memo: ^map[rawptr]bool) -> bool {
 	if ti == nil {
 		return false
@@ -207,7 +203,7 @@ lp_contains_changed :: proc(ti: ^runtime.Type_Info, direct: map[Qual]bool, memo:
 
 	result := false
 	if named, ok := ti.variant.(runtime.Type_Info_Named); ok {
-		if direct[lp_qual(named)] {
+		if direct[{named.pkg, named.name}] {
 			result = true
 		}
 	}

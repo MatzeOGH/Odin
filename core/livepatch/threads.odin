@@ -146,9 +146,6 @@ lp_suspend_other_threads :: proc() -> [dynamic]win.HANDLE {
 	// QUERY_LIMITED_INFORMATION is needed so GetThreadId works to skip our own thread.
 	ACCESS :: win.ACCESS_MASK(win.THREAD_SUSPEND_RESUME | win.THREAD_GET_CONTEXT | win.THREAD_SET_CONTEXT | win.THREAD_QUERY_LIMITED_INFORMATION)
 
-	// NtGetNextThread reads `cursor` only to locate the next thread; it never closes it. So a
-	// handle stays valid as the cursor for exactly one more call, after which we close it unless
-	// we kept it (suspended, to be resumed later). nil cursor starts the enumeration.
 	cursor: win.HANDLE = nil
 	cursor_keep := false
 	for {

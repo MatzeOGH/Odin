@@ -17,8 +17,7 @@ LP_TIMING :: #config(LP_TIMING, false)
 @(private) _lp_busy: b32
 @(private) _lp_build_busy: b32
 
-// A single reload object mapped into memory near the exe, plus the bookkeeping
-// needed to relocate and later free it.
+// A single reload object mapped into memory near the exe, plus the bookkeeping needed to relocate and later free it.
 @(private)
 Obj :: struct {
 	path:          string,
@@ -480,6 +479,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			needs_swap_types, changed, fresh_ti_hdr = lp_analyze_types(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, want_changes)
 		}
 	}
+	lp_phase("types", &mark)
 	defer delete(changed)
 	lp_call_patch_hooks(pre_tbl, changed, lp_resolve_pre_hook, nil)
 

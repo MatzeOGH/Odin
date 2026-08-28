@@ -18,12 +18,15 @@ apply :: proc(obj_path: string) -> bool {
 // Applies every .obj in a directory as one reload.
 apply_dir :: proc(dir := "hot_objs") -> bool {
 	when !ODIN_LIVEPATCH { return false }
+
 	scratch: runtime.Arena
 	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
 	context.temp_allocator = runtime.arena_allocator(&scratch)
 	defer runtime.arena_destroy(&scratch)
+
 	pattern := fmt.tprintf("%s/*.obj", dir)
 	matches, err := filepath.glob(pattern, context.temp_allocator)
+
 	if err != nil || len(matches) == 0 {
 		fmt.eprintfln("[livepatch] apply_dir: no .obj files found in %q", dir)
 		return false
@@ -31,8 +34,8 @@ apply_dir :: proc(dir := "hot_objs") -> bool {
 	return apply_many(matches)
 }
 
-// Rebuilds the reload objects by invoking the Odin compiler per the manifest.
-build_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> bool {
+// Rebuilds the reload objects by invoking the Odin compiler on the exe's own package.
+build_patch :: proc(odin := "odin", env: []string = nil) -> bool {
 	when !ODIN_LIVEPATCH { return false }
 
 	scratch: runtime.Arena
@@ -40,26 +43,19 @@ build_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: 
 	context.temp_allocator = runtime.arena_allocator(&scratch)
 	defer runtime.arena_destroy(&scratch)
 
-	pkg_dir, ok := lp_manifest_pkg_dir(manifest)
-	if !ok {
-		fmt.eprintfln("[livepatch] build_patch: no pkg_dir in manifest %q (build the exe with -livepatch first)", manifest)
-		return false
-	}
-	return lp_run_patch_build(odin, pkg_dir, env)
+	return lp_run_patch_build(odin, filepath.dir(os.args[0]), env)
 }
 
 // Rebuilds the reload objects and applies them in one step.
-apply_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> bool {
+apply_patch :: proc(odin := "odin", env: []string = nil) -> bool {
 	when !ODIN_LIVEPATCH { return false }
+
 	scratch: runtime.Arena
 	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
 	context.temp_allocator = runtime.arena_allocator(&scratch)
 	defer runtime.arena_destroy(&scratch)
-	pkg_dir, ok := lp_manifest_pkg_dir(manifest)
-	if !ok {
-		fmt.eprintfln("[livepatch] apply_patch: no pkg_dir in manifest %q (build the exe with -livepatch first)", manifest)
-		return false
-	}
+
+	pkg_dir := filepath.dir(os.args[0])
 	if !lp_run_patch_build(odin, pkg_dir, env) {
 		return false
 	}
@@ -71,16 +67,15 @@ apply_patch :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: 
 Async_Build :: struct {
 	th:       ^thread.Thread,
 	done:     b32, // atomic: set by the worker when the build finishes
-	ok:       b32, // valid once done: whether the build succeeded
+	ok:       b32, // valid once done
 	odin:     string,
-	manifest: string,
 	env:      []string,
-	objs_dir: string, // resolved at spawn so apply doesn't need the manifest again
+	objs_dir: string, // resolved at spawn so apply doesn't re-derive it
 }
 
 
 // Starts an async patch build on a worker thread, returning a handle to poll.
-build_patch_async :: proc(odin := "odin", manifest := "odin-livepatch.manifest", env: []string = nil) -> ^Async_Build {
+build_patch_async :: proc(odin := "odin", env: []string = nil) -> ^Async_Build {
 	when !ODIN_LIVEPATCH { return nil }
 
 	if _, ok := intrinsics.atomic_compare_exchange_strong(&_lp_build_busy, false, true); !ok {
@@ -88,23 +83,13 @@ build_patch_async :: proc(odin := "odin", manifest := "odin-livepatch.manifest",
 		return nil
 	}
 
-	scratch: runtime.Arena
-	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
-	context.temp_allocator = runtime.arena_allocator(&scratch)
-	defer runtime.arena_destroy(&scratch)
-
 	ab := new(Async_Build)
 	ab.odin = strings.clone(odin)
-	ab.manifest = strings.clone(manifest)
 	ab.env = env
+	ab.objs_dir = filepath.join({filepath.dir(os.args[0]), "hot_objs"}) or_else strings.clone("hot_objs")
 
-	if pkg_dir, ok := lp_manifest_pkg_dir(manifest); ok {
-		ab.objs_dir = filepath.join({pkg_dir, "hot_objs"}) or_else strings.clone("hot_objs")
-	} else {
-		ab.objs_dir = strings.clone("hot_objs")
-	}
 	ab.th = thread.create_and_start_with_poly_data(ab, proc(ab: ^Async_Build) {
-		ok := build_patch(ab.odin, ab.manifest, ab.env)
+		ok := build_patch(ab.odin, ab.env)
 		intrinsics.atomic_store(&ab.ok, b32(ok))
 		intrinsics.atomic_store(&ab.done, true)
 	})
@@ -126,7 +111,6 @@ try_apply_async :: proc(ab: ^Async_Build) -> (applied: bool, still_building: boo
 	}
 	thread.destroy(ab.th)
 	delete(ab.odin)
-	delete(ab.manifest)
 	delete(ab.objs_dir)
 	free(ab)
 	intrinsics.atomic_store(&_lp_build_busy, false)
@@ -151,22 +135,4 @@ lp_run_patch_build :: proc(odin: string, pkg_dir: string, env: []string) -> bool
 		return false
 	}
 	return true
-}
-
-// Reads the pkg_dir value from a livepatch manifest file.
-@(private)
-lp_manifest_pkg_dir :: proc(manifest_path: string) -> (string, bool) {
-	data, err := os.read_entire_file(manifest_path, context.temp_allocator)
-	if err != nil {
-		return "", false
-	}
-
-	content := string(data)
-	for line in strings.split_lines_iterator(&content) {
-		if strings.has_prefix(line, "pkg_dir ") {
-			pkg_dir := strings.trim_space(strings.trim_prefix(line, "pkg_dir "))
-			return pkg_dir, len(pkg_dir) > 0
-		}
-	}
-	return "", false
 }

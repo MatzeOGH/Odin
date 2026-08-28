@@ -1122,10 +1122,6 @@ gb_internal void lb_setup_type_info_data_giant_array(lbModule *m, i64 global_typ
 	lb_set_odin_rtti_section(giant_array);
 }
 
-
-// lb_livepatch_emit_type_table_syms emits the two externals the loader needs to refresh reflection
-// after a reload: __odin_livepatch_type_infos (the reload's complete []^Type_Info slice value) and
-// __odin_livepatch_type_table_ref (a pointer to the live runtime.type_table slice header to swap).
 gb_internal void lb_livepatch_emit_type_table_syms(lbModule *m, lbValue global_type_table, LLVMValueRef slice) {
 	Type *slice_type = type_deref(global_type_table.type);
 	LLVMValueRef tbl = LLVMAddGlobal(m->mod, lb_type(m, slice_type), "__odin_livepatch_type_infos");
