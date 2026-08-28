@@ -1,9 +1,0 @@
-.work/
-.work_rl/
-.probe/
-*.exe
-*.obj
-*.pdb
-*.rdi
-*.manifest
-hot_objs/
