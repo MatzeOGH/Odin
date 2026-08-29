@@ -124,10 +124,11 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 // relocation should target (the exe's copy, unless the proc is hot & changed),
 // and `hot_names` lists the procedures to patch.
 @(private)
-lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: bool) -> (all_syms, all_defs: map[string]rawptr, hot_names: [dynamic]Hot, hot_detect_misses: int) {
+lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: bool) -> (all_syms, all_defs: map[string]rawptr, hot_names, new_hot: [dynamic]Hot, hot_detect_misses: int) {
 	all_syms = make(map[string]rawptr, context.temp_allocator)
 	all_defs = make(map[string]rawptr, context.temp_allocator)
 	hot_names = make([dynamic]Hot, context.temp_allocator)
+	new_hot = make([dynamic]Hot, context.temp_allocator)
 	for &o, oi in objs {
 		cursor := 0
 		for sym in coff_symbols(o.data, o.sym_off, o.n_syms, &cursor) {
@@ -157,6 +158,21 @@ lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: 
 							}
 						} else if exe_addr != nil {
 							all_syms[name] = exe_addr
+						} else if is_code && have_obj_hashes && hash.fnv64a(transmute([]byte)name) in obj_hashes {
+							// A newly-added procedure: not in the exe, but a tracked
+							// livepatchable proc. Route every reference through a stable
+							// persistent trampoline so it becomes an independent patch
+							// target and all callers observe one live version.
+							_, existed := _lp_new_tramps[name]
+							tramp := lp_new_proc_trampoline(name)
+							if tramp == nil {
+								all_syms[name] = obj_addr
+							} else {
+								all_syms[name] = tramp
+								if !existed || lp_proc_changed(name, obj_hashes, have_obj_hashes) {
+									append(&new_hot, Hot{name, oi})
+								}
+							}
 						} else {
 							all_syms[name] = obj_addr
 						}
@@ -400,7 +416,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		}
 	}
 
-	all_syms, all_defs, hot_names, hot_detect_misses := lp_build_symbols(objs[:], obj_hashes, have_obj_hashes)
+	all_syms, all_defs, hot_names, new_hot, hot_detect_misses := lp_build_symbols(objs[:], obj_hashes, have_obj_hashes)
 
 	if hot_detect_misses > 0 {
 		fmt.eprintfln("[livepatch] WARNING: %d changed livepatchable procedure(s) exist in the running exe but their prologue did not match a patch pad. These procedures were NOT patched.", hot_detect_misses)
@@ -518,7 +534,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		swap_type_table = tt_ref != nil
 	}
 
-	if len(hot_names) == 0 && len(refresh_targets) == 0 && !swap_type_table {
+	if len(hot_names) == 0 && len(new_hot) == 0 && len(refresh_targets) == 0 && !swap_type_table {
 		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
 		if have_obj_hashes {
 			for k, v in obj_hashes {
@@ -552,6 +568,22 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		append(&targets, Target{h.name, original, fresh})
 	}
 
+	// Newly-added procedures: (re)point each stable trampoline at this reload's body.
+	New_Target :: struct {
+		name:         string,
+		tramp, fresh: rawptr,
+	}
+	new_targets := make([dynamic]New_Target, context.temp_allocator)
+	for h in new_hot {
+		tramp := lp_new_proc_trampoline(h.name)
+		fresh, found := all_defs[h.name]
+		if tramp == nil || !found {
+			fmt.eprintfln("[livepatch] aborting reload: could not resolve new procedure %q (tramp=%v, fresh_found=%v). nothing patched", h.name, tramp != nil, found)
+			return false
+		}
+		append(&new_targets, New_Target{h.name, tramp, fresh})
+	}
+
 	regions := make([]Lp_Range, len(targets), context.temp_allocator)
 	for t, i in targets {
 		lo := uintptr(t.original)
@@ -560,7 +592,7 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	lp_phase("meta", &mark)
 
-	owner_bound := len(refresh_targets) + len(targets) + 1
+	owner_bound := len(refresh_targets) + len(targets) + len(new_targets) + 1
 	_lp_serial += 1
 	gen_serial := _lp_serial
 	gen_owned := make([dynamic]uintptr, 0, owner_bound, runtime.heap_allocator())
@@ -628,6 +660,16 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			append(&gen_owned, uintptr(t.original))
 		}
 	}
+	// Point each new procedure's stable trampoline at this reload's body. The
+	// trampoline arena is permanently writable+executable, and every other thread
+	// is suspended, so overwriting all 14 bytes is safe (a thread parked on the
+	// stub resumes into the freshly written absolute jump).
+	for t in new_targets {
+		lp_write_abs_jump(([^]u8)(t.tramp), t.fresh)
+		win.FlushInstructionCache(win.GetCurrentProcess(), t.tramp, win.SIZE_T(PATCH_LEN))
+		_lp_owner[uintptr(t.tramp)] = gen_serial
+		append(&gen_owned, uintptr(t.tramp))
+	}
 	lp_resume(handles)
 	lp_free_marked(freeable)
 
@@ -653,6 +695,9 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		if patch_ok[i] {
 			fmt.printfln("[livepatch] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, patch_atomic[i] ? "atomic" : "overwrite")
 		}
+	}
+	for t in new_targets {
+		fmt.printfln("[livepatch] linked new %s: trampoline %p -> %p", t.name, t.tramp, t.fresh)
 	}
 	for &o in objs {
 		for i in 0 ..< o.n_sections {

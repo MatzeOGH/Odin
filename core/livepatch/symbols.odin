@@ -33,6 +33,34 @@ Near_Arena :: struct {
 	cells:  map[uintptr]rawptr,
 }
 
+// Process-lifetime arena and registry backing the stable trampoline each
+// newly-added procedure is reached through. Never freed per generation: a
+// trampoline is a proc's identity across reloads, so it must outlive any single
+// reload's block.
+@(private) _lp_new_arena:  Near_Arena
+@(private) _lp_new_tramps: map[string]rawptr
+
+// Returns the stable trampoline for a newly-added procedure, creating a 16-byte
+// slot in the persistent near arena on first sighting. The slot's bytes (a
+// 14-byte absolute jump to the current body) are written later by apply_many,
+// once the reload's body address is known.
+@(private)
+lp_new_proc_trampoline :: proc(name: string) -> rawptr {
+	if t, ok := _lp_new_tramps[name]; ok {
+		return t
+	}
+	if _lp_new_arena.near == 0 {
+		_lp_new_arena.near = uintptr(win.GetModuleHandleW(nil))
+		_lp_new_tramps = make(map[string]rawptr, runtime.heap_allocator())
+	}
+	t := lp_near_bump(&_lp_new_arena, 16)
+	if t == nil {
+		return nil
+	}
+	_lp_new_tramps[strings.clone(name, runtime.heap_allocator())] = t
+	return t
+}
+
 // Reserves executable memory within 2GB of the running exe.
 alloc_near_exe :: proc(size: int) -> rawptr {
 	return alloc_near(uintptr(win.GetModuleHandleW(nil)), size)
