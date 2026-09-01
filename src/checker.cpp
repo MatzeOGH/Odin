@@ -3138,6 +3138,57 @@ gb_internal void generate_livepatch_type_info_deps(Checker *c) {
 	}
 }
 
+// A livepatch reload can only call code that is already present in the running image, and the
+// patch object never carries a stdlib module (see `lb_livepatch_skip_object`). Force every
+// top-level procedure and variable of every imported package into the dependency set so the
+// base build emits them all, which lets a reload reach for anything in a package some package
+// already imports. This cannot widen the set of packages: the checker only ever creates
+// entities for transitively-imported packages.
+gb_internal void generate_livepatch_package_deps(Checker *c) {
+	for (Entity *e : c->info.entities) {
+		if (e == nullptr || e->pkg == nullptr || e->scope == nullptr) {
+			continue;
+		}
+		if ((e->scope->flags & (ScopeFlag_File|ScopeFlag_Pkg)) == 0) {
+			continue;
+		}
+		switch (e->kind) {
+		case Entity_Procedure:
+			// A foreign procedure has no body to emit; `/WHOLEARCHIVE` supplies those bytes.
+			if (e->Procedure.is_foreign) {
+				continue;
+			}
+			break;
+		case Entity_Variable:
+			if (e->Variable.is_foreign) {
+				continue;
+			}
+			break;
+		default:
+			continue;
+		}
+		if (e->type == nullptr || is_type_polymorphic(e->type)) {
+			continue;
+		}
+		// Overload resolution registers a candidate instantiation per proc-group member and
+		// discards the ones whose 'where' clauses fail. Those entities stay in `info.entities`,
+		// so forcing them would make `check_unchecked_bodies` check a body that was never meant
+		// to exist. A genuinely used instantiation is reached through its caller's deps anyway.
+		DeclInfo *d = decl_info_of_entity(e);
+		if (d == nullptr || d->gen_proc_type != nullptr) {
+			continue;
+		}
+		// An alias (`to_lower_camel_case :: to_camel_case`) has no body of its own. Forcing it
+		// alongside the entity it aliases emits the same body twice against one DISubprogram,
+		// which LLVM rejects. Only force the declaration that actually owns the body.
+		if (e->kind == Entity_Procedure && (d->proc_lit == nullptr || d->entity.load(std::memory_order_relaxed) != e)) {
+			continue;
+		}
+		e->flags |= EntityFlag_Used;
+		add_dependency_to_set(c, e);
+	}
+}
+
 gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 #define FORCE_ADD_RUNTIME_ENTITIES(condition, ...) do {                                              \
 	if (condition) {                                                                             \
@@ -3241,6 +3292,14 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 
 	if (build_context.livepatch && !build_context.no_rtti) {
 		generate_livepatch_type_info_deps(c);
+	}
+
+	// Host builds only. A patch build's dependency set then stays a strict subset of the
+	// host's, so a reload can never need a global or procedure the host image lacks, and
+	// every F5 avoids generating IR for all of `core:`.
+	if (build_context.livepatch && !build_context.livepatch_patch && !build_context.livepatch_no_preload) {
+		generate_livepatch_package_deps(c);
+		thread_pool_wait();
 	}
 
 

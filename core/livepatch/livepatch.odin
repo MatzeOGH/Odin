@@ -78,7 +78,7 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 	for i in 0 ..< o.n_sections {
 		sh := section_header(data, o.sec_off, i)
 		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
-		if size == 0 {
+		if size == 0 || lp_is_discarded_section(sh) {
 			o.offsets[i + 1] = -1
 			continue
 		}
@@ -121,8 +121,12 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 
 // Builds the merged symbol tables across all objects: `all_defs` maps every
 // object-defined symbol to its object address, `all_syms` picks the address a
-// relocation should target (the exe's copy, unless the proc is hot & changed),
-// and `hot_names` lists the procedures to patch.
+// relocation should target — always a procedure's *stable* cell (its exe entry,
+// whose patch pad is the indirection, or the persistent trampoline of a proc the
+// reload introduced), never a body address — and `hot_names`/`new_hot` list the
+// cells to retarget. Routing every call site through the stable cell is what
+// keeps exactly one live version of a procedure: a caller that is itself never
+// re-patched still reaches the newest body of everything it calls.
 @(private)
 lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: bool) -> (all_syms, all_defs: map[string]rawptr, hot_names, new_hot: [dynamic]Hot, hot_detect_misses: int) {
 	all_syms = make(map[string]rawptr, context.temp_allocator)
@@ -137,7 +141,7 @@ lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: 
 			if sn > 0 && o.section_bases[sn] != nil {
 				obj_addr := rawptr(uintptr(o.section_bases[sn]) + uintptr(sym.value))
 				sh := section_header(o.data, o.sec_off, sn - 1)
-				if !lp_is_object_local_const(sh) {
+				if !lp_is_object_local(sym, name, sh) {
 					if _, seen := all_defs[name]; !seen {
 						all_defs[name] = obj_addr
 					}
@@ -145,24 +149,25 @@ lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: 
 						exe_addr := lp_resolve_pdb(name)
 						is_code := (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0
 						if exe_addr != nil && is_code {
+							// The exe entry is this proc's stable cell: its patch pad
+							// holds the indirection, so callers always land on the
+							// newest body. Never point a call site at a body directly.
+							all_syms[name] = exe_addr
 							changed := lp_proc_changed(name, obj_hashes, have_obj_hashes)
 							hot := lp_is_hot_entry(exe_addr)
 							if changed && hot {
-								all_syms[name] = obj_addr
 								append(&hot_names, Hot{name, oi})
-							} else {
-								if !hot && changed && have_obj_hashes && hash.fnv64a(transmute([]byte)name) in obj_hashes {
-									hot_detect_misses += 1
-								}
-								all_syms[name] = exe_addr
+							} else if !hot && changed && have_obj_hashes && hash.fnv64a(transmute([]byte)name) in obj_hashes {
+								hot_detect_misses += 1
 							}
 						} else if exe_addr != nil {
 							all_syms[name] = exe_addr
 						} else if is_code && have_obj_hashes && hash.fnv64a(transmute([]byte)name) in obj_hashes {
-							// A newly-added procedure: not in the exe, but a tracked
-							// livepatchable proc. Route every reference through a stable
-							// persistent trampoline so it becomes an independent patch
-							// target and all callers observe one live version.
+							// A newly-added procedure: not in the exe, so it has no entry
+							// and no patch pad. Give it a stable cell of its own in the
+							// persistent arena so it is an independent patch target and
+							// every caller, from this reload or an older one, observes a
+							// single live version.
 							_, existed := _lp_new_tramps[name]
 							tramp := lp_new_proc_trampoline(name)
 							if tramp == nil {
@@ -188,14 +193,14 @@ lp_build_symbols :: proc(objs: []Obj, obj_hashes: map[u64]u64, have_obj_hashes: 
 // flushes the icache over patched code and registers its .pdata unwind info.
 // Returns per-object relocation-failure counts.
 @(private)
-lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map[string]uintptr) -> (unresolved, unsupported, unresolved_text: int) {
+lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map[string]uintptr) -> (unresolved, unsupported, unresolved_text, unsupported_text: int) {
 	cursor := 0
 	for sym, i in coff_symbols(o.data, o.sym_off, o.n_syms, &cursor) {
 		name := symbol_name(sym, o.data, o.strtab_off)
 		sn := int(sym.section_number)
 		if sn > 0 && o.section_bases[sn] != nil {
 			sh := section_header(o.data, o.sec_off, sn - 1)
-			if lp_is_object_local_const(sh) {
+			if lp_is_object_local(sym, name, sh) {
 				o.resolved[i] = rawptr(uintptr(o.section_bases[sn]) + uintptr(sym.value))
 			} else {
 				o.resolved[i] = all_syms[name]
@@ -251,7 +256,7 @@ lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map
 					usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
 					uname := symbol_name(usym, o.data, o.strtab_off)
 					fmt.eprintfln("[livepatch] unresolved symbol in executable code: %s", uname)
-					fmt.eprintfln("[livepatch]   (if this is a foreign-library function: its code is not present in the running image. Reference it once in the base build, or link the archive whole, e.g. /WHOLEARCHIVE. Adding a library not linked into the base build is not supported. A base build without -debug also has no PDB to resolve non-exported symbols.)")
+					fmt.eprintfln("[livepatch]   (its code is not present in the running image. A -livepatch base build preloads everything its imports could reach, so the usual causes are: the symbol comes from a package no package in the base build imports, which is not supported; the base build used -livepatch-no-preload, which limits a reload to procedures the base build already referenced; or the base build had no -debug, leaving no PDB to resolve non-exported symbols.)")
 				}
 				continue
 			}
@@ -292,6 +297,12 @@ lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map
 				}
 			case:
 				unsupported += 1
+				if is_text {
+					unsupported_text += 1
+					usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
+					uname := symbol_name(usym, o.data, o.strtab_off)
+					fmt.eprintfln("[livepatch] unsupported relocation type 0x%x in executable code, against %s", int(rel.type), uname)
+				}
 			}
 		}
 	}
@@ -424,19 +435,22 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	lp_phase("symbols", &mark)
 
 	unresolved, unsupported := 0, 0
-	unresolved_text := 0
+	unresolved_text, unsupported_text := 0, 0
 	tls_cache := make(map[string]uintptr, context.temp_allocator)
 	for &o in objs {
-		u, us, ut := lp_relocate_object(&o, all_syms, &tls_cache)
+		u, us, ut, ust := lp_relocate_object(&o, all_syms, &tls_cache)
 		unresolved += u
 		unsupported += us
 		unresolved_text += ut
+		unsupported_text += ust
 	}
 	if unresolved > 0 || unsupported > 0 {
 		fmt.eprintfln("[livepatch] note: %d unresolved and %d unsupported relocations (fine if only in code you don't call)", unresolved, unsupported)
 	}
-	if unresolved_text > 0 {
-		fmt.eprintfln("[livepatch] aborting reload: %d unresolved relocation(s) in executable code (see names above)", unresolved_text)
+	// Either kind leaves a call site holding its raw addend, so patching a proc
+	// built from it would put silently wrong code live.
+	if unresolved_text > 0 || unsupported_text > 0 {
+		fmt.eprintfln("[livepatch] aborting reload: %d unresolved and %d unsupported relocation(s) in executable code (see names above)", unresolved_text, unsupported_text)
 		return false
 	}
 	lp_phase("reloc", &mark)
@@ -553,7 +567,9 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	targets := make([dynamic]Target, context.temp_allocator)
 	for h in hot_names {
 		original := lp_resolve_pdb(h.name)
-		fresh, found := all_syms[h.name]
+		// all_defs, not all_syms: all_syms[name] is now the entry itself, and
+		// patching an entry to jump to itself would spin.
+		fresh, found := all_defs[h.name]
 		if original == nil || !found {
 			fmt.eprintfln("[livepatch] aborting reload: could not resolve hot procedure %q (original=%v, fresh_found=%v). nothing patched", h.name, original != nil, found)
 			return false
@@ -662,8 +678,9 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	// Point each new procedure's stable trampoline at this reload's body. The
 	// trampoline arena is permanently writable+executable, and every other thread
-	// is suspended, so overwriting all 14 bytes is safe (a thread parked on the
-	// stub resumes into the freshly written absolute jump).
+	// is suspended, so overwriting all 14 bytes is safe (the stub is a single
+	// instruction, so a parked thread's RIP can only be at its first byte, and it
+	// resumes into the freshly written absolute jump).
 	for t in new_targets {
 		lp_write_abs_jump(([^]u8)(t.tramp), t.fresh)
 		win.FlushInstructionCache(win.GetCurrentProcess(), t.tramp, win.SIZE_T(PATCH_LEN))
@@ -724,14 +741,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	lp_phase("patch", &mark)
 
-	if patched != len(targets) {
-		return false
-	}
-
-	for k, v in obj_hashes {
-		_lp_cur[k] = v
-	}
-
 	if did_swap {
 		lp_advance_live_types(fresh_ti_hdr)
 		if have_obj_type_hash {
@@ -740,8 +749,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		}
 	}
 
-	lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
-
+	// The reload is committed: these blocks hold live code and data the process is
+	// already reaching, whether or not every entry took. Record the generation
+	// before any early-out, otherwise a partial patch strands the blocks, the near
+	// arena and the .pdata registrations where retirement can never reach them.
 	{
 		gen: Lp_Generation
 		gen.serial = gen_serial
@@ -766,6 +777,23 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			_lp_generations = make([dynamic]Lp_Generation, runtime.heap_allocator())
 		}
 		append(&_lp_generations, gen)
+	}
+
+	// Something went live, so state migration has to run even if some entries did
+	// not take -- the app is executing the new code either way.
+	if patched > 0 || did_swap || refreshed > 0 {
+		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
+	}
+
+	if patched != len(targets) {
+		fmt.eprintfln("[livepatch] %d of %d procedure(s) could not be patched; the reload is live but incomplete", len(targets) - patched, len(targets))
+		return false
+	}
+
+	// Only on a complete patch: a proc that did not take is still running its old
+	// body, so its hash must stay stale for the next reload to retry it.
+	for k, v in obj_hashes {
+		_lp_cur[k] = v
 	}
 	return true
 }

@@ -10,6 +10,16 @@ struct LinkerData {
 	bool     needs_system_library_linked;
 };
 
+// `system:` foreign imports resolve to a bare filename, everything else to a path.
+gb_internal bool string_contains_path_separator(String const &s) {
+	for (isize i = 0; i < s.len; i++) {
+		if (s[i] == '/' || s[i] == '\\') {
+			return true;
+		}
+	}
+	return false;
+}
+
 gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, ...);
 gb_internal bool system_exec_command_line_app_output(char const *command, gbString *output);
 
@@ -207,6 +217,8 @@ try_cross_linking:;
 
 			String prev_lib = {};
 
+			bool livepatch_whole_archive = build_context.livepatch && !build_context.livepatch_no_preload;
+
 			StringSet asm_files = {};
 			string_set_init(&asm_files, 64);
 			defer (string_set_destroy(&asm_files));
@@ -271,6 +283,15 @@ try_cross_linking:;
 					           !build_context.min_link_libs) {
 						if (prev_lib != lib) {
 							lib_str = gb_string_append_fmt(lib_str, " \"%.*s\"", LIT(lib));
+							// A livepatch reload can only call code that is already in the
+							// image, so pull every member of a foreign archive in rather
+							// than just the ones the base build happened to reference.
+							// Skipped for `system:` libraries, which resolve to a bare
+							// filename with no directory: whole-archiving the system import
+							// libraries only balloons the IAT.
+							if (livepatch_whole_archive && string_contains_path_separator(lib)) {
+								lib_str = gb_string_append_fmt(lib_str, " /WHOLEARCHIVE:\"%.*s\"", LIT(lib));
+							}
 						}
 						prev_lib = lib;
 					}

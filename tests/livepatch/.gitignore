@@ -1,0 +1,5 @@
+build/
+bench/
+
+# tests/.gitignore excludes *.bat; the driver is the test, like tests/issues/run.bat.
+!run.bat

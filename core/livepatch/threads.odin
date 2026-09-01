@@ -48,6 +48,15 @@ lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
 	if !win.GetThreadContext(h, &ctx) {
 		return true
 	}
+	return lp_context_touches(ctx, ranges)
+}
+
+// Walks the call stack described by a captured context, reporting whether any
+// frame lies in the given code ranges. Takes the context by value: unwinding
+// mutates it.
+@(private)
+lp_context_touches :: proc(ctx_in: win.CONTEXT, ranges: [dynamic]Lp_Range) -> bool {
+	ctx := ctx_in
 	MAX_FRAMES :: 256
 	for _ in 0 ..< MAX_FRAMES {
 		pc := uintptr(ctx.Rip)
@@ -77,9 +86,15 @@ lp_thread_touches :: proc(h: win.HANDLE, ranges: [dynamic]Lp_Range) -> bool {
 	return true
 }
 
-// Marks which past generations are unreferenced and untouched by any thread, so they can be freed.
+// Marks which past generations are unreferenced and untouched by any thread, so
+// they can be freed. `handles` covers the suspended threads; the applying thread
+// is not among them, so its own stack is captured here — a reload is very often
+// driven from inside a livepatched procedure, and that frame's generation must
+// not be freed out from under it.
 @(private)
 lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
+	self: win.CONTEXT
+	win.RtlCaptureContext(&self)
 	for gen, i in _lp_generations {
 		if i >= len(freeable) {
 			break
@@ -94,12 +109,12 @@ lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
 		if referenced {
 			continue
 		}
-		in_use := false
+		in_use := lp_context_touches(self, gen.ranges)
 		for h in handles {
-			if lp_thread_touches(h, gen.ranges) {
-				in_use = true
+			if in_use {
 				break
 			}
+			in_use = lp_thread_touches(h, gen.ranges)
 		}
 		freeable[i] = !in_use
 	}

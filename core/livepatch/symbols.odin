@@ -36,7 +36,8 @@ Near_Arena :: struct {
 // Process-lifetime arena and registry backing the stable trampoline each
 // newly-added procedure is reached through. Never freed per generation: a
 // trampoline is a proc's identity across reloads, so it must outlive any single
-// reload's block.
+// reload's block. (Procedures that exist in the exe already have such a cell —
+// their 16-byte patch pad — so they need no entry here.)
 @(private) _lp_new_arena:  Near_Arena
 @(private) _lp_new_tramps: map[string]rawptr
 

@@ -410,6 +410,7 @@ enum BuildFlagKind {
 	BuildFlag_LivePatchArenaSize,
 	BuildFlag_LivePatchTlsArenaSize,
 	BuildFlag_LivePatchManifest,
+	BuildFlag_LivePatchNoPreload,
 	BuildFlag_NoThreadedChecker,
 	BuildFlag_ShowDebugMessages,
 	BuildFlag_DidYouMeanLimit,
@@ -676,6 +677,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_LivePatchArenaSize,      str_lit("livepatch-arena-size"),     BuildFlagParam_Integer, Command__does_build);
 	add_flag(&build_flags, BuildFlag_LivePatchTlsArenaSize,   str_lit("livepatch-tls-arena-size"), BuildFlagParam_Integer, Command__does_build);
 	add_flag(&build_flags, BuildFlag_LivePatchManifest,       str_lit("livepatch-manifest"),       BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_LivePatchNoPreload,      str_lit("livepatch-no-preload"),     BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ShowDebugMessages,       str_lit("show-debug-messages"),       BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_DidYouMeanLimit,         str_lit("did-you-mean-limit"),        BuildFlagParam_Integer, Command__does_check);
@@ -1445,6 +1447,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							if (build_context.livepatch_tls_arena_size == 0) {
 								build_context.livepatch_tls_arena_size = 4*1024;
 							}
+							break;
+						case BuildFlag_LivePatchNoPreload:
+							build_context.livepatch_no_preload = true;
 							break;
 						case BuildFlag_LivePatchArenaSize:
 							{
@@ -3398,6 +3403,11 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		}
 		if (print_flag("-livepatch-manifest:<filepath>")) {
 			print_usage_line(2, "Overrides the livepatch manifest path (default: <package>/odin-livepatch.manifest).");
+		}
+		if (print_flag("-livepatch-no-preload")) {
+			print_usage_line(2, "Disables the -livepatch preloading of everything the base build could reach.");
+			print_usage_line(2, "Without preloading a patch may only call procedures the base build already referenced,");
+			print_usage_line(2, "but the base build stays smaller and links faster.");
 		}
 		if (print_flag("-livepatch-arena-size:<integer>")) {
 			print_usage_line(2, "Bytes reserved in the exe for globals introduced by a reload (default: 262144).");

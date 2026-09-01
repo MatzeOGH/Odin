@@ -1,6 +1,7 @@
 #+build windows
 package livepatch
 
+import "base:intrinsics"
 import "base:runtime"
 
 LP_TYPE_INFOS_SYM :: "__odin_livepatch_type_infos"
@@ -24,6 +25,39 @@ _lp_live_types_ready: bool
 _lp_latest_ti_hdr: rawptr
 
 
+
+// Copies every field present in both structs (matched by name and identical
+// type) from `src` into `dst`. Fields only in `dst` keep their current value
+// (zero, if freshly allocated); fields only in `src` are dropped. Use it from an
+// @(post_patch_hook) to carry a struct's state across a reload that reordered,
+// inserted, or removed fields — allocate a new-layout value, migrate_fields into
+// it, then repoint. A field whose own type changed layout has a different `id`
+// and is skipped rather than copied wrong. Shallow (memcpy per field).
+// ponytail: shallow per-field copy; add recursion into nested changed structs if a real case needs it.
+migrate_fields :: proc(dst: rawptr, dst_ti: ^runtime.Type_Info, src: rawptr, src_ti: ^runtime.Type_Info) -> (copied: int) {
+	if dst == nil || src == nil || dst_ti == nil || src_ti == nil {
+		return
+	}
+	ds, dok := runtime.type_info_base(dst_ti).variant.(runtime.Type_Info_Struct)
+	ss, sok := runtime.type_info_base(src_ti).variant.(runtime.Type_Info_Struct)
+	if !dok || !sok {
+		return
+	}
+	for di in 0 ..< int(ds.field_count) {
+		dtype := ds.types[di]
+		for si in 0 ..< int(ss.field_count) {
+			if ss.names[si] != ds.names[di] {
+				continue
+			}
+			if stype := ss.types[si]; dtype != nil && stype != nil && dtype.id == stype.id {
+				intrinsics.mem_copy(rawptr(uintptr(dst) + ds.offsets[di]), rawptr(uintptr(src) + ss.offsets[si]), dtype.size)
+				copied += 1
+			}
+			break
+		}
+	}
+	return
+}
 
 // Reports whether two type infos differ in memory layout (size, struct fields, enum/union members).
 @(private)

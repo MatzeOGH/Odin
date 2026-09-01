@@ -590,6 +590,7 @@ struct BuildContext {
 	bool   livepatch;
 	bool   livepatch_patch;
 	bool   livepatch_is_reload;
+	bool   livepatch_no_preload;
 	i64    livepatch_arena_size; // bytes for new globals
 	i64    livepatch_tls_arena_size; // bytes for new tls 
 	String livepatch_manifest;

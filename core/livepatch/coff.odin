@@ -9,14 +9,15 @@ SECTION_HDR_SIZE :: 40
 FILE_HDR_SIZE    :: 20
 RELOC_SIZE       :: 10
 
-// Section holding an object's local constants (not merged across objects).
-LP_CONST_SECTION :: ".odinti"
+IMAGE_SYM_CLASS_STATIC :: 3
 
 // --- PE/COFF machine, section-characteristic and AMD64 relocation constants ---
 IMAGE_FILE_MACHINE_AMD64 :: 0x8664
 IMAGE_SCN_MEM_EXECUTE       :: 0x20000000
 IMAGE_SCN_MEM_WRITE         :: 0x80000000
 IMAGE_SCN_LNK_NRELOC_OVFL   :: 0x01000000
+IMAGE_SCN_MEM_DISCARDABLE   :: 0x02000000
+IMAGE_SCN_LNK_REMOVE        :: 0x00000800
 
 IMAGE_REL_AMD64_ADDR64   :: 0x01
 IMAGE_REL_AMD64_ADDR32NB :: 0x03
@@ -88,9 +89,31 @@ section_name :: proc(sh: ^Coff_Section_Header) -> string {
 	return strings.truncate_to_byte(string(sh.name[:]), 0)
 }
 
-// Reports whether a section is the object-local constant section (.odinti).
-lp_is_object_local_const :: proc(sh: ^Coff_Section_Header) -> bool {
-	return section_name(sh) == LP_CONST_SECTION
+// Reports whether a defined symbol must resolve within its own object rather
+// than through the reload-wide symbol map.
+//
+// A COFF section symbol shares its section's name, and one object routinely
+// holds several sections with the same name — a package object here carries ten
+// `.rdata` COMDATs — so merging them by name binds one object's relocations to
+// another object's (or another COMDAT's) bytes. Assembler temporaries (`.L…`)
+// are object-local for the same reason.
+//
+// Odin's own file-local symbols (`pkg::name`, `__$equal$…`) are STATIC too, but
+// each names the same logical entity in every object, so they keep merging —
+// that is what points every object at one live copy of a procedure.
+lp_is_object_local :: proc(sym: ^Coff_Symbol, name: string, sh: ^Coff_Section_Header) -> bool {
+	if sym.storage_class != IMAGE_SYM_CLASS_STATIC {
+		return false
+	}
+	return name == section_name(sh) || strings.has_prefix(name, ".L")
+}
+
+// Reports whether a section is dropped at link time — debug info (`.debug$S`,
+// `.debug$T`) and linker directives (`.drectve`). Mapping them burns the scarce
+// address space near the exe, and their relocations are types the runtime has no
+// reason to apply, which is what buried the reloc diagnostics in false positives.
+lp_is_discarded_section :: proc(sh: ^Coff_Section_Header) -> bool {
+	return (u32(sh.characteristics) & (IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_LNK_REMOVE)) != 0
 }
 
 // Returns a COFF symbol's name, following the string-table indirection for long names.
