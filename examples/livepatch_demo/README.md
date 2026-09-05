@@ -49,13 +49,15 @@ For the simple blocking version, `livepatch.apply_patch()` does the build and ap
 
 - **Freely, live:** anything in `frame`, `draw_scene`, `seed_state`, or the `State` fields —
   values, colors, physics, layout, and any widget the base build already used.
-- **Also live:** any raylib or microui procedure, including ones the base build never called,
-  and a brand-new `import` of a package some package here already imports. A `-livepatch` base
-  build preloads everything its imports could reach -- it emits every procedure of every
-  imported Odin package, and links foreign archives whole (`/WHOLEARCHIVE`) -- so the whole
-  raylib and microui surface is in the image waiting for you. For this demo that costs a 1.5x
-  larger exe, a 1.9x larger PDB and +0.4s on a full rebuild — the F5 patch build is unaffected.
-  `-livepatch-no-preload` turns it off if you would rather have the smaller host.
+- **Also live:** any raylib or microui procedure the base build's Odin surface already
+  references, and a brand-new `import` of a package some package here already imports. A
+  `-livepatch` base build emits every procedure of every imported Odin package, and those
+  procedures pull their foreign callees into the image through normal archive linking -- so the
+  reachable raylib and microui surface is waiting for you. For this demo that costs a 1.5x larger
+  exe, a 1.9x larger PDB and +0.4s on a full rebuild — the F5 patch build is unaffected.
+  `-livepatch-no-preload` turns the Odin force-emit off if you would rather have the smaller host.
+  A foreign function *nothing* in the base references is the exception: whole-archive its library
+  by hand with `-extra-linker-flags:"/WHOLEARCHIVE:<lib>"` to reach it.
 - **Needs a full rebuild (not F5):** importing a package that *nothing* in the base build
   imports. Its code was never compiled into the host, and a patch object never carries stdlib
   code, so the reload fails with "unresolved symbol." Rebuild the host once.

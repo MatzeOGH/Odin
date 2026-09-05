@@ -27,10 +27,24 @@ copy /y "%HERE%v1\main.odin" "%HERE%build\lean\" >nul
 copy /y "%HERE%v2\main.odin" "%HERE%build\lean\" >nul
 "%HERE%build\lean\t.exe" "%ODIN%" --expect-fail || exit /b
 
-rem raylib.lib's members are coarse enough that referencing anything drags most of it into the
-rem image either way, so the reload above cannot discriminate on /WHOLEARCHIVE. Check the flag.
-echo === /WHOLEARCHIVE for non-system foreign libraries ===
-"%ODIN%" build "%HERE%build\lp" -livepatch -debug "-out:%HERE%build\probe1.exe" -show-system-calls 2>&1 | findstr /c:"/WHOLEARCHIVE:" >nul || exit /b
-"%ODIN%" build "%HERE%build\lean" -livepatch -livepatch-no-preload -debug "-out:%HERE%build\probe2.exe" -show-system-calls 2>&1 | findstr /c:"/WHOLEARCHIVE:" >nul && exit /b 1
+rem A same-length string-literal edit ("aaaa" -> "bbbb") must still flip the proc's
+rem content hash so the reload re-patches it. Regression test for the constant-identity
+rem fix in lb_livepatch_proc_content_hash.
+echo === same-length string-literal edit is detected ===
+mkdir "%HERE%build\strlit"
+copy /y "%HERE%strlit_v1\main.odin" "%HERE%build\strlit\" >nul
+"%ODIN%" build "%HERE%build\strlit" -livepatch -debug "-out:%HERE%build\strlit\t.exe" || exit /b
+copy /y "%HERE%strlit_v2\main.odin" "%HERE%build\strlit\" >nul
+"%HERE%build\strlit\t.exe" "%ODIN%" || exit /b
+
+rem A proc signature change must NOT be rejected (Live++ parity; the F8 ABI guard was removed).
+rem v2 changes add(x: int) -> add(x, y: int) and updates its caller; both re-patch in one reload,
+rem so compute() reaches add's new body through the new ABI and returns 16.
+echo === signature change reloads ===
+mkdir "%HERE%build\sig"
+copy /y "%HERE%sig_v1\main.odin" "%HERE%build\sig\" >nul
+"%ODIN%" build "%HERE%build\sig" -livepatch -debug "-out:%HERE%build\sig\t.exe" || exit /b
+copy /y "%HERE%sig_v2\main.odin" "%HERE%build\sig\" >nul
+"%HERE%build\sig\t.exe" "%ODIN%" || exit /b
 
 echo SUCCESSFUL

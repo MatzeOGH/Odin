@@ -6365,6 +6365,7 @@ gb_internal AstPackage *try_add_import_path(Parser *p, String path, String const
 	AstPackage *pkg = permanent_alloc_item<AstPackage>();
 	pkg->kind = kind;
 	pkg->fullpath = path;
+	pkg->import_collection_index = -1; // default: user root / unknown; overwritten by the importer for known collections
 	array_init(&pkg->files, permanent_allocator());
 	pkg->foreign_files.allocator = permanent_allocator();
 
@@ -6576,7 +6577,7 @@ gb_internal bool is_package_name_reserved(String const &name) {
 }
 
 
-gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node, String base_dir, String const &original_string, String *path, bool use_check_errors=false) {
+gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node, String base_dir, String const &original_string, String *path, bool use_check_errors=false, i32 *out_collection_index=nullptr) {
 	GB_ASSERT(path != nullptr);
 
 	void (*do_error)(Ast *, char const *, ...);
@@ -6687,6 +6688,10 @@ gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node
 			// NOTE(bill): It's a naughty name
 			do_error(node, "Unknown library collection: '%.*s'", LIT(collection_name));
 			return false;
+		} else if (out_collection_index) {
+			// Record which collection this import resolved through (after the core:->base: rewrite).
+			// Left untouched for prefix-less/relative imports so the caller's inherited value survives.
+			find_library_collection_index(collection_name, out_collection_index);
 		}
 	}
 
@@ -6770,7 +6775,8 @@ gb_internal void parse_setup_file_decls(Parser *p, AstFile *f, String const &bas
 			}
 
 			String import_path = {};
-			bool ok = determine_path_from_string(&p->file_decl_mutex, node, base_dir, original_string, &import_path);
+			i32 ci = f->pkg ? f->pkg->import_collection_index : -1; // inherit importer; overwritten if a collection prefix resolves
+			bool ok = determine_path_from_string(&p->file_decl_mutex, node, base_dir, original_string, &import_path, false, &ci);
 			if (!ok) {
 				decls[i] = ast_bad_decl(f, id->relpath, id->relpath);
 				continue;
@@ -6781,7 +6787,8 @@ gb_internal void parse_setup_file_decls(Parser *p, AstFile *f, String const &bas
 			if (is_package_name_reserved(import_path)) {
 				continue;
 			}
-			try_add_import_path(p, import_path, original_string, ast_token(node).pos);
+			AstPackage *imported_pkg = try_add_import_path(p, import_path, original_string, ast_token(node).pos);
+			if (imported_pkg) imported_pkg->import_collection_index = ci; // non-null only for the first creator
 		} else if (node->kind == Ast_ForeignImportDecl) {
 			ast_node(fl, ForeignImportDecl, node);
 
@@ -7527,7 +7534,9 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 			if (!ok) {
 				compiler_error("Unable to find The 'base:runtime' package. Is the ODIN_ROOT set up correctly?");
 			}
-			try_add_import_path(p, s, s, init_pos, Package_Runtime);
+			i32 base_ci = -1; find_library_collection_index(str_lit("base"), &base_ci);
+			AstPackage *runtime_pkg = try_add_import_path(p, s, s, init_pos, Package_Runtime);
+			if (runtime_pkg) runtime_pkg->import_collection_index = base_ci;
 		}
 
 		try_add_import_path(p, init_fullpath, init_fullpath, init_pos, Package_Init);
@@ -7539,7 +7548,9 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 			if (!ok) {
 				compiler_error("Unable to find The 'core:testing' package. Is the ODIN_ROOT set up correctly?");
 			}
-			try_add_import_path(p, s, s, init_pos, Package_Normal);
+			i32 core_ci = -1; find_library_collection_index(str_lit("core"), &core_ci);
+			AstPackage *testing_pkg = try_add_import_path(p, s, s, init_pos, Package_Normal);
+			if (testing_pkg) testing_pkg->import_collection_index = core_ci;
 		}
 		
 

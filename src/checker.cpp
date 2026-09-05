@@ -3154,7 +3154,9 @@ gb_internal void generate_livepatch_package_deps(Checker *c) {
 		}
 		switch (e->kind) {
 		case Entity_Procedure:
-			// A foreign procedure has no body to emit; `/WHOLEARCHIVE` supplies those bytes.
+			// A foreign procedure has no Odin body to emit; its bytes come from normal lazy
+			// archive linking when an emitted Odin caller references it. Members that nothing
+			// references are simply absent, so a reload cannot newly bind to them.
 			if (e->Procedure.is_foreign) {
 				continue;
 			}

@@ -167,7 +167,8 @@ Unresolved relocations **in executable sections** abort the reload
 (`unresolved_text`); unresolved relocations in data you never touch are only a
 note. A common failure mode — a foreign-library function whose code isn't in the
 running image — is reported with guidance (reference it in the base build, or
-`/WHOLEARCHIVE`).
+whole-archive the library manually with
+`-extra-linker-flags:"/WHOLEARCHIVE:<lib>"`).
 
 After patching bytes, the `.text` icache is flushed
 (`FlushInstructionCache`), and each `.pdata` section is registered with
@@ -543,6 +544,35 @@ pad at the original entry straight to the newest body. Old bodies become
 unreferenced immediately (nothing jumps to them anymore) but are freed lazily
 (below).
 
+### Changing a procedure's signature
+
+Because redirection is at the callee's entry and call sites are never rewritten, a
+proc's **signature** (parameter/return types, calling convention) may change across
+a reload — the same as Live++, and for the same reason. It is just an ordinary code
+change:
+
+- The changed proc's IR differs, so its content hash differs, so it is re-patched.
+- Every **direct** caller marshals arguments per the callee's signature, so when the
+  signature changes the caller's own IR changes too — its content hash changes, its
+  module is emitted, and it is re-patched **in the same reload**. `apply_dir` /
+  `apply_patch` map and patch the callee and all such callers together as one
+  `apply_many` (threads suspended, published atomically), so a re-patched caller
+  reaches the new body through the new ABI. There is no window in which an old-ABI
+  caller reaches a new-ABI body — and the compiler already rejects any call
+  expression that does not match the new signature.
+
+The compiler used to reject a signature change at build time (the F8 ABI guard); that
+rejection has been removed. It still records each proc's canonical signature hash for
+`build_id`, but does not compare it.
+
+The one residual hazard — identical to Live++'s raw-function-pointer caveat — is a
+stored **`proc`-value** that still holds the *old* signature and is called through the
+old ABI. Nothing re-patches such an indirect call site, so its marshalling stays on the
+old ABI while the entry it targets now runs the new body. Prefer re-fetching the proc
+value after a reload, or route through a proc that *is* re-patched. (Contrast the
+global-*layout* guard, which is **not** lifted: a value global lives at a fixed address
+that unpatched code reads through baked-in field offsets the entry-jump never rewrites.)
+
 ### 2. `_lp_cur` — change detection tracks the *live* state, not the exe
 
 `_lp_cur` (in `meta.odin`) starts as the running exe's per-proc content hashes.
@@ -705,12 +735,18 @@ It runs on **host builds only**. A patch build's dependency set then stays a
 strict subset of the host's, so a reload can never need a global or procedure
 the host image lacks — and every F5 avoids generating IR for all of `core:`.
 
-**Foreign archives — `/WHOLEARCHIVE` (`src/linker.cpp`).** A static archive
-only contributes the members something referenced. Under `-livepatch` each
-non-system foreign library is passed as `/WHOLEARCHIVE:<path>` so every member
-is in the image. `system:` libraries are excluded — they resolve to a bare
-filename with no directory, and whole-archiving the system import libraries
-only balloons the IAT.
+**Foreign archives.** A static archive only contributes the members something
+referenced. Because the host build force-emits every imported package's Odin
+surface, and those procedures reference their foreign callees, normal lazy
+archive linking already pulls every foreign function reachable from imported
+Odin code into the image — so a reload can call it. The compiler does **not**
+whole-archive foreign libraries: doing so pulled in *orphan* members (foreign
+functions no Odin code references) at the cost of `LNK2005` duplicate-symbol
+failures whenever two archives (or an archive and the CRT) collided, which broke
+the whole base build. If you genuinely need to reload-call an orphan member of a
+static archive that nothing in the base references, whole-archive that one
+library by hand: `-extra-linker-flags:"/WHOLEARCHIVE:<lib>"`, or
+`@(extra_linker_flags="/WHOLEARCHIVE:<lib>")` on its `foreign import`.
 
 **Cost, and the escape hatch.** Measured on `examples/livepatch_demo`
 (`tests/livepatch/bench.ps1`):
@@ -728,8 +764,8 @@ a longer first-apply pause, since `lp_dbghelp_ensure` enumerates every symbol
 once. How much a given project pays depends on how much of its import graph is
 currently dead code.
 
-`-livepatch-no-preload` turns both paths off. A reload is then limited to
-procedures the base build already referenced, which is what `tests/livepatch`
+`-livepatch-no-preload` turns the Odin force-emit off. A reload is then limited
+to procedures the base build already referenced, which is what `tests/livepatch`
 asserts as its negative case.
 
 What still needs a full rebuild: importing a package that *nothing* in the base

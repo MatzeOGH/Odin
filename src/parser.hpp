@@ -200,6 +200,7 @@ struct AstPackage {
 	Array<AstForeignFile> foreign_files;
 	bool                  is_single_file;
 	isize                 order;
+	i32                   import_collection_index; // index into library_collections; -1 = user root / unknown
 
 	BlockingMutex         files_mutex;
 	BlockingMutex         foreign_files_mutex;

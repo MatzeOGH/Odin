@@ -256,7 +256,7 @@ lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map
 					usym := coff_symbol(o.data, o.sym_off, int(rel.symbol_table_index))
 					uname := symbol_name(usym, o.data, o.strtab_off)
 					fmt.eprintfln("[livepatch] unresolved symbol in executable code: %s", uname)
-					fmt.eprintfln("[livepatch]   (its code is not present in the running image. A -livepatch base build preloads everything its imports could reach, so the usual causes are: the symbol comes from a package no package in the base build imports, which is not supported; the base build used -livepatch-no-preload, which limits a reload to procedures the base build already referenced; or the base build had no -debug, leaving no PDB to resolve non-exported symbols.)")
+					fmt.eprintfln("[livepatch]   (its code is not present in the running image. A -livepatch base build emits every procedure of every imported Odin package, so the usual causes are: the symbol comes from a package no package in the base build imports, which is not supported; it is a foreign static-archive function that nothing in the base references (whole-archive its library with -extra-linker-flags:\"/WHOLEARCHIVE:<lib>\"); the base build used -livepatch-no-preload, which limits a reload to procedures the base build already referenced; or the base build had no -debug, leaving no PDB to resolve non-exported symbols.)")
 				}
 				continue
 			}

@@ -20,7 +20,7 @@
 
 #include "llvm_backend.hpp"
 
-gb_internal bool lb_path_is_stdlib(String fullpath);
+gb_internal bool lb_pkg_is_stdlib(AstPackage *pkg);
 gb_internal void lb_set_odin_rtti_section(LLVMValueRef value);
 
 #include "llvm_abi.cpp"
@@ -2827,7 +2827,7 @@ gb_internal bool lb_livepatch_skip_object(lbModule *m) {
 	if (m->pkg == nullptr) {
 		return false;
 	}
-	if (lb_path_is_stdlib(m->pkg->fullpath)) {
+	if (lb_pkg_is_stdlib(m->pkg)) {
 		return true;
 	}
 	return !m->livepatch_changed;
@@ -3424,12 +3424,41 @@ gb_internal u64 lb_livepatch_layout_hash(Type *t) {
 	return fnv64a(words.data, words.count * gb_size_of(u64));
 }
 
+// Hashes the *contents* of an interned constant global (csbs$.../csba$...): a
+// proc references such a constant only by a name whose sole distinguishing part
+// is a nondeterministic per-module dedup id, which the content-hash normalizer
+// deliberately strips. Folding the referenced constant's bytes in instead lets a
+// proc be seen to change when a string/array literal's bytes change even though
+// the id stayed the same (and without thrashing when the id churns but the bytes
+// do not).
+gb_internal u64 lb_livepatch_const_ir_hash(LLVMModuleRef mod, char const *name) {
+	if (mod == nullptr) {
+		return 0;
+	}
+	LLVMValueRef g = LLVMGetNamedGlobal(mod, name);
+	if (g == nullptr) {
+		return 0;
+	}
+	LLVMValueRef init = LLVMGetInitializer(g);
+	if (init == nullptr) {
+		return 0;
+	}
+	char *s = LLVMPrintValueToString(init);
+	if (s == nullptr) {
+		return 0;
+	}
+	u64 h = fnv64a(s, gb_strlen(s));
+	LLVMDisposeMessage(s);
+	return h;
+}
+
 gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 	TEMPORARY_ALLOCATOR_GUARD();
 	char *ir = LLVMPrintValueToString(p->value);
 	if (ir == nullptr) {
 		return 0;
 	}
+	LLVMModuleRef pmod = p->module ? p->module->mod : nullptr;
 	char const *mod = p->module ? p->module->module_name : nullptr;
 	isize mod_len = (mod != nullptr) ? cast(isize)gb_strlen(mod) : 0;
 
@@ -3457,6 +3486,54 @@ gb_internal u64 lb_livepatch_proc_content_hash(lbProcedure *p) {
 			}
 			isize i = 0;
 			while (i < keep) {
+				// A quoted global reference @"name". String/array literals are
+				// interned as private globals named csbs$/csba$ whose only
+				// varying part is a nondeterministic dedup id; hashing the name
+				// would both miss real content edits (same id, new bytes) and
+				// thrash on unrelated id churn. Replace such a reference with a
+				// hash of the constant's *contents*, bound to this position.
+				if (line[i] == '@' && (keep - i) >= 2 && line[i+1] == '"') {
+					isize q = i + 2;
+					while (q < keep && line[q] != '"') { q++; }
+					if (q < keep) {
+						isize nlen = q - (i + 2);
+						char const *nm = line + i + 2;
+						bool is_const = nlen >= 5 &&
+						    (gb_strncmp(nm, "csbs$", 5) == 0 || gb_strncmp(nm, "csba$", 5) == 0);
+						if (is_const) {
+							char *name_c = gb_alloc_array(temporary_allocator(), char, nlen + 1);
+							gb_memmove(name_c, nm, nlen);
+							name_c[nlen] = 0;
+							u64 ch = lb_livepatch_const_ir_hash(pmod, name_c);
+							norm = gb_string_append_fmt(norm, "@const:%llx", cast(unsigned long long)ch);
+						} else {
+							// Other quoted names may still carry the $<module>$<hex>
+							// id (anonymous procedures, etc.); strip it as below so
+							// unrelated churn does not perturb the hash.
+							norm = gb_string_appendc(norm, "@\"");
+							isize k = i + 2;
+							while (k < q) {
+								if (mod_len > 0 && line[k] == '$' && (q - k) >= (mod_len + 2) &&
+								    gb_strncmp(line + k + 1, mod, mod_len) == 0 && line[k + 1 + mod_len] == '$') {
+									isize j = k + 1 + mod_len + 1;
+									while (j < q) {
+										char c = line[j];
+										bool is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+										if (!is_hex) { break; }
+										j++;
+									}
+									k = j;
+								} else {
+									norm = gb_string_append_length(norm, line + k, 1);
+									k++;
+								}
+							}
+							norm = gb_string_appendc(norm, "\"");
+						}
+						i = q + 1;
+						continue;
+					}
+				}
 				if (mod_len > 0 && line[i] == '$' && (keep - i) >= (mod_len + 2) &&
 				    gb_strncmp(line + i + 1, mod, mod_len) == 0 && line[i + 1 + mod_len] == '$') {
 					isize j = i + 1 + mod_len + 1; // past "$<module_name>$"
@@ -3517,14 +3594,14 @@ gb_internal void lb_livepatch_emit_func_hashes(lbGenerator *gen) {
 		string_map_set(&hm.fhash, p->name, content_hash);
 
 		if (p->type != nullptr) {
+			// A signature change across a reload is allowed (Live++ parity). The changed proc gets a
+			// new content hash and is re-patched; every *direct* caller's argument marshalling also
+			// changes, so its content hash changes and it is re-patched in the same reload, reaching
+			// the new body through the new ABI. The one residual hazard is a stored proc-value holding
+			// the old signature, called through the old ABI -- the same documented caveat Live++
+			// carries for raw function pointers. We still record the sig hash: it feeds the base
+			// build's build_id (lb_livepatch_emit_build_id, computed only on !hm.exists).
 			u64 sig_hash = type_hash_canonical_type(p->type);
-			if (hm.exists) {
-				u64 *prev = string_map_get(&hm.sig, p->name);
-				if (prev != nullptr && *prev != sig_hash) {
-					Token tok = (p->entity != nullptr) ? p->entity->token : empty_token;
-					error(tok, "livepatch: procedure '%.*s' changed its signature. The frozen host still calls it with the original ABI, so this is rejected. Revert the signature or restart the program", LIT(p->name));
-				}
-			}
 			string_map_set(&hm.sig, p->name, sig_hash);
 		}
 		LLVMValueRef fields[2] = {

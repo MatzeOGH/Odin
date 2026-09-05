@@ -13,17 +13,18 @@ import "core:strings"
 import mu "vendor:microui"
 import rl "vendor:raylib"
 
-// v2 is the patch. Same signature as v1 -- livepatch rejects a changed signature -- but the body
-// now calls procedures the base build never referenced:
+// v2 is the patch. It keeps check's signature (signature changes are allowed; see the sig_v1/
+// sig_v2 test) and instead exercises reachability: the body now calls procedures the base build
+// never referenced:
 //   strings.count           Odin stdlib source, absent from the image without preloading
 //   mu.rect_overlaps_vec2   vendor Odin source, same
 //   rl.ColorToHSV           a foreign C call from patched code
 //
 // The two Odin procedures are the discriminators: they are genuinely missing from a
 // -livepatch-no-preload image, which is what the negative case in run.bat asserts. The raylib
-// call is coverage that a foreign call from patched code still resolves -- it is not a
-// discriminator, because raylib.lib's members are coarse enough that referencing anything in it
-// drags most of the library in regardless. run.bat checks the /WHOLEARCHIVE flag directly.
+// call is coverage that a foreign call from patched code still resolves -- it works because the
+// preloaded Odin surface already references it, so normal archive linking pulls that member into
+// the base image.
 check :: proc() -> bool {
 	if strings.count("livepatch patches patches", "patch") != 3 {
 		return false

@@ -69,30 +69,11 @@ gb_internal void lb_mem_copy_non_overlapping(lbProcedure *p, lbValue dst, lbValu
 	lb_call_intrinsic(p, name, args, gb_count_of(args), types, gb_count_of(types));
 }
 
-gb_internal bool lb_path_under_dir(String fullpath, String dir) {
-	while (dir.len > 0 && (dir.text[dir.len-1] == '/' || dir.text[dir.len-1] == '\\')) {
-		dir.len -= 1;
-	}
-	if (dir.len == 0 || fullpath.len < dir.len) {
-		return false;
-	}
-	if (!str_eq_ignore_case(substring(fullpath, 0, dir.len), dir)) {
-		return false;
-	}
-	if (fullpath.len == dir.len) {
-		return true;
-	}
-	u8 c = fullpath.text[dir.len];
-	return c == '/' || c == '\\';
-}
-
-gb_internal bool lb_path_is_stdlib(String fullpath) {
-	for (auto const &lc : library_collections) {
-		if (lc.builtin && lb_path_under_dir(fullpath, lc.path)) {
-			return true;
-		}
-	}
-	return false;
+gb_internal bool lb_pkg_is_stdlib(AstPackage *pkg) {
+	// A package belongs to the stdlib iff it was resolved through a `builtin` collection
+	// (base/core/vendor). Tracked as an index on the package at import time, so this is a
+	// direct identity check rather than a path-string prefix match.
+	return pkg != nullptr && library_collection_is_builtin(pkg->import_collection_index);
 }
 
 gb_internal bool lb_proc_is_livepatchable(lbProcedure *p) {
@@ -123,7 +104,7 @@ gb_internal bool lb_proc_is_livepatchable(lbProcedure *p) {
 	if (pkg == nullptr) {
 		return false;
 	}
-	if (lb_path_is_stdlib(pkg->fullpath)) {
+	if (lb_pkg_is_stdlib(pkg)) {
 		return false;
 	}
 	return true;

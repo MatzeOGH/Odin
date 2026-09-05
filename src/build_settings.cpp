@@ -1084,6 +1084,20 @@ gb_internal bool find_library_collection_path(String name, String *path) {
 	return false;
 }
 
+gb_internal bool find_library_collection_index(String name, i32 *index) {
+	for (i32 i = 0; i < library_collections.count; i++) {
+		if (library_collections[i].name == name) {
+			if (index) *index = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+gb_internal bool library_collection_is_builtin(i32 index) {
+	return 0 <= index && index < library_collections.count && library_collections[index].builtin;
+}
+
 gb_internal bool is_arch_wasm(void) {
 	switch (build_context.metrics.arch) {
 	case TargetArch_wasm32:

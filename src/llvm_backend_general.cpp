@@ -57,7 +57,7 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	m->info = &c->info;
 
 	// disable optimization for patchable module
-	bool is_builtin = m->pkg != nullptr && lb_path_is_stdlib(m->pkg->fullpath);
+	bool is_builtin = lb_pkg_is_stdlib(m->pkg);
 	if (build_context.livepatch && !is_builtin) {
 		m->optimization_level = -1; // -1 == -o:none
 	} else {
