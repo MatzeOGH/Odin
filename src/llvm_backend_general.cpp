@@ -3822,17 +3822,12 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 		if (is_external) {
 			String name = lb_get_entity_name(other_module, e);
 			
-			// add new globals
+			// A new thread-local still lives in the exe's TLS arena. A new ordinary global
+			// (Live++ policy) is an undefined external the loader resolves to persistent
+			// storage, so it falls through to the generic external-global path below.
 			if (build_context.livepatch) {
 				LivePatchManifest &hm = m->gen->livepatch_manifest;
 				if (hm.exists) {
-					if (LivePatchNewEntry *ne = string_map_get(&hm.newg, name)) {
-						lbValue g = {};
-						g.type  = alloc_type_pointer(e->type);
-						g.value = lb_livepatch_arena_ptr(m, ne->offset, g.type);
-						lb_add_entity(m, e, g);
-						return g;
-					}
 					if (LivePatchNewEntry *ne = string_map_get(&hm.tls_newg, name)) {
 						lbValue g = {};
 						g.type  = alloc_type_pointer(e->type);

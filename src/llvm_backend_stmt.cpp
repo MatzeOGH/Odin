@@ -2471,45 +2471,24 @@ gb_internal bool lb_livepatch_handle_static_variable(lbGenerator *gen, lbModule 
 		}
 		bool has_const_init = value.value != nullptr && !LLVMIsNull(value.value);
 
-		i64 offset   = 0;
-		i64 flag_off = -1;
+		// Record the layout baseline once so a later reload can warn on a layout change.
 		LivePatchNewEntry *ne = string_map_get(&hm.newg, mangled_name);
 		if (ne != nullptr) {
-			offset   = ne->offset;
-			flag_off = ne->init_flag_offset;
 			if (ne->type_hash != th) {
-				error(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
+				warning(e->token, "livepatch: new @(static) variable '%.*s' changed type/layout across a reload. Its storage is address-stable and reinterpreted as-is; migrate it with a patch hook if the layout is incompatible", LIT(name));
 			}
 		} else {
-			i64 al = gb_max(type_align_of(e->type), 1);
-			i64 sz = gb_max(type_size_of(e->type), 1);
-			offset = align_formula(hm.next_free, al);
-			hm.next_free = offset + sz;
-			if (has_const_init) {
-				flag_off = hm.next_free;
-				hm.next_free = flag_off + 1;
-			}
-			if (hm.next_free > hm.arena_size) {
-				error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). Rebuild the exe with a larger -livepatch-arena-size", cast(long long)hm.next_free, cast(long long)hm.arena_size);
-			}
-			LivePatchNewEntry added = {offset, th, flag_off};
+			LivePatchNewEntry added = {0, th, -1};
 			string_map_set(&hm.newg, mangled_name, added);
-
-			if (has_const_init) {
-				char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->livepatch_inits.count);
-				LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(value.value), blob_name);
-				LLVMSetInitializer(blob, value.value);
-				LLVMSetGlobalConstant(blob, true);
-				LLVMSetLinkage(blob, LLVMPrivateLinkage);
-				LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
-				array_add(&gen->livepatch_inits, ie);
-			}
 		}
+
+		// Loader-allocated persistent storage (Live++ policy), keyed by mangled name.
+		LLVMValueRef gv = lb_livepatch_new_global_external(gen, m, mangled_name, e->type, has_const_init ? value.value : nullptr);
 		mutex_unlock(&gen->livepatch_mutex);
 
 		lbValue g = {};
 		g.type  = alloc_type_pointer(e->type);
-		g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
+		g.value = gv;
 		lb_add_entity(m, e, g);
 		lb_add_member(m, mangled_name, g);
 		return true;

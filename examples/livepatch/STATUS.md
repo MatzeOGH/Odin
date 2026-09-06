@@ -113,7 +113,7 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         (object-local address per symbol); then resolve + relocate + patch each object, with an
         undefined external resolving to another reload object via `all_syms` before falling back
         to the exe (`lp_resolve`). Cross-object calls beyond REL32 range reuse the trampoline
-        path. Metadata tables (func_hashes/build_id/new_global_inits/refresh_syms/type_infos/
+        path. Metadata tables (func_hashes/build_id/new_globals/refresh_syms/type_infos/
         patch-hooks) are read from the default/metadata object; refresh + post-patch-hook bodies
         resolve via `all_defs`. Fixed a separate-modules cross-module break: TLS accessor thunks
         (`__odin_lptls$*`) now emit into the module that defines the thread-local
@@ -161,27 +161,26 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       procedure's prologue with a 14-byte `FF 25` absolute jump.
 - [x] **Global state preserved across reload** — validated by the demo (`hits` keeps
       counting through a reload).
-- [x] **New globals across a reload.** The compiler reserves a zero-init arena
-      (`__odin_livepatch_global_arena`) in the exe and, driven by a build-to-build
-      manifest (`-livepatch-manifest`, `-livepatch-arena-size`), redirects
-      *new* globals (ones absent from the exe) into it at stable byte offsets, so
-      their state persists across every reload. Base build records original
-      globals + their canonical `type_hash`; a reload build assigns/reuses arena
-      offsets for new globals and **errors** if an existing global's type/layout
-      changed or the arena is exhausted. Compiler: `src/llvm_backend.cpp`
-      (`lb_livepatch_arena`, `LivePatchManifest`, global-emission fork),
-      `src/main.cpp`, `src/build_settings.cpp`, `base/runtime/core.odin`
-      (`Hot_Reload_Symbol` gained `kind` + `type_hash`).
+- [x] **New globals across a reload (Live++ storage policy).** A global absent from
+      the exe compiles to an **undefined external symbol**; the loader gives it its
+      own persistent, near-exe storage (`lp_new_global_storage`/`alloc_near_data`),
+      keyed by name and reused across reloads, so its state persists — no fixed exe
+      arena, no size cap. Base build records original globals + each new global's
+      canonical `type_hash`; a reload build **warns** (Live++ parity, no longer an
+      error) if a global's type/layout changed — the storage is address-stable and
+      reinterpreted in place. Compiler: `src/llvm_backend.cpp`
+      (`lb_livepatch_new_global_external`, `LivePatchManifest`, global-emission fork),
+      `src/llvm_backend_general.cpp` (cross-module refs fall through to the generic
+      external-global path), `src/main.cpp`, `src/build_settings.cpp`.
+      (`-livepatch-arena-size` is now deprecated and ignored.)
 - [x] **Compile-time constant initializers for new globals.** A new global with a
       constant initializer (scalars, arrays, structs, strings) starts at its
-      declared value instead of zero. The compiler emits the constant as a blob +
-      an object-local descriptor table `__odin_livepatch_new_global_inits`
-      (`{arena_offset, flag_offset, size, blob}` per entry) and reserves a 1-byte
-      once-only guard in the arena (offset recorded in the manifest). The loader
-      copies each blob into the arena iff its flag byte is 0, then sets it — so the
-      init runs exactly once and never clobbers accumulated state on later reloads.
-      Arena is 16-byte aligned. Runtime (non-constant) initializers and new
-      `@(init)` still error.
+      declared value instead of zero. The introducing build emits the constant as an
+      `__odin_lpg_init$<name>` blob; the loader lists new globals in
+      `__odin_livepatch_new_globals` and, on **first allocation** of each (the
+      `fresh` flag), copies its blob in once — so the init runs exactly once and
+      never clobbers accumulated state on later reloads. Runtime (non-constant)
+      initializers and new `@(init)` still error.
 - [x] **New procedures across a reload.** A new proc called from hot code links as
       an object-local symbol and is reachable from patched and other new code.
 - [x] **Loader promoted to `core:livepatch`** with `apply(obj_path)` that
@@ -412,13 +411,14 @@ Status as of this branch. See `README.md` for how to run it and how it works.
 - [x] **Function-local statics.** Local `@(static)` variables are now preserved the
       same way file-scope globals are: an *original* static (present in the exe)
       resolves to the exe's copy across a reload, and a *new* static introduced by a
-      reload is placed in the persistent arena (const initializer applied once). This
-      needed a build-stable symbol name — the old mangling used the entity id (a
-      global atomic assigned during multithreaded checking, so unstable across builds);
-      it is now `<proc>$static$<var>[$<occ>]`, derived purely from source, under
-      `-livepatch`. Statics are recorded in the manifest (`orig`/`new`), published in
-      `runtime.livepatch_symbol_table`, and the manifest write + new-global init table
-      were moved to after procedure generation so local statics are included.
+      reload gets its own loader-allocated storage like a new global (const
+      initializer applied once). This needed a build-stable symbol name — the old
+      mangling used the entity id (a global atomic assigned during multithreaded
+      checking, so unstable across builds); it is now `<proc>$static$<var>[$<occ>]`,
+      derived purely from source, under `-livepatch`. Statics are recorded in the
+      manifest (`orig`/`new`), published in `runtime.livepatch_symbol_table`, and the
+      manifest write + new-globals table were moved to after procedure generation so
+      local statics are included.
       `any`-typed *new* statics and *new* statics needing a runtime initializer
       are rejected at build time (only constant/zero-init new statics are supported,
       matching new file-scope globals).
@@ -477,9 +477,10 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       `core/sys/windows/dbghelp.odin` (`SymEnumSymbolsW` binding), `core/livepatch/livepatch.odin`
       (`lp_dbghelp_ensure` enumerates; `lp_resolve_pdb` is now a map lookup; `lp_is_hot_entry`;
       `lp_tls_offset`).
-      - **Manifest:** still needed — it persists the arena OFFSETS a reload build assigns to
-        new globals/statics/thread-locals so they stay stable across successive reloads; those
-        offsets are chosen by reload builds and are not derivable from the base exe's PDB.
+      - **Manifest:** still needed — it persists each global/static/thread-local's canonical
+        `type_hash` (so a reload can warn on a layout change) and the TLS-arena OFFSETS a reload
+        build assigns to new thread-locals so they stay stable across successive reloads. Ordinary
+        new globals no longer need pinned offsets — the loader owns their storage, keyed by name.
 - [x] **`/OPT:NOREF,NOICF` when livepatching** — `/OPT:NOICF` stops the linker folding
       identical procedures (would break per-procedure patching); `/OPT:NOREF` keeps functions
       the base source never referenced — chiefly members of already-linked static libraries
@@ -711,11 +712,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
   (plus the default/metadata object); the standard library and unchanged user packages are
   not re-emitted. The front-end (parse/check) + IR generation still run over the whole
   program each reload — only object emission and loading are incremental.
-- New globals and new procedures may be *added* across a reload. An existing
-  global's type/layout must not change (rejected at build time); new globals may
-  carry compile-time constant initializers (applied once) but not runtime
-  initializers or `@(init)`; and the new-global arena is a fixed size
-  (`-livepatch-arena-size`, default 256 KiB).
+- New globals and new procedures may be *added* across a reload. A global whose
+  type/layout changes is no longer rejected (Live++ parity — the compiler warns and
+  reinterprets the address-stable storage in place; migrate with a patch hook if
+  incompatible); new globals may carry compile-time constant initializers (applied
+  once) but not runtime initializers or `@(init)`. New globals get loader-allocated
+  storage with no fixed cap; `-livepatch-arena-size` is deprecated and ignored.
 - Reflection from hot code works (`fmt` of basic types, `%v` on a user struct, `typeid`), and now
   refreshes across a reload: an *edited* struct/enum/union layout and a *brand-new* type reached
   through hot code both reflect, because the loader swaps `runtime.type_table` to the reload's fresh,

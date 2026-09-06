@@ -4,15 +4,6 @@ package livepatch
 import "core:fmt"
 import "core:hash"
 
-// Extra data emitted for a new global the reload introduces: where it lives in
-// the runtime arena and a once-flag so it is initialized at most once.
-New_Global_Init :: struct {
-	arena_offset: i64,
-	flag_offset:  i64,
-	size:         i64,
-	blob:         rawptr,
-}
-
 Patch_Hook :: #type proc(changed: []Type_Change)
 
 Patch_Hook_Entry :: struct {

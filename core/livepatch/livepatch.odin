@@ -7,6 +7,7 @@ import "core:fmt"
 import "core:hash"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:time"
 import win "core:sys/windows"
 
@@ -333,6 +334,66 @@ lp_relocate_object :: proc(o: ^Obj, all_syms: map[string]rawptr, tls_cache: ^map
 	return
 }
 
+// A global introduced by this reload, resolved to its persistent storage. `fresh` marks
+// the globals this reload allocated for the first time, so their initializer runs once.
+@(private)
+New_Global :: struct {
+	name:    string,
+	storage: rawptr,
+	size:    int,
+	fresh:   bool,
+}
+
+// Reads the reload's `__odin_livepatch_new_globals` table (a raw {u64 count, {u64 size,
+// u64 name_len, name}...} blob), resolves each new global to persistent near-exe storage,
+// and registers it in `all_syms` so the object's relocations reach it. Must run before
+// relocation. The table carries no pointers, so it is readable before relocation.
+@(private)
+lp_prepare_new_globals :: proc(objs: []Obj, all_syms: ^map[string]rawptr) -> []New_Global {
+	tbl: rawptr
+	for &o in objs {
+		if a, ok := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, "__odin_livepatch_new_globals"); ok {
+			tbl = a
+			break
+		}
+	}
+	if tbl == nil {
+		return nil
+	}
+	p := uintptr(tbl)
+	count := int((^u64)(p)^); p += size_of(u64)
+	out := make([dynamic]New_Global, 0, count, context.temp_allocator)
+	for _ in 0 ..< count {
+		size := int((^u64)(p)^); p += size_of(u64)
+		nlen := int((^u64)(p)^); p += size_of(u64)
+		name := string(([^]u8)(rawptr(p))[:nlen]); p += uintptr(nlen)
+		storage, fresh := lp_new_global_storage(name, size)
+		if storage != nil {
+			all_syms[name] = storage
+			append(&out, New_Global{name, storage, size, fresh})
+		}
+	}
+	return out[:]
+}
+
+// Runs each freshly-allocated new global's one-time constant initializer, copying the
+// bytes from its `__odin_lpg_init$<name>` blob (a defined symbol in the reload object, so
+// its address is in `all_defs`). Must run after relocation: an initializer may embed a
+// pointer (e.g. a string literal) that relocation fixes up in place. A global with no
+// constant initializer has no blob and keeps its zero-initialized storage.
+@(private)
+lp_init_new_globals :: proc(ngs: []New_Global, all_defs: map[string]rawptr) {
+	for ng in ngs {
+		if !ng.fresh {
+			continue
+		}
+		blob_name := strings.concatenate({"__odin_lpg_init$", ng.name}, context.temp_allocator)
+		if blob, ok := all_defs[blob_name]; ok && blob != nil {
+			intrinsics.mem_copy(ng.storage, blob, ng.size)
+		}
+	}
+}
+
 // Loads, relocates, and hot-patches one or more reload objects into the running process — the core reload routine.
 apply_many :: proc(obj_paths: []string) -> bool {
 	when !ODIN_LIVEPATCH { return false }
@@ -434,6 +495,10 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	lp_phase("symbols", &mark)
 
+	// Give every global this reload introduces its persistent storage and register it in
+	// all_syms before relocation, so the objects' data references resolve to it.
+	new_globals := lp_prepare_new_globals(objs[:], &all_syms)
+
 	unresolved, unsupported := 0, 0
 	unresolved_text, unsupported_text := 0, 0
 	tls_cache := make(map[string]uintptr, context.temp_allocator)
@@ -455,30 +520,15 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	lp_phase("reloc", &mark)
 
+	// Relocation is done, so any pointer an initializer embeds is now fixed up: run each
+	// new global's one-time constant initializer into its freshly-allocated storage.
+	lp_init_new_globals(new_globals, all_defs)
+
 	meta_i := -1
 	for &o, oi in objs {
 		if _, ok := find_symbol_address(o.data, o.sym_off, o.n_syms, o.strtab_off, o.section_bases, "__odin_livepatch_func_hashes"); ok {
 			meta_i = oi
 			break
-		}
-	}
-
-	if meta_i >= 0 {
-		mo := &objs[meta_i]
-		if tbl_addr, ok := find_symbol_address(mo.data, mo.sym_off, mo.n_syms, mo.strtab_off, mo.section_bases, "__odin_livepatch_new_global_inits"); ok {
-			if arena_addr := lp_resolve_pdb("__odin_livepatch_global_arena"); arena_addr != nil {
-				count := (^i64)(tbl_addr)^
-				entries := ([^]New_Global_Init)(rawptr(uintptr(tbl_addr) + size_of(i64)))
-				for k in 0 ..< int(count) {
-					e := entries[k]
-					flag := (^u8)(uintptr(arena_addr) + uintptr(e.flag_offset))
-					if flag^ == 0 {
-						dst := rawptr(uintptr(arena_addr) + uintptr(e.arena_offset))
-						intrinsics.mem_copy(dst, e.blob, int(e.size))
-						flag^ = 1
-					}
-				}
-			}
 		}
 	}
 

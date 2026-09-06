@@ -144,49 +144,55 @@ which runs `odin build <pkg_dir> -livepatch-patch`.
 
 ---
 
-## 4. New-global arena
+## 4. New-global storage (Live++ policy)
 
 A reload object can introduce globals that did not exist at the time of the exe build. These
-globals cannot live in the object's own data. The loader remaps the object every reload, so their
-state would be lost. There is also no room in the exe's fixed data sections. So the exe reserves a
-zero-init **arena**. Reload objects place new globals into it at fixed, manifest-pinned byte
-offsets. Their state then persists across every later reload.
+globals cannot live in the object's own data — the loader remaps and eventually retires the object
+every reload, so their state would be lost — and there is no room in the exe's fixed data sections.
+So, exactly like the stable trampoline each new *procedure* gets, the **loader** gives each new
+global its own persistent storage that outlives any single reload's block. This mirrors Live++,
+where a patch is a real linked image and its new globals get real independent storage; there is no
+fixed-size exe arena to reserve or exhaust.
 
-- `__odin_livepatch_global_arena` is a `[arena_size]u8` global, over-aligned to 16. The
-  alignment keeps an aggregate, f64, or SIMD global correct at an aligned offset inside the arena.
-  The base exe build defines it, zero-init and **external**, so the loader can find it by name in
-  the exe's PDB. A reload object build declares it external, and the loader resolves it to the
-  exe's arena. A new global compiles to a constant in-bounds GEP into this arena, pointer-cast to
-  the global's type.
+- A new global compiles to an **undefined external symbol** (its link name, no initializer), so
+  every load/store is a normal relocation against that symbol. `lp_new_global_storage` in the
+  loader resolves it, on first sighting, to a fresh `alloc_near_data` block — read/write memory
+  within ±1.5GB of the exe, so a `REL32` data reference from the reload's code always reaches it —
+  keyed by name in `_lp_new_globals` and reused (same address, same state) by every later reload.
+  Each global gets its own page-granular block, so an in-place layout change has headroom rather
+  than a neighbor to overrun.
 
 Three places classify globals, and they mirror each other:
 
-- **File-scope globals** — the global loop in `lb_generate_code`.
+- **File-scope globals** — the global loop in `lb_generate_code` (`lb_livepatch_handle_global`).
 - **Local `@(static)`** — `lb_build_static_variables`.
-- **Cross-module references to a new global** — `lb_find_value_from_entity`. New globals are
-  inline arena GEPs, registered only in `default_module`. A reference from another module must
-  re-materialize that GEP in *this* module. The arena base is a real external that the loader
-  resolves, so the GEP is valid in any module. The alternative — an undefined external declared
-  by link name — the loader cannot resolve, and it fails with "unresolved symbol". The global
-  loop runs before procedure codegen and pins the offsets in the manifest, so they are ready
-  here.
+- **Cross-module references to a new global** — `lb_find_value_from_entity`. A new ordinary global
+  is just an undefined external by link name, so a reference from another module falls through to
+  the generic external-global path and resolves to the same loader storage. (A new thread-local
+  still routes to the TLS arena here — see section 5.)
 
 For each global, on a reload build:
 
 - **Original** (present in `manifest.orig`): emit it normally. The loader resolves the reference
-  to the exe's live copy, so state is preserved. The type and layout must not change. A changed
-  canonical type hash is a hard error, because the preserved memory cannot be reinterpreted
-  safely.
-- **New**: redirect it into the arena at a pinned offset. The compiler classifies the
-  initializer:
-  - none / zero / nil → zero-init (the arena is already zero).
-  - compile-time constant → the loader copies the constant's bytes into the arena slot **once**.
-    A one-byte flag in the arena gates the copy (see the init table, section 13). Only the
-    introducing build emits the constant blob and the descriptor.
+  to the exe's live copy, so state is preserved. A changed canonical type hash is now a **warning**
+  (Live++ parity): the preserved memory keeps its address and is reinterpreted as-is; migrate it
+  with a pre/post-patch hook if the new layout is incompatible.
+- **New**: emit the undefined external and record its size in the `__odin_livepatch_new_globals`
+  table for the loader. The compiler classifies the initializer:
+  - none / zero / nil → zero-init (the loader zeroes fresh storage).
+  - compile-time constant → the introducing build emits the bytes as an `__odin_lpg_init$<name>`
+    blob; the loader copies it into the storage **once**, on first allocation (the `fresh` flag
+    gates it, so a later reload that still carries the global does not clobber its runtime state).
   - anything at run time (a new `@(init)` included) → not supported, hard error.
   - an `any`-typed new global → not supported, hard error.
+  A new global whose layout changed across reloads is a **warning**, not an error, the same as an
+  original global.
 
 On the base build the compiler records every global into `manifest.orig` for later reloads.
+
+> Note: `-livepatch-arena-size` is deprecated and ignored — there is no fixed arena to size. The
+> manifest still carries `next_free`/`arena_size` fields, now vestigial for globals (the TLS arena
+> in section 5 still uses its own `tls_*` fields).
 
 ---
 
@@ -217,8 +223,10 @@ plain address.
   symbol is public either way, so the loader resolves it by name whatever module holds it.
 
 A new thread-local static that does not fit the exe's frozen TLS arena is a hard error. The user
-must rebuild the exe with a larger `-livepatch-tls-arena-size`. A changed type or layout on a
-preserved or arena-backed thread-local is a hard error, the same as section 4.
+must rebuild the exe with a larger `-livepatch-tls-arena-size`. (Only thread-locals still use a
+fixed arena; ordinary new globals moved to loader-allocated storage — section 4.) A changed type
+or layout on a preserved or TLS-arena thread-local is a **warning**, not an error, the same as
+section 4 — the slot is reinterpreted in place, so migrate it with a patch hook if incompatible.
 
 ---
 
@@ -486,12 +494,13 @@ other symbols only from the mapped object. Those are internal plus compiler-used
 
 | Symbol | Shape | Read by / purpose |
 | --- | --- | --- |
-| `__odin_livepatch_global_arena` | `[arena_size]u8`, align 16 | Section 4. Base: defined external. Reload obj: external decl. New globals GEP into it. |
+| `<global link-name>` (per new global) | external decl, no initializer | Section 4. Reload obj: undefined external the loader resolves to persistent near-exe storage. |
+| `__odin_lpg_init$<link-name>` (per new global with a const init) | const blob of the global's bytes | Section 4. The loader copies it into the global's storage once, on first allocation. |
 | `__odin_livepatch_tls_arena` | `@thread_local [tls_arena_size]u8` | Section 5. New thread-locals GEP into it. Both builds define it. |
 | `__odin_lptls$<link-name>` | `proc() -> rawptr` | Section 5. Accessor thunk that returns `&var`. The loader calls it to learn a preserved thread-local's TLS offset. |
 | `__odin_livepatch_func_hashes` | `{ i64 count; {u64 name_hash, u64 content_hash}[] }` | Section 6. Change-detection baseline/delta. |
 | `__odin_livepatch_build_id` | `u64` | Section 6. Layout fingerprint. The loader refuses a mismatched object (F6). |
-| `__odin_livepatch_new_global_inits` | `{ i64 count; {i64 arena_off, i64 flag_off, i64 size, rawptr blob}[] }` | Section 4. The loader copies each blob into the arena once, gated by its flag byte. Internal. |
+| `__odin_livepatch_new_globals` | self-contained blob: `[i64 count]` then per entry `[i64 size][i64 name_len][name bytes]` | Section 4. Names+sizes of new globals; the loader allocates each one's storage. Internal, no pointer relocations. |
 | `__odin_livepatch_refresh_syms` | self-contained blob: `[i64 count]` then per entry `[i64 size][i64 name_len][name bytes]` | Section 10. `@(rodata)`/`#load` repoint list. Internal, no pointer relocations. |
 | `__odin_livepatch_type_infos` | `[]^Type_Info` | Section 9. Published type table for struct-layout diffing. |
 | `__odin_livepatch_pre_patch_hooks` | `{ i64 count; {rawptr name, i64 name_len}[] }` | Section 11. Pre-patch hook names (resolved against the exe). |

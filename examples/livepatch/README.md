@@ -20,7 +20,7 @@ A reload may also **introduce new globals and new procedures** (see below).
 Use the `odin.exe` from **this repo** (it has `-livepatch` and the
 `core:livepatch` loader package).
 
-1. **Build the demo once and run it.** `-livepatch` reserves the new-global arena,
+1. **Build the demo once and run it.** `-livepatch`
    implies `-debug` (producing the PDB the loader resolves symbols from), auto-adds
    `/OPT:NOREF,NOICF`, and writes the manifest (default
    `<pkg>/odin-livepatch.manifest`) so reload builds line up against it. Run it from
@@ -42,7 +42,7 @@ Use the `odin.exe` from **this repo** (it has `-livepatch` and the
 3. **Rebuild only the patch** in a second terminal (do *not* rebuild the exe —
    that would restart the process). One command — `-livepatch-patch` implies
    `-build-mode:obj`, emits into `.\hot_objs\` (created + stale `*.obj` cleared), and
-   reuses the default manifest so any new global gets a stable arena slot:
+   reuses the default manifest so any new global keeps a stable identity across reloads:
 
    ```
    cd examples/livepatch
@@ -80,11 +80,10 @@ procedure** (`bonus`), compiles it to `hot.obj`, and drives **two** reloads.
 it:
 
 ```
-==> new-global arena slots recorded in the manifest:
-next_free 49
-new 0  3300913439211647358 0  livepatch_demo::reloads     # zero-init, no flag
-new 8  3300913439211647358 17 livepatch_demo::threshold   # const 42, init-flag at 16
-new 24 3211830901467771920 49 livepatch_demo::limits      # const [3]i64, init-flag at 48
+==> new globals recorded in the manifest:
+new 0 3300913439211647358 0 livepatch_demo::reloads     # zero-init
+new 0 3300913439211647358 0 livepatch_demo::threshold   # const 42
+new 0 3211830901467771920 0 livepatch_demo::limits      # const [3]i64
 ...
 > counter = 1   hits = 2   mirror = 0
 counter = 2   hits = 4   mirror = 0
@@ -94,6 +93,8 @@ reload ok: true
 counter = 72   hits = 8   mirror = 44   # threshold persisted across reload 2 (not reset to 43)
 ```
 
+The manifest now records only each new global's layout hash (the leading `0`s are
+vestigial arena fields — storage is loader-allocated, not arena-pinned).
 `mirror` reaching `44` (not `43`) is the point: the new global's **constant
 initializer is applied exactly once**, and its state persists across every
 reload. `counter` jumping by 35 per tick shows the aggregate constant `limits`
@@ -118,12 +119,13 @@ the symbol name.)
    table (`__odin_livepatch_func_hashes`, no addresses — dead-code elimination
    stays on) so the loader patches only the procedures whose code actually changed.
 
-3. **The new-global arena + manifest.** `-livepatch` also reserves a zero-init
-   arena (`__odin_livepatch_global_arena`) in the exe. The compiler writes a
-   **manifest** (`-livepatch-manifest:<path>`) recording every original global
-   and, for reload builds, the arena offset assigned to each **new** global — so
-   the same new global lands at the same address every reload and its state
-   persists.
+3. **New-global storage + manifest.** A global a reload introduces is an undefined
+   external symbol that the loader resolves to its own persistent, near-exe storage
+   (the Live++ policy — no fixed exe arena to size or exhaust), keyed by name and
+   reused across reloads so the global keeps one address and its state persists. The
+   compiler writes a **manifest** (`-livepatch-manifest:<path>`) recording every
+   original global's layout hash (and each new global's, so a later reload can warn
+   on a layout change).
 
 4. **Recompile to an object.** On reload the program is rebuilt to reload object(s)
    with a single `odin build <pkg> -livepatch-patch` — that flag implies
@@ -139,8 +141,9 @@ the symbol name.)
      resolved by policy: a symbol that exists in the running exe and is **not** hot
      → the exe's address (reuses procedures and points existing globals at the
      exe's copy); a **hot** symbol → the object's fresh copy; an object-local
-     symbol (new procedures, constants, labels) → its loaded copy. New globals
-     reference the arena symbol (resolved to the exe's arena) plus a byte offset.
+     symbol (new procedures, constants, labels) → its loaded copy. A **new global**
+     is an undefined external the loader resolves to its own persistent near-exe
+     storage (allocated on first sighting, reused by name across reloads).
      An **undefined external** not in the table — a C-runtime helper
      (`memcpy`/`memset`/…), `_tls_index`, an `__imp_*` import cell, or a Windows-API
      symbol — is resolved against the running process via `GetProcAddress` / an
@@ -164,30 +167,33 @@ the symbol name.)
 
 Works: replacing a running procedure; hot code that reads/writes existing package
 globals (state preserved); **new procedures** (called from hot code, transitively);
-**new globals** (persist across reloads via the arena); and **`fmt`/`any`/reflection
+**new globals** (loader-allocated storage that persists across reloads); and **`fmt`/`any`/reflection
 from hot code**, including `%v` over user structs and `typeid_of(T)` for any type
 present in the program at exe-build time.
 
 Out of scope for this PoC (documented edges):
 
 - **Runtime initializers for new globals.** New globals may carry **compile-time
-  constant** initializers — the loader writes them into the arena exactly once (via
-  a per-global flag byte), so they start at their declared value and then persist.
-  A *runtime* (non-constant) initializer or a new `@(init)` for a fresh global is
-  still unsupported (rejected at build time).
+  constant** initializers — the loader copies them into the global's fresh storage
+  exactly once (on first allocation), so they start at their declared value and then
+  persist. A *runtime* (non-constant) initializer or a new `@(init)` for a fresh
+  global is still unsupported (rejected at build time).
 - **New host-callable entry points.** A brand-new procedure is reachable through
   the patched call graph, but the frozen host cannot gain a new direct call site.
-- **Changing an existing global's type/layout** across a reload is rejected at
-  build time (its preserved memory cannot be reinterpreted). The new-global arena
-  is a fixed size (`-livepatch-arena-size`, default 256 KiB).
+- **Changing an existing global's type/layout** across a reload is not an error —
+  like Live++, the preserved memory keeps its address and is reinterpreted as-is
+  (the compiler warns; migrate it with a pre/post-patch hook if the layout is
+  incompatible). New globals have no fixed-size cap; `-livepatch-arena-size` is
+  deprecated and ignored.
 - **Reflection over a brand-new type introduced only by a hot edit.** `fmt`/`any`/
   reflection over any type that exists in the program at exe-build time now works
   from hot code (`typeid` is the build-stable canonical hash; under `-livepatch` the
   exe's `type_table` is made complete and hot code resolves `type_info` through it).
   But a type that appears *only* in a reload edit is absent from the exe's frozen
   `type_table`, so reflection on it won't be correct.
-- Each reload leaks the mapped block (new-global storage is in the exe arena, so it is
-  unaffected); whole-program recompile per reload; x64 / Windows / COFF only.
+- Each reload leaks the mapped block (new-global storage is its own persistent
+  loader allocation, so it is unaffected); whole-program recompile per reload;
+  x64 / Windows / COFF only.
 
 Thread safety: patching is safe while other threads run the hot procedures. On a reload
 the loader suspends every other thread, checks none is parked in a prologue it is about to
@@ -274,9 +280,10 @@ out of migrated state), and the diff still compares bit-sets by size alone.
 - Tagless patchability + `@(no_livepatch)` opt-out — `src/checker.{hpp,cpp}`,
   `src/entity.cpp`, `src/check_decl.cpp`, `src/llvm_backend_proc.cpp`
   (`lb_proc_is_livepatchable`).
-- `-livepatch` (implies `-debug`), `-livepatch-arena-size`, `-livepatch-manifest`
-  flags; PDB-based resolution + change-detection hash table
-  (`__odin_livepatch_func_hashes`); new-global arena + manifest; auto
+- `-livepatch` (implies `-debug`), `-livepatch-manifest` flags
+  (`-livepatch-arena-size` is deprecated/ignored); PDB-based resolution +
+  change-detection hash table (`__odin_livepatch_func_hashes`);
+  loader-allocated new-global storage + manifest; auto
   `/OPT:NOREF,NOICF` — `src/main.cpp`, `src/build_settings.cpp`,
   `src/llvm_backend.cpp`, `src/linker.cpp`, `core/sys/windows/dbghelp.odin`
   (`SymEnumSymbolsW`).

@@ -1,6 +1,7 @@
 #+build windows
 package livepatch
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
 import "core:strings"
@@ -62,6 +63,38 @@ lp_new_proc_trampoline :: proc(name: string) -> rawptr {
 	return t
 }
 
+// Process-lifetime storage for globals a reload introduces (the Live++ policy: each
+// new global gets real, independent storage rather than a slot in a fixed exe arena).
+// Like the trampoline registry it must outlive any single reload's block, so a global
+// introduced in reload 2 keeps the same address — and its state — when reloads 3, 4, …
+// still carry it. Keyed by mangled name.
+@(private) _lp_new_globals: map[string]rawptr
+
+// Returns persistent, near-exe storage for a new global, allocating and zeroing it on
+// first sighting. The bool reports whether this call allocated it, so the caller runs
+// the global's one-time constant initializer exactly once across the process lifetime.
+// Each global gets its own near allocation: a data REL32 reference from the reload's
+// code (which sits within ±1.5GB of the exe) can then always reach it, and a page-
+// granular block leaves headroom that keeps an in-place layout change from overrunning.
+@(private)
+lp_new_global_storage :: proc(name: string, size: int) -> (rawptr, bool) {
+	if _lp_new_globals != nil {
+		if p, ok := _lp_new_globals[name]; ok {
+			return p, false
+		}
+	} else {
+		_lp_new_globals = make(map[string]rawptr, runtime.heap_allocator())
+	}
+	n := max(size, 1)
+	p := alloc_near_data(uintptr(win.GetModuleHandleW(nil)), n)
+	if p == nil {
+		return nil, false
+	}
+	intrinsics.mem_zero(p, n)
+	_lp_new_globals[strings.clone(name, runtime.heap_allocator())] = p
+	return p, true
+}
+
 // Reserves executable memory within 2GB of the running exe.
 alloc_near_exe :: proc(size: int) -> rawptr {
 	return alloc_near(uintptr(win.GetModuleHandleW(nil)), size)
@@ -69,16 +102,27 @@ alloc_near_exe :: proc(size: int) -> rawptr {
 
 // Reserves size bytes of executable memory within 2GB of the given address (for x64 rel32 reach).
 alloc_near :: proc(near: uintptr, size: int) -> rawptr {
+	return alloc_near_prot(near, size, win.PAGE_EXECUTE_READWRITE)
+}
+
+// Reserves size bytes of read/write (non-executable) memory within 2GB of the given
+// address — for new-global data a reload's code reaches via a rel32 displacement.
+alloc_near_data :: proc(near: uintptr, size: int) -> rawptr {
+	return alloc_near_prot(near, size, win.PAGE_READWRITE)
+}
+
+// Reserves size bytes within 2GB of the given address with the requested page protection.
+alloc_near_prot :: proc(near: uintptr, size: int, prot: win.DWORD) -> rawptr {
 	sz := win.SIZE_T(size)
 	step :: uintptr(0x0010_0000)
 	limit :: uintptr(0x6000_0000)
 	for off := step; off <= limit; off += step {
 		if near > off {
-			if m := win.VirtualAlloc(rawptr(near - off), sz, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE); m != nil {
+			if m := win.VirtualAlloc(rawptr(near - off), sz, win.MEM_COMMIT | win.MEM_RESERVE, prot); m != nil {
 				return m
 			}
 		}
-		if m := win.VirtualAlloc(rawptr(near + off), sz, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE); m != nil {
+		if m := win.VirtualAlloc(rawptr(near + off), sz, win.MEM_COMMIT | win.MEM_RESERVE, prot); m != nil {
 			return m
 		}
 	}

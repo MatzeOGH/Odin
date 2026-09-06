@@ -1453,12 +1453,15 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_LivePatchArenaSize:
 							{
+								// Deprecated: new globals now get loader-allocated storage
+								// (no fixed exe arena), so this flag no longer does anything.
 								GB_ASSERT(value.kind == ExactValue_Integer);
 								i64 size = big_int_to_i64(&value.value_integer);
 								if (size < 0) {
 									gb_printf_err("%.*s expected a non-negative number, got %.*s\n", LIT(name), LIT(param));
 									bad_flags = true;
 								} else {
+									gb_printf_err("warning: %.*s is deprecated and ignored; a reload's new globals are given storage on demand, with no fixed-size arena.\n", LIT(name));
 									build_context.livepatch_arena_size = size;
 								}
 							}
@@ -3410,7 +3413,8 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "but the base build stays smaller and links faster.");
 		}
 		if (print_flag("-livepatch-arena-size:<integer>")) {
-			print_usage_line(2, "Bytes reserved in the exe for globals introduced by a reload (default: 262144).");
+			print_usage_line(2, "Deprecated and ignored: globals introduced by a reload now get storage on demand,");
+			print_usage_line(2, "with no fixed-size exe arena, so there is no size to reserve.");
 		}
 		if (print_flag("-livepatch-tls-arena-size:<integer>")) {
 			print_usage_line(2, "Per-thread bytes reserved for thread-locals introduced by a reload (default: 4096).");

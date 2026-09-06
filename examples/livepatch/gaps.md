@@ -117,10 +117,13 @@ callbacks. Minor; add if an app wants to gate the build phases.
   the actual migration is the user's job in the hook. Odin's reflection
   `migrate_fields` is a bonus. Its sharp edges (enum-with-no-constant nil-deref,
   `#no_nil` tag-0) are just **bugs to fix**, not parity gaps — cheap, do them.
-- **New globals/procs/types** — parity. Caveat: Odin applies a new global's
-  *compile-time constant* initializer once, not a runtime initializer/`@(init)`;
-  Live++'s new-global init is underdocumented and Clang has its own dynamic-init
-  limitation, so this is roughly comparable, not a clear gap.
+- **New globals/procs/types** — parity, including storage policy: a new global is an
+  undefined external the loader resolves to its own persistent storage (like Live++'s
+  real linked-image globals), not a slot in a fixed exe arena — so there is no size cap
+  and no "arena exhausted" build error (`-livepatch-arena-size` is deprecated/ignored).
+  Caveat: Odin applies a new global's *compile-time constant* initializer once, not a
+  runtime initializer/`@(init)`; Live++'s new-global init is underdocumented and Clang
+  has its own dynamic-init limitation, so this is roughly comparable, not a clear gap.
 - **Optimized builds** — parity (both forgo LTO/LTCG).
 - **Unwind / SEH through hot code** — parity.
 - **Changing a function's signature** — parity. Both redirect at the callee's

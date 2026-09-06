@@ -47,7 +47,7 @@ because the whole scheme resolves addresses in the live image through its **PDB*
 | `symbols.odin`  | Symbol resolution: PDB enumeration via DbgHelp, exe/DLL exports, TLS offsets, the "near arena" for trampolines and import cells. |
 | `patch.odin`    | The actual entry-point patching: patch-pad detection, atomic pad jump, overwrite fallback. |
 | `threads.odin`  | Thread suspension, IP/stack-walk safety checks, and generation lifetime (freeing old reloads safely). |
-| `meta.odin`     | Reads compiler-emitted metadata: per-proc content hashes, patch hooks, new-global inits. |
+| `meta.odin`     | Reads compiler-emitted metadata: per-proc content hashes, patch hooks. |
 | `types.odin`    | Reflection type-table diffing and swapping so `type_info_of` sees edited/new types. |
 
 ---
@@ -191,9 +191,13 @@ newly mapped code.
 Before touching code, three data-side updates happen, driven by compiler
 metadata found in the "meta" object (`meta_i`):
 
-1. **New global inits** (`__odin_livepatch_new_global_inits`): globals the reload
-   *introduces* get their initializer blob copied into the runtime global arena,
-   guarded by a once-flag so re-applying doesn't re-run initialization.
+1. **New globals** (`__odin_livepatch_new_globals`): globals the reload
+   *introduces* are undefined external symbols; `lp_prepare_new_globals` gives each
+   its own persistent, near-exe storage (`lp_new_global_storage`) and registers it
+   in `all_syms` before relocation, so the object's references resolve to it. After
+   relocation, `lp_init_new_globals` copies each freshly-allocated global's
+   `__odin_lpg_init$<name>` blob in once, so re-applying doesn't re-run
+   initialization. (This is the Live++ storage policy — no fixed exe arena.)
 
 2. **`@(rodata)` / `#load` refresh** (`__odin_livepatch_refresh_syms`): named
    read-only globals whose *contents* changed are copied byte-for-byte over the
@@ -223,7 +227,7 @@ list. Pre-hooks resolve to the **live** proc (run the old code before the swap);
 post-hooks resolve to the **reload's** proc (run the new code after). This is
 where an app migrates existing state to a changed struct layout.
 
-### Globals keep their exe address — and why a layout change is refused
+### Globals keep their exe address — and why a layout change only warns
 
 All three data updates above preserve the global's **live exe address**; nothing
 is duplicated into the reload. In `lp_build_symbols`, a data symbol (non-code)
@@ -232,25 +236,26 @@ to global `a` from a freshly patched proc and a reference from an *unpatched*
 proc land on the exact same address. Mutable state therefore survives a reload
 untouched.
 
-That single-instance invariant is exactly why the compiler **refuses a global
-whose type layout changed** (`lb_livepatch_handle_global`, `src/llvm_backend.cpp`
-→ "global '…' changed type/layout across a reload"). The base build records each
-global's layout hash in the `.manifest`; a patch build compares and errors on a
-mismatch. An existing exe global is a fixed address with fixed *old-layout*
-storage in `.data`/`.bss`, and unpatched procedures reference it through
-already-compiled instructions that a hot patch never rewrites. Relocating it to a
-new-layout arena slot would make patched code see the new copy while unpatched
-code kept reading the stale exe copy — silent divergence. Refusing it is the safe
-default.
+That single-instance invariant is why a global whose layout changed is delicate.
+An existing exe global is a fixed address with fixed *old-layout* storage in
+`.data`/`.bss`, and unpatched procedures reference it through already-compiled
+instructions that a hot patch never rewrites — so reinterpreting the old bytes
+through a new layout makes patched code see the new shape while unpatched code
+keeps reading the old one. Like Live++, the compiler does **not** refuse this: it
+keeps the address and reinterprets in place, and emits a **warning**
+(`lb_livepatch_handle_global`, `src/llvm_backend.cpp` → "changed type/layout
+across a reload … migrate it with a patch hook"). The base build records each
+global's layout hash in the `.manifest`; a patch build compares and warns on a
+mismatch. Getting it right is then your responsibility, via the hooks below.
 
-**The supported way to evolve a global's structure** is to put the evolving data
+**The clean way to evolve a global's structure** is to put the evolving data
 behind a *pointer* global (`state: ^State`, heap-allocated). The pointer's layout
-never changes, so the guard never fires; grow or reorder `State` freely and
-migrate the old value to the new layout in a `@(post_patch_hook)` (the
-`[]Type_Change` list tells you what changed). New value fields are zero-init'd and
-preserved from then on. For a value global you must evolve in place, add a
-new differently-named global with the new layout and copy across in the hook —
-new globals are already supported (Step 4.1).
+never changes, so nothing warns; grow or reorder `State` freely and migrate the
+old value to the new layout in a `@(post_patch_hook)` (the `[]Type_Change` list
+tells you what changed). New value fields are zero-init'd and preserved from then
+on. For a value global you must evolve in place, add a new differently-named
+global with the new layout and copy across in the hook — new globals get their own
+loader-allocated storage (Step 4.1).
 
 To do the migration without hand-copying every field, call `migrate_fields`
 (`types.odin`) from the hook: it reflection-copies every field present in both
@@ -598,10 +603,10 @@ swapped table, not the exe's original type set.
 
 Re-applying must not re-run one-time work:
 
-- **New-global inits** are each guarded by a `flag` byte in the runtime arena
-  (`New_Global_Init.flag_offset`); the blob is copied only while `flag == 0`, then
-  the flag is set. A global introduced in reload 2 is initialized once, even if
-  reload 3, 4, … still carry it.
+- **New-global inits** fire only on first allocation: `lp_new_global_storage`
+  returns a `fresh` flag, and `lp_init_new_globals` copies the init blob only when
+  `fresh` is true. A global introduced in reload 2 is initialized once, even if
+  reload 3, 4, … still carry it (their storage lookup returns `fresh == false`).
 - **`@(rodata)`/`#load` refresh** and the **type-table swap** are idempotent
   byte-copies — re-doing them with identical bytes is a no-op, and the type-hash
   fast-path skips the whole type walk when nothing changed.
@@ -685,7 +690,7 @@ The runtime leans on several compiler-emitted symbols (resolved through the PDB)
 | `__odin_livepatch_func_hashes`      | per-proc content hashes → change detection |
 | `__odin_livepatch_build_id`         | rejects objects not built against the running exe |
 | `__odin_livepatch_type_infos` / `_type_table_hash` / `_type_table_ref` | reflection type diffing & swap |
-| `__odin_livepatch_new_global_inits` | init blobs for newly introduced globals |
+| `__odin_livepatch_new_globals`      | names+sizes of newly introduced globals (loader allocates their storage); each const init is an `__odin_lpg_init$<name>` blob |
 | `__odin_livepatch_refresh_syms`     | `@(rodata)`/`#load` globals to refresh |
 | `__odin_livepatch_pre/post_patch_hooks` | user migration hooks |
 | `__odin_lptls$<var>`                | per-thread-local offset accessors (SECREL relocs) |

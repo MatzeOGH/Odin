@@ -3102,39 +3102,33 @@ gb_internal u64 lb_livepatch_parse_u64(String s) {
 	return v;
 }
 
-gb_internal LLVMValueRef lb_livepatch_arena(lbModule *m) {
-	LLVMValueRef existing = LLVMGetNamedGlobal(m->mod, "__odin_livepatch_global_arena");
-	if (existing != nullptr) {
-		return existing;
-	}
-	i64 size = build_context.livepatch_arena_size;
-	if (size <= 0) {
-		size = 1;
-	}
-	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
-	LLVMValueRef arena = LLVMAddGlobal(m->mod, arena_t, "__odin_livepatch_global_arena");
-	if (build_context.livepatch_is_reload) {
-		LLVMSetLinkage(arena, LLVMExternalLinkage);
-	} else {
-		LLVMSetInitializer(arena, LLVMConstNull(arena_t));
-		LLVMSetLinkage(arena, LLVMExternalLinkage);
-	}
-	LLVMSetAlignment(arena, 16);
-	return arena;
-}
+// Emits (once per module) an undefined external symbol for a global the reload
+// introduces, and, if it has a non-zero constant initializer, an `__odin_lpg_init$<name>`
+// blob the loader copies in on first sighting. The loader resolves the external symbol to
+// persistent near-exe storage (the Live++ policy) — no fixed exe arena, no size cap.
+// Returns the pointer to use as the global's address.
+gb_internal LLVMValueRef lb_livepatch_new_global_external(lbGenerator *gen, lbModule *m, String name, Type *type, LLVMValueRef const_init) {
+	char const *name_c = alloc_cstring(temporary_allocator(), name);
+	LLVMValueRef g = LLVMGetNamedGlobal(m->mod, name_c);
+	if (g == nullptr) {
+		// No initializer -> an undefined external in the object; the loader resolves it.
+		g = LLVMAddGlobal(m->mod, lb_type(m, type), name_c);
+		LLVMSetLinkage(g, LLVMExternalLinkage);
+		LLVMSetAlignment(g, cast(unsigned)gb_max(type_align_of(type), 1));
 
-gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *ptr_type) {
-	LLVMValueRef arena = lb_livepatch_arena(m);
-	i64 size = build_context.livepatch_arena_size;
-	if (size <= 0) {
-		size = 1;
+		lbLivePatchNewGlobal ng = { name, gb_max(type_size_of(type), 1) };
+		array_add(&gen->livepatch_new_globals, ng);
+
+		if (const_init != nullptr && !LLVMIsNull(const_init)) {
+			char const *blob_name = gb_bprintf("__odin_lpg_init$%.*s", LIT(name));
+			LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(const_init), blob_name);
+			LLVMSetInitializer(blob, const_init);
+			LLVMSetGlobalConstant(blob, true);
+			LLVMSetLinkage(blob, LLVMExternalLinkage);
+			lb_append_to_used(m, blob);
+		}
 	}
-	LLVMTypeRef arena_t = LLVMArrayType(lb_type(m, t_u8), cast(unsigned)size);
-	LLVMValueRef indices[2] = {};
-	indices[0] = LLVMConstInt(lb_type(m, t_i32), 0, false);
-	indices[1] = LLVMConstInt(lb_type(m, t_int), offset, false);
-	LLVMValueRef gep = LLVMConstInBoundsGEP2(arena_t, arena, indices, 2);
-	return LLVMConstPointerCast(gep, lb_type(m, ptr_type));
+	return g;
 }
 
 gb_internal LLVMValueRef lb_livepatch_tls_arena(lbModule *m) {
@@ -3703,10 +3697,6 @@ gb_internal void lb_livepatch_emit_support(lbGenerator *gen) {
 		}
 	}
 
-	if (build_context.livepatch_arena_size > 0) {
-		LLVMValueRef arena = lb_livepatch_arena(m);
-		lb_append_to_used(m, arena);
-	}
 }
 
 gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInfo *info, bool want_pre, char const *sym_name) {
@@ -3751,40 +3741,32 @@ gb_internal void lb_livepatch_emit_patch_hook_table(lbGenerator *gen, CheckerInf
 	lb_append_to_used(m, tbl);
 }
 
-// Emits __odin_livepatch_new_global_inits: {i64 count, {i64 arena_offset, i64 flag_offset,
-// i64 size, rawptr blob}[]} — the const initializers the loader copies into fresh arena slots.
-gb_internal void lb_livepatch_emit_new_global_inits(lbGenerator *gen) {
-	if (gen->livepatch_inits.count == 0) {
+// Emits __odin_livepatch_new_globals: a length-prefixed blob {u64 count, {u64 size,
+// u64 name_len, name bytes}[]} naming every global this reload introduces. The loader
+// reads it before relocation (no pointers inside), gives each global its own persistent
+// near-exe storage, and copies its `__odin_lpg_init$<name>` blob in once if present.
+gb_internal void lb_livepatch_emit_new_globals(lbGenerator *gen) {
+	if (gen->livepatch_new_globals.count == 0) {
 		return;
 	}
 	lbModule *m = &gen->default_module;
-	LLVMTypeRef i64t = lb_type(m, t_i64);
-	LLVMTypeRef ptrt = lb_type(m, t_rawptr);
-	LLVMTypeRef entry_field_types[4] = { i64t, i64t, i64t, ptrt };
-	LLVMTypeRef entry_t = LLVMStructTypeInContext(m->ctx, entry_field_types, 4, false);
-
-	auto entry_vals = array_make<LLVMValueRef>(temporary_allocator(), 0, gen->livepatch_inits.count);
-	for (LivePatchInitEntry const &ie : gen->livepatch_inits) {
-		LLVMValueRef fields[4] = {};
-		fields[0] = LLVMConstInt(i64t, cast(u64)ie.arena_offset, false);
-		fields[1] = LLVMConstInt(i64t, cast(u64)ie.flag_offset, false);
-		fields[2] = LLVMConstInt(i64t, cast(u64)ie.size, false);
-		fields[3] = LLVMConstPointerCast(ie.blob, ptrt);
-		array_add(&entry_vals, LLVMConstStructInContext(m->ctx, fields, 4, false));
+	auto buf = array_make<u8>(heap_allocator(), 0, 256);
+	lb_livepatch_put_u64_le(&buf, cast(u64)gen->livepatch_new_globals.count);
+	for (lbLivePatchNewGlobal const &ng : gen->livepatch_new_globals) {
+		lb_livepatch_put_u64_le(&buf, cast(u64)ng.size);
+		lb_livepatch_put_u64_le(&buf, cast(u64)ng.name.len);
+		for (isize i = 0; i < ng.name.len; i++) {
+			array_add(&buf, ng.name.text[i]);
+		}
 	}
-	LLVMTypeRef arr_t = LLVMArrayType(entry_t, cast(unsigned)entry_vals.count);
-	LLVMValueRef arr = LLVMConstArray(entry_t, entry_vals.data, cast(unsigned)entry_vals.count);
-
-	LLVMTypeRef tbl_field_types[2] = { i64t, arr_t };
-	LLVMTypeRef tbl_t = LLVMStructTypeInContext(m->ctx, tbl_field_types, 2, false);
-	LLVMValueRef tbl_fields[2] = { LLVMConstInt(i64t, cast(u64)entry_vals.count, false), arr };
-	LLVMValueRef tbl_val = LLVMConstStructInContext(m->ctx, tbl_fields, 2, false);
-
-	LLVMValueRef tbl = LLVMAddGlobal(m->mod, tbl_t, "__odin_livepatch_new_global_inits");
-	LLVMSetInitializer(tbl, tbl_val);
+	LLVMValueRef blob = LLVMConstStringInContext(m->ctx, cast(char const *)buf.data, cast(unsigned)buf.count, true);
+	LLVMValueRef tbl = LLVMAddGlobal(m->mod, LLVMTypeOf(blob), "__odin_livepatch_new_globals");
+	LLVMSetInitializer(tbl, blob);
 	LLVMSetGlobalConstant(tbl, true);
 	LLVMSetLinkage(tbl, LLVMInternalLinkage);
+	LLVMSetAlignment(tbl, 8);
 	lb_append_to_compiler_used(m, tbl);
+	array_free(&buf);
 }
 
 // Emits __odin_livepatch_refresh_syms: a length-prefixed blob {u64 count, {u64 size, u64 name_len,
@@ -3832,7 +3814,10 @@ gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entit
 	u64 *orig_th = string_map_get(&livepatch_manifest.orig, name);
 	if (orig_th != nullptr) {
 		if (*orig_th != th) {
-			error(e->token, "livepatch: global '%.*s' changed type/layout across a reload. Its preserved memory cannot be reinterpreted safely", LIT(name));
+			// Live++ parity: don't reject a layout change. The preserved global keeps its
+			// original address and bytes; patched code reinterprets them through the new
+			// type. Use @(pre/post_patch_hook)+migrate_fields to migrate the data.
+			warning(e->token, "livepatch: global '%.*s' changed type/layout across a reload. Its preserved memory is reinterpreted as-is; migrate it with a patch hook if the layout is incompatible", LIT(name));
 		}
 		return false;
 	}
@@ -3846,7 +3831,10 @@ gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entit
 		if (ne != nullptr) {
 			offset = ne->offset;
 			if (ne->type_hash != th) {
-				error(e->token, "livepatch: new thread-local '%.*s' changed type/layout across a reload. Its TLS arena storage cannot be reinterpreted safely", LIT(name));
+				// Live++ parity: reinterpret the existing TLS arena slot instead of rejecting.
+				// The slot size is fixed at first introduction, so a size increase can overrun
+				// its neighbor -- migrate with a patch hook if the layout is incompatible.
+				warning(e->token, "livepatch: new thread-local '%.*s' changed type/layout across a reload. Its TLS arena slot is reinterpreted as-is (fixed size); a larger layout may overrun the next slot", LIT(name));
 			}
 		} else {
 			i64 al = gb_max(type_align_of(e->type), 1);
@@ -3873,7 +3861,7 @@ gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entit
 		return true;
 	}
 
-	// New global introduced by the reload -> persistent arena slot.
+	// New global introduced by the reload -> loader-allocated persistent storage.
 	bool has_const_init = false;
 	bool runtime_init   = false;
 	lbValue init = {};
@@ -3900,46 +3888,23 @@ gb_internal bool lb_livepatch_handle_global(lbGenerator *gen, lbModule *m, Entit
 		error(e->token, "livepatch: new global '%.*s' has a non-constant initializer. Only compile-time constant initializers are supported for a global introduced across a reload", LIT(name));
 	}
 
-	i64 offset   = 0;
-	i64 flag_off = -1;
+	// Record the layout baseline once, so a later reload can warn if the global's layout
+	// changes (the storage is address-stable, so an incompatible change must be migrated).
 	LivePatchNewEntry *ne = string_map_get(&livepatch_manifest.newg, name);
 	if (ne != nullptr) {
-		offset   = ne->offset;
-		flag_off = ne->init_flag_offset;
 		if (ne->type_hash != th) {
-			error(e->token, "livepatch: new global '%.*s' changed type/layout across a reload. Its arena storage cannot be reinterpreted safely", LIT(name));
+			warning(e->token, "livepatch: new global '%.*s' changed type/layout across a reload. Its storage is address-stable and reinterpreted as-is; migrate it with a patch hook if the layout is incompatible", LIT(name));
 		}
 	} else {
-		i64 al = gb_max(type_align_of(e->type), 1);
-		i64 sz = gb_max(type_size_of(e->type), 1);
-		offset = align_formula(livepatch_manifest.next_free, al);
-		livepatch_manifest.next_free = offset + sz;
-		if (has_const_init) {
-			flag_off = livepatch_manifest.next_free;
-			livepatch_manifest.next_free = flag_off + 1;
-		}
-		if (livepatch_manifest.next_free > livepatch_manifest.arena_size) {
-			error(e->token, "livepatch: new-global arena exhausted (%lld/%lld bytes). rebuild the exe with a larger -livepatch-arena-size", cast(long long)livepatch_manifest.next_free, cast(long long)livepatch_manifest.arena_size);
-		}
-		LivePatchNewEntry added = {offset, th, flag_off};
+		LivePatchNewEntry added = {0, th, -1};
 		string_map_set(&livepatch_manifest.newg, name, added);
-
-		if (has_const_init) {
-			char const *blob_name = gb_bprintf("__odin_hrg_init_%td", cast(isize)gen->livepatch_inits.count);
-			LLVMValueRef blob = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), blob_name);
-			LLVMSetInitializer(blob, init.value);
-			LLVMSetGlobalConstant(blob, true);
-			LLVMSetLinkage(blob, LLVMPrivateLinkage);
-			LivePatchInitEntry ie = {offset, flag_off, gb_max(type_size_of(e->type), 1), blob};
-			array_add(&gen->livepatch_inits, ie);
-		}
 	}
 
 	lbGlobalVariable var = {};
 	var.decl = decl;
 	lbValue g = {};
 	g.type  = alloc_type_pointer(e->type);
-	g.value = lb_livepatch_arena_ptr(m, offset, alloc_type_pointer(e->type));
+	g.value = lb_livepatch_new_global_external(gen, m, name, e->type, has_const_init ? init.value : nullptr);
 	var.is_initialized = true;
 	var.var = g;
 	array_add(global_variables, var);
@@ -4269,9 +4234,8 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	auto global_variables = array_make<lbGlobalVariable>(permanent_allocator(), 0, global_variable_max_count);
 
 	LivePatchManifest &livepatch_manifest = gen->livepatch_manifest;
-	Array<LivePatchInitEntry> &livepatch_inits = gen->livepatch_inits;
 	if (build_context.livepatch) {
-		livepatch_inits = array_make<LivePatchInitEntry>(heap_allocator(), 0, 16);
+		gen->livepatch_new_globals = array_make<lbLivePatchNewGlobal>(heap_allocator(), 0, 16);
 		gen->livepatch_tls_syms = array_make<lbLivePatchStaticSym>(heap_allocator(), 0, 16);
 		gen->livepatch_refresh_syms = array_make<lbLivePatchRefreshSym>(heap_allocator(), 0, 16);
 		livepatch_manifest_read(&livepatch_manifest);
@@ -4528,11 +4492,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		lb_livepatch_emit_build_id(gen);
 		lb_livepatch_emit_type_table_hash(gen);
 
-		lb_livepatch_emit_new_global_inits(gen);
+		lb_livepatch_emit_new_globals(gen);
 		lb_livepatch_emit_refresh_syms(gen);
 
 		livepatch_manifest_write(&livepatch_manifest);
-		array_free(&livepatch_inits);
+		array_free(&gen->livepatch_new_globals);
 		array_free(&gen->livepatch_refresh_syms);
 	}
 

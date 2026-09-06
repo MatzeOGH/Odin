@@ -222,11 +222,12 @@ struct LivePatchManifest {
 };
 
 
-struct LivePatchInitEntry {
-	i64 arena_offset;
-	i64 flag_offset;
-	i64 size;
-	LLVMValueRef blob;
+// One global a reload introduces. The loader gives it its own persistent storage
+// (Live++ policy), keyed by `name`; `size` is how many bytes to reserve and how many
+// of its `__odin_lpg_init$<name>` blob to copy on first sighting.
+struct lbLivePatchNewGlobal {
+	String name;
+	i64    size;
 };
 
 
@@ -264,14 +265,14 @@ struct lbGenerator : LinkerData {
 	MPSCQueue<String> raddebug_section_strings;
 
 	LivePatchManifest  livepatch_manifest;
-	Array<LivePatchInitEntry> livepatch_inits;
+	Array<lbLivePatchNewGlobal> livepatch_new_globals;
 	Array<lbLivePatchStaticSym> livepatch_tls_syms;
 	Array<lbLivePatchRefreshSym> livepatch_refresh_syms;
 	BlockingMutex livepatch_mutex;
 };
 
-gb_internal LLVMValueRef lb_livepatch_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
 gb_internal LLVMValueRef lb_livepatch_tls_arena_ptr(lbModule *m, i64 offset, Type *ptr_type);
+gb_internal LLVMValueRef lb_livepatch_new_global_external(lbGenerator *gen, lbModule *m, String name, Type *type, LLVMValueRef const_init);
 gb_internal u64 lb_livepatch_layout_hash(Type *t);
 gb_internal bool lb_is_load_directive_expr(Ast *expr);
 gb_internal String lb_call_basic_directive_name(Ast *expr);
