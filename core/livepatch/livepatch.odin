@@ -23,6 +23,8 @@ LP_SECTION_MAP :: #config(LP_SECTION_MAP, true)
 
 @(private) _lp_busy: b32
 @(private) _lp_build_busy: b32
+// Set once the first reload has swept stale lp_<addr>.dll/.pdb files from prior runs.
+@(private) _lp_swept: bool
 
 // A single reload object mapped into memory near the exe, plus the bookkeeping needed to relocate and later free it.
 @(private)
@@ -586,6 +588,14 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	defer runtime.arena_destroy(&scratch)
 
 	_lp_dbg_warned = false // one debugger heads-up per reload (see lp_establish_section)
+
+	// Before emitting this run's first debug module, clear stale lp_<addr>.dll/.pdb
+	// files that earlier runs left next to the exe (their last live generation is
+	// never retired, and fresh base addresses give fresh names, so they accumulate).
+	if !_lp_swept {
+		lp_sweep_stale_debug_files()
+		_lp_swept = true
+	}
 
 	if len(obj_paths) == 0 {
 		fmt.eprintln("[livepatch] apply_many: no objects given")

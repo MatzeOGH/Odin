@@ -15,6 +15,7 @@ package livepatch
 import "base:runtime"
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import win "core:sys/windows"
 
@@ -577,4 +578,27 @@ filepath_dir_of_exe :: proc(alloc: runtime.Allocator) -> string {
 os2_write :: proc(path: string, data: []u8) -> bool {
 	err := os.write_entire_file(path, data)
 	return err == nil
+}
+
+// Deletes stale `lp_<addr>.dll` / `lp_<addr>.pdb` debug modules left next to the exe
+// by earlier runs. A process that exits — or crashes — never retires its last live
+// generation, so that generation's files stay on disk; because each run maps at a
+// fresh base address the filenames differ, so across many dev iterations they pile
+// up. Called once, before this process emits any of its own (see apply_many), so
+// only prior runs' files are swept, never a still-live generation's. Best-effort: a
+// file another live process still has section-mapped can't be removed and is simply
+// skipped (Windows denies deleting an open image mapping), as is any other failure.
+@(private)
+lp_sweep_stale_debug_files :: proc() {
+	dir := filepath_dir_of_exe(context.temp_allocator)
+	for suffix in ([?]string{"dll", "pdb"}) {
+		pattern := fmt.tprintf("%s\\lp_*.%s", dir, suffix)
+		matches, err := filepath.glob(pattern, context.temp_allocator)
+		if err != nil {
+			continue
+		}
+		for m in matches {
+			os.remove(m)
+		}
+	}
 }

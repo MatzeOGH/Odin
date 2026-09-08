@@ -676,6 +676,20 @@ live implementation of that proc. The count is observable via
 `live_generations()`, and each collapse prints `freed N stale reload
 generation(s); M still in use`.
 
+Each reload's debug module is also written to disk next to the exe as
+`lp_<base>.dll` + `lp_<base>.pdb` (so an attached debugger can load its symbols).
+When a generation is retired, `lp_free_marked` deletes its two files along with
+the memory. But the **current** live generation is never retired while the process
+runs, and process exit does no cleanup — so a run always leaves its last
+generation's files behind, and because each run maps at a fresh base the names
+differ, so they accumulate run-over-run. To bound this, the first reload of a
+process sweeps the exe directory of stale `lp_*.dll` / `lp_*.pdb`
+(`lp_sweep_stale_debug_files`, guarded by `_lp_swept`) **before** emitting any of
+its own — so only earlier runs' files are removed, never a live generation's. It is
+best-effort: a file another live process still has section-mapped can't be deleted
+and is skipped. This is crash-proof (unlike an at-exit hook), so it also reclaims
+files left by a run that crashed or was killed.
+
 ### Which copy does a reload's code call? (newly-added procedures)
 
 Symbol resolution is **per-reload and self-contained**: `lp_build_symbols` looks
