@@ -102,6 +102,14 @@ main :: proc() {
 			fmt.printfln("reload ok %v", ok)
 			for { win.Sleep(1000) } // persist so an external debugger/verifier can attach
 		}
+		if os.args[i] == "--dbg-loop" {
+			// Reload immediately, then call `update` forever so a source breakpoint set on a
+			// line in the patched `update` body can actually HIT (dbg-auto/-wait only Sleep).
+			fmt.printfln("dbg-loop pid %d", pid)
+			ok := lp.apply_dir()
+			fmt.printfln("reload ok %v", ok)
+			for { update(&state); win.Sleep(500) }
+		}
 		if os.args[i] == "--dbg-wait" {
 			fmt.printfln("dbg-wait pid %d", pid)
 			win.Sleep(5000)                  // window to attach a debugger BEFORE the reload

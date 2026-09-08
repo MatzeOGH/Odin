@@ -163,6 +163,31 @@ the symbol name.)
      (structurally, via the prologue pad, filtered by the change-detection hashes),
      so callers don't list them.
 
+## Debugging hot code (source breakpoints in reloaded procedures)
+
+A normal red-dot breakpoint on a line in a patched procedure binds to and hits inside the
+**patch**, in both VS Code (cppvsdbg) and raddbg, launched-under-debugger or
+attached-after-start — no `intrinsics.debug_trap()` needed. Each changed object is mapped
+as a `SEC_IMAGE` section (so the kernel fires a real `LOAD_DLL`) and gets a per-patch PDB
+with line info + a source-file checksum, emitted next to the exe as `lp_<addr>.dll`/`.pdb`.
+
+**One required setting — turn ON exact-source matching** (Live++ requires the same). After a
+reload two modules claim the same source line: the exe's original copy of the procedure
+(now dead — its entry was rewritten to jump into the patch) and the patch. Exact-source
+matching makes the debugger reject the exe's stale copy (its baked source no longer matches
+the file you're editing) and bind the patch (whose checksum matches the on-disk file):
+
+- **VS Code:** use `examples/livepatch/.vscode/launch.json` (ships `"requireExactSource": true`).
+  Open *this folder* in VS Code; needs the C/C++ extension.
+- **Visual Studio:** Tools → Options → Debugging → General → "Require source files to exactly
+  match the original version".
+- **raddbg:** enable its equivalent exact-source-match option.
+
+To exercise a body breakpoint without stdin, `livepatch.exe --dbg-loop` reloads once and then
+calls `update` in a loop; `--dbg-auto` / `--dbg-wait` reload then idle (attach-after / -before).
+Caveat: a source edited *again* between the patch build and the reload won't match (ordinary
+staleness).
+
 ## Scope and limitations
 
 Works: replacing a running procedure; hot code that reads/writes existing package

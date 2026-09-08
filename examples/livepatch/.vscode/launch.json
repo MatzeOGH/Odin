@@ -1,0 +1,46 @@
+{
+  // Source-level debugging of livepatched (hot-reloaded) code.
+  //
+  // Open THIS folder (examples/livepatch) in VS Code so this launch.json is picked up.
+  // Requires the "C/C++" extension (ms-vscode.cpptools -> the "cppvsdbg" debug type).
+  //
+  // Why "requireExactSource": true matters
+  // --------------------------------------
+  // After a reload, TWO modules claim game.odin's line 47: the exe's ORIGINAL copy of
+  // `update` (now dead — its entry was rewritten to jump into the patch) and the freshly
+  // mapped patch module lp_<addr>.dll. A red-dot must bind to the PATCH, not the dead exe
+  // copy, or it never hits. The loader emits a real source-file MD5 in the patch PDB
+  // (core/livepatch/pdb.odin), so with exact-source matching ON the debugger REJECTS the
+  // exe's stale copy (its baked game.odin no longer matches the edited on-disk file) and
+  // binds to the patch (whose checksum matches the file you're editing). Turn this OFF and
+  // the debugger happily binds the stale exe copy first -> the breakpoint sticks on dead
+  // code and never fires. Live++ requires the same setting for the same reason.
+  //
+  // Build before debugging:
+  //   powershell -ExecutionPolicy Bypass -File run.ps1      (build the exe once; then Ctrl-C)
+  //   edit game.odin, then:  ..\..\odin.exe build . -livepatch-patch
+  // then launch "livepatch (reload, cppvsdbg)" below, or attach to a running livepatch.exe.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Launch-under-debugger: runs livepatch.exe --dbg-loop, which reloads hot_objs\ once
+      // and then calls `update` in a loop so a breakpoint in the patched body actually hits.
+      "name": "livepatch (reload, cppvsdbg)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/livepatch.exe",
+      "args": ["--dbg-loop"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "requireExactSource": true
+    },
+    {
+      // Attach-after-start: run `livepatch.exe` yourself, then attach here and reload with `r`.
+      "name": "livepatch (attach, cppvsdbg)",
+      "type": "cppvsdbg",
+      "request": "attach",
+      "processId": "${command:pickProcess}",
+      "requireExactSource": true
+    }
+  ]
+}

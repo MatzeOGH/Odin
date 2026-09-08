@@ -49,6 +49,9 @@ because the whole scheme resolves addresses in the live image through its **PDB*
 | `threads.odin`  | Thread suspension, IP/stack-walk safety checks, and generation lifetime (freeing old reloads safely). |
 | `meta.odin`     | Reads compiler-emitted metadata: per-proc content hashes, patch hooks. |
 | `types.odin`    | Reflection type-table diffing and swapping so `type_info_of` sees edited/new types. |
+| `section.odin`  | Maps each changed object as a `SEC_IMAGE` section so the kernel fires a real `LOAD_DLL` for an attached debugger. |
+| `debug.odin`    | Makes a reload a debuggable module: synthetic PE header + on-disk `lp_<addr>.dll`/`.pdb`, DbgHelp `SymLoadModuleEx`, PEB loader-list splice. |
+| `pdb.odin`      | Emits the per-patch PDB (line tables, source-file MD5 checksums, and the DBI **SourceInfo** file names an external debugger needs to forward-bind a source breakpoint into the patch). |
 
 ---
 
@@ -732,6 +735,67 @@ And on **DbgHelp** (`SymInitialize` / `SymEnumSymbolsW`) to enumerate the live
 image's symbols once (`lp_dbghelp_ensure`), since non-exported procedures and
 globals aren't in the export table. No PDB (no `-debug`) → no live addresses →
 livepatch can't work.
+
+---
+
+## Source-level debugging of hot code — what was and wasn't necessary
+
+Goal: a normal red-dot breakpoint on a line in a patched procedure binds to and **hits**
+inside the patch module (not the exe's dead copy), in a real external debugger. Verified with
+lldb reading our on-disk PDB — both launched-under-debugger and attached-after-start, source
+frame correct, surviving reloads. The pieces below were established empirically (each was
+toggled and observed); this records the result so the next person doesn't re-derive it.
+
+### The trap that made this hard to diagnose
+
+An **external** debugger and our **in-process DbgHelp** read line info through *different*
+paths, so a PDB can look complete while forward binding silently fails:
+
+- In-process **reverse** lookup (addr→line, for our own backtraces/crash dumps) reads the
+  C13 line records + file checksums directly and maps them onto the block base we pass to
+  `SymLoadModuleExW`. It never consults the DBI SourceInfo and never needs exact-source.
+- An external debugger doing **forward** binding (source line → address) builds each compile
+  unit's *support-file list* from the DBI **SourceInfo** substream, matches the breakpoint's
+  file against it, then places the address from the C13 lines.
+
+So reverse lookup worked (and `llvm-pdbutil` dumped line info) for a long time while a plain
+red dot never attached — the two exercise disjoint PDB structures.
+
+### Necessary (remove any one and the breakpoint stops binding into the patch)
+
+1. **A genuine module-load event.** Each changed object is mapped as a `SEC_IMAGE` section
+   (`section.odin`) so the kernel fires a real `LOAD_DLL` for a launched-under debugger; an
+   attaching debugger finds it by walking the PEB loader list.
+2. **An on-disk `lp_<addr>.dll` with a valid CodeView debug directory.** Its RSDS entry
+   points to `lp_<addr>.pdb` with a **matching GUID + age** (`lp_write_pe_header`,
+   `debug.odin`), so the debugger locates and loads the PDB by path.
+3. **A per-patch PDB (`pdb.odin`) with all three of:**
+   - C13 **line tables** (`0xF2`) mapping code offsets → `game.odin` lines;
+   - a **section-headers stream** + section map, so a symbol's `segment:offset` resolves to
+     an RVA;
+   - the DBI **SourceInfo** substream carrying the **real source-file names**. *This was the
+     missing piece.* It shipped empty names (offset 0 into an empty buffer), so the patch
+     module had no source file, so forward binding fell back to the exe's stale (now dead,
+     redirected) copy and never hit. Fixed in `lp_pdb_dbi`.
+4. **Exact-source matching ON in the debugger** (`requireExactSource` for cppvsdbg; the
+   equivalent VS / raddbg option). After a reload two modules claim the same line — the exe's
+   original copy and the patch. Exact matching rejects the exe copy (its baked source no
+   longer matches the edited file) and binds the patch. The PDB's **source-file MD5 checksum**
+   (`0xF4`, kind 1) is what lets the debugger tell them apart — necessary *for this setting*,
+   but by itself (without #3) it bound nothing, because there was no source file to match.
+
+### NOT necessary (hypothesised or attempted, then ruled out)
+
+- **LDR / PEB loader-entry enrichment.** Completing the partial `LDR_DATA_TABLE_ENTRY`,
+  splicing it into all three loader lists + `LdrpHashTable`, or moving the splice pre-commit
+  — none of it was needed. The existing partial PEB splice (`lp_peb_splice`, `debug.odin`)
+  plus the `SEC_IMAGE` `LOAD_DLL` is enough: attach-after binding was verified to work as-is.
+- **Loading the patch as a real `LoadLibrary`'d DLL.** The large compiler+loader change (a
+  linked hot DLL bridged back to the exe's globals) — the previously-scoped fallback — is
+  unnecessary. A manually section-mapped module is forward-bound fine once its PDB is complete.
+- **The `intrinsics.debug_trap()` workaround.** Not needed; a plain source breakpoint hits.
+- **Any change to the exe or its PDB.** The exe's stale line copy is simply rejected by
+  exact-source matching; nothing on the exe side had to change.
 
 ---
 

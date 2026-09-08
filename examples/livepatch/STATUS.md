@@ -253,34 +253,40 @@ Status as of this branch. See `README.md` for how to run it and how it works.
         view — hot frames appear in the (now-correct) call stack as raw addresses. Real
         break-and-step in hot code would need a different loader (a `LoadLibrary`'d DLL
         that fires a module-load event + PDB, or DbgHelp `SymLoadModuleEx` over the
-        mapped range). Out of scope here.
+        mapped range). Out of scope here. **(Superseded — source-level debugging now works
+        via the `SEC_IMAGE` section map + per-patch PDB; see the completed "Source-level
+        debugging of hot code" item above. This paragraph describes the earlier
+        `VirtualAlloc` state.)**
       - **Limitation:** the ADDR32NB fixup assumes every target is in-block (always true
         for unwind data). An ADDR32NB to an out-of-block symbol (e.g. a language-EH
         personality routine in the exe) would wrap to a bogus RVA; Odin's unwind info
         carries no such handler, so this does not arise today.
-- [ ] **Source-level debugging of hot code (symbols + PDB).** Follow-on to the unwind
-      item: stack *unwinding* through hot code now works, but a debugger still can't set
-      a source-line breakpoint in a hot procedure or show it in the source view, because
-      the object is mapped as anonymous `VirtualAlloc` memory with no registered
-      module/PDB — hot frames appear in the (now-correct) call stack as raw addresses.
-      Live++ gets this precisely because it works with linked images + PDBs, not raw
-      obj blobs. Two candidate approaches:
-  - [ ] **DbgHelp virtual module.** Emit a PDB for the reload object (`odin build -debug`
-        already produces debug info; needs it written for the `.obj`/its symbols) and, at
-        load time, register the mapped range with the debugger via DbgHelp
-        `SymLoadModuleEx` over the block + a synthesized module, mapping the PDB's
-        RVA-based line/symbol info onto the block base. Lightest touch; works with
-        WinDbg-family tools, less reliably with the VS debugger.
-  - [ ] **Load as a real DLL instead of a raw obj.** `LoadLibrary` a linked hot DLL so the
-        OS fires a module-load debug event and the debugger auto-loads its PDB — full
-        source-level break/step in VS and WinDbg. But a DLL gets its own copy of globals
-        and cannot relocate new code against the exe's existing globals/procs, which is
-        the whole reason this loader mmaps a raw obj (see the top-of-file rationale).
-        Would need the arena/symbol-table machinery extended to bridge a DLL back to the
-        exe's state — a large change, arguably a different architecture.
-  - Either way, needs the compiler to emit usable debug info for the reload object and a
-    scheme to associate the PDB's image-base-relative addresses with the runtime block
-    base (same "block is the image base" trick the unwind registration uses).
+- [x] **Source-level debugging of hot code (symbols + PDB).** A normal red-dot source
+      breakpoint on a line in a patched procedure now binds to and HITS inside the patch
+      module — verified in a real external debugger (lldb) both launched-under-debugger
+      and attached-after-start, correct source frame, surviving reloads, no
+      `intrinsics.debug_trap()` workaround. The loader maps each changed object as a
+      `SEC_IMAGE` section (`section.odin`) so the kernel fires a genuine `LOAD_DLL`, emits
+      a per-patch PDB with real line info + a source-file MD5 checksum
+      (`pdb.odin`, `debug.odin`), and writes the `lp_<addr>.dll`/`.pdb` to disk so the
+      debugger resolves the RSDS by path.
+  - **Root cause of the long-standing "breakpoint never attaches" (the last gap):** the
+    patch PDB's DBI **SourceInfo** substream shipped *empty* source-file names (all
+    name-offsets 0, empty names buffer). Our in-process DbgHelp reverse lookup (addr→line)
+    reads the C13 checksums/lines and so never needed it, which masked the bug — but an
+    **external** debugger builds each compile unit's source-file list from SourceInfo and
+    matches a source breakpoint's file against it. With no name, the patch module had no
+    source file, so forward source→address binding silently fell back to the exe's stale
+    (now-dead, redirected) copy of the line and never hit. Fixed by emitting the real file
+    names in SourceInfo (`lp_pdb_dbi`, `pdb.odin`). Neither the LDR/PEB-entry enrichment nor
+    a real-DLL load turned out to be necessary.
+  - **Debugger setup (required, same as Live++):** turn ON exact-source matching so the
+    debugger rejects the exe's stale copy and binds the patch. Shipped as
+    `requireExactSource: true` in `examples/livepatch/.vscode/launch.json` (cppvsdbg); in
+    Visual Studio it is Tools → Options → Debugging → "Require source files to exactly
+    match the original version"; raddbg has the equivalent. `examples/livepatch/game.odin`
+    gains a `--dbg-loop` mode (reload, then call `update` in a loop) so a body breakpoint
+    can actually be exercised without stdin.
 - [x] **New calls into an already-linked package/foreign library.** Reloaded code may now
       call a foreign-library procedure (e.g. a `vendor:raylib` proc) that the base source
       had **not** referenced before, as long as its library is already linked into the exe

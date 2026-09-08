@@ -243,7 +243,8 @@ lp_pdb_mod :: proc(funcs: []Pdb_Func, secs: []Pdb_Section, file_offs: []u32, fil
 }
 
 @(private="file")
-lp_pdb_dbi :: proc(mod_sym_size, mod_c13_size: u32, secs: []Pdb_Section, source_files: int, age: u32) -> []u8 {
+lp_pdb_dbi :: proc(mod_sym_size, mod_c13_size: u32, secs: []Pdb_Section, files: []string, age: u32) -> []u8 {
+	source_files := len(files)
 	s: Pbuf
 	// ModInfo (one module)
 	mi: Pbuf
@@ -280,12 +281,25 @@ lp_pdb_dbi :: proc(mod_sym_size, mod_c13_size: u32, secs: []Pdb_Section, source_
 	}
 	sectionmap := sm.b[:]
 
-	// SourceInfo: 1 module, N files
+	// SourceInfo (DBI "FileInfo" substream): NumModules, NumSourceFiles, ModIndices[],
+	// ModFileCounts[], FileNameOffsets[], then the NamesBuffer of null-terminated names.
+	// The names MUST be real: an external debugger (lldb/DIA/raddbg) builds each compile
+	// unit's source-file list from HERE, and matches a source breakpoint's file against it.
+	// Emitting empty names (offset 0 into an empty buffer) left the patch module with no
+	// source file, so forward source→address binding silently failed even though reverse
+	// lookup — which uses the C13 checksums/lines instead — worked.
 	si: Pbuf
 	pb_u16(&si, 1); pb_u16(&si, u16(source_files))
 	pb_u16(&si, 0); pb_u16(&si, u16(source_files))
-	for _ in 0..<source_files { pb_u32(&si, 0) } // file name offsets (unused by us)
-	pb_u8(&si, 0); for len(si.b)%4 != 0 { pb_u8(&si, 0) }
+	nmb: Pbuf
+	name_offs := make([]u32, source_files, context.temp_allocator)
+	for f, i in files {
+		name_offs[i] = u32(len(nmb.b))
+		pb_raw(&nmb, transmute([]u8)f); pb_u8(&nmb, 0)
+	}
+	for o in name_offs { pb_u32(&si, o) }
+	pb_raw(&si, nmb.b[:])
+	for len(si.b)%4 != 0 { pb_u8(&si, 0) }
 	sourceinfo := si.b[:]
 
 	// OptionalDbgHeader: index 5 = section headers
@@ -328,7 +342,7 @@ lp_emit_pdb :: proc(guid: [16]u8, age: u32, funcs: []Pdb_Func, files: []string, 
 	streams[PS_OLD] = {}
 	streams[PS_INFO] = lp_pdb_info(guid, age)
 	streams[PS_TPI] = lp_pdb_tpi(PS_TPIHASH)
-	streams[PS_DBI] = lp_pdb_dbi(sym_sz, c13_sz, secs, len(files), age)
+	streams[PS_DBI] = lp_pdb_dbi(sym_sz, c13_sz, secs, files, age)
 	streams[PS_IPI] = lp_pdb_tpi(PS_IPIHASH)
 	streams[PS_NAMES] = names
 	streams[PS_SECHDR] = lp_pdb_sechdr(secs)
