@@ -92,6 +92,26 @@ main :: proc() {
 	state := State{counter = 0, step = 1}
 	pid := win.GetCurrentProcessId()
 
+	// Non-interactive modes for driving a reload under a debugger (no stdin):
+	//   livepatch.exe --dbg-auto   reload immediately, then persist (attach AFTER)
+	//   livepatch.exe --dbg-wait   wait 5s (attach FIRST), then reload while attached
+	for i := 1; i < len(os.args); i += 1 {
+		if os.args[i] == "--dbg-auto" {
+			fmt.printfln("dbg-auto pid %d", pid)
+			ok := lp.apply_dir()
+			fmt.printfln("reload ok %v", ok)
+			for { win.Sleep(1000) } // persist so an external debugger/verifier can attach
+		}
+		if os.args[i] == "--dbg-wait" {
+			fmt.printfln("dbg-wait pid %d", pid)
+			win.Sleep(5000)                  // window to attach a debugger BEFORE the reload
+			fmt.println("reloading now (debugger should be attached)...")
+			ok := lp.apply_dir()             // mid-session reload while attached
+			fmt.printfln("reload ok %v", ok)
+			for { win.Sleep(1000) }
+		}
+	}
+
 	// Reference one `vendor:raylib` procedure so the exe statically links raylib.lib
 	// (pulling its object member into the image). A livepatch can then call *other*
 	// raylib procedures this source never referenced — the loader resolves them via the
@@ -125,7 +145,8 @@ main :: proc() {
 				fmt.printfln("reload ok: %v", ok)
 			case: // empty line or "t": advance the simulation
 				update(&state)
-				fmt.printfln("counter = %d   hits = %d   mirror = %d", state.counter, hits, state.mirror)
+				fmt.printfln("counter = %d   hits = %d   mirror = %d",
+					state.counter, hits, state.mirror)
 			}
 		}
 	}

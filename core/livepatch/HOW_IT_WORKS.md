@@ -127,14 +127,22 @@ running exe's table is read once into `_lp_cur`; the object's table is compared
 against it. Same hash → unchanged → don't patch. This is why an unchanged reload
 patches nothing.
 
-> **Known limitation — the content hash is blind to referenced constants.**
-> `lb_livepatch_proc_content_hash` (`src/llvm_backend.cpp`) hashes a proc's own IR,
-> which names its string/constant globals by an index-based symbol
-> (`csbs$<module>$0`) rather than by content. An edit that changes *only* a string
-> literal (`"v1"` → `"v2"`) leaves the hash identical, so the proc is judged
-> unchanged and the reload does nothing for it — the same blindness also stops the
-> compiler emitting the module object at all. To force a reload, make any
-> non-string change alongside it.
+The content hash folds in **referenced string/array constants by content**.
+`lb_livepatch_proc_content_hash` (`src/llvm_backend.cpp`) hashes a proc's own IR,
+but a string/array literal is interned as a private global whose name
+(`csbs$<module>$<id>` / `csba$…`) carries only a nondeterministic per-module dedup
+id. Hashing that name would both miss real edits (same id, new bytes) and thrash on
+unrelated id churn, so the normalizer instead replaces each such reference with
+`@const:<hash>`, where the hash is over the referenced constant's *initializer bytes*
+(`lb_livepatch_const_ir_hash`). So an edit that changes *only* a string literal
+(`"v1"` → `"v2"`) does change the proc's content hash: the proc is judged changed,
+its module object is emitted, and the reload patches it.
+
+> **Residual caveat.** `lb_livepatch_const_ir_hash` looks the constant up only in the
+> proc's *own* module (`p->module->mod`). A constant interned in a different module
+> resolves to `0`, so distinct cross-module literals would both fold to `@const:0` and
+> a swap between them would be missed. In practice each module interns its own string
+> constants (the name even carries `$<module>$`), so this is not normally reachable.
 
 "Hot" comes from `lp_is_hot_entry` (`patch.odin`): the entry must be preceded by
 a **patch pad** (see Step 6). If a proc changed but its prologue doesn't match a
@@ -390,33 +398,36 @@ If a proc's content hash changed but this check fails, it is *not* patched and i
 counted as a `hot_detect_miss` and warned about — the pad is the contract, and
 without it there is no safe patch site.
 
-### `patch_jump` — two strategies
+### Patching — prepare / commit / restore (two strategies)
 
-```odin
-patch_jump :: proc(original, target: rawptr) -> (ok, atomic: bool) {
-    if lp_patch_atomic(original, target) { return true, true }
-    return lp_patch_overwrite(original, target), false
-}
-```
+Patching is split into three phases so the whole reload can be **all-or-nothing**:
+`lp_patch_prepare` picks a redirect strategy and makes the destination bytes
+writable *without writing anything*; `lp_patch_commit` writes the redirect (pure
+memory writes that cannot fail); `lp_patch_restore` puts the page protection back.
+`apply_many` runs every target's *prepare* first — see "the pre-flight" below — so
+if any page can't be made writable it aborts before a single byte is written.
 
-It always *prefers* the atomic pad path and only falls back to a direct overwrite
-when there is no usable pad.
+`lp_patch_prepare` always *prefers* the atomic pad path and only falls back to a
+direct overwrite when there is no usable pad.
 
-### Strategy A — atomic pad jump (`lp_patch_atomic`)
+### Strategy A — atomic pad jump
 
 This is the normal path for compiler-emitted hot procs. The trick is that the
 14-byte jump is written **into the pad**, which nothing is executing, and only a
-tiny 2-byte redirect is written over the live entry:
+tiny 2-byte redirect is written over the live entry.
 
-1. Re-check `lp_has_patch_pad(original)`; bail if the pad isn't there.
-2. `VirtualProtect` the region `[entry-16, entry+2)` (`PAD_LEN + 2` bytes) to
-   `PAGE_EXECUTE_READWRITE`.
-3. **Write the full 14-byte `FF 25` absolute jump into the pad** (`entry-16`),
+*prepare* (`plan.atomic = true`): the entry has a pad (`lp_has_patch_pad`), so
+`VirtualProtect` the region `[entry-16, entry+2)` (`PAD_LEN + 2` bytes) to
+`PAGE_EXECUTE_READWRITE`.
+
+*commit*:
+
+1. **Write the full 14-byte `FF 25` absolute jump into the pad** (`entry-16`),
    pointing at the new body (`lp_write_abs_jump`). No thread can be here — the pad
    is not reachable code yet.
-4. `FlushInstructionCache` over the pad so the CPU's icache picks up the new
+2. `FlushInstructionCache` over the pad so the CPU's icache picks up the new
    bytes.
-5. **Atomically** store `0xEEEB` at the entry with
+3. **Atomically** store `0xEEEB` at the entry with
    `intrinsics.atomic_store((^u16)(original), 0xEEEB)`. Little-endian that is the
    two bytes `EB EE`, i.e. `jmp short -18`:
 
@@ -426,8 +437,9 @@ tiny 2-byte redirect is written over the live entry:
 
    So the entry now jumps back 16 bytes into the pad, which jumps (absolute) to
    the new body.
-6. `FlushInstructionCache` over those 2 bytes.
-7. Restore the pad's original page protection.
+4. `FlushInstructionCache` over those 2 bytes.
+
+*restore*: put the pad's original page protection back.
 
 Why this is safe under concurrency: the only byte range a *running* thread can be
 fetching from is the live entry. That range is mutated by a **single aligned
@@ -450,33 +462,53 @@ Re-patching later just overwrites the pad's abs-jump target and re-flips the sam
 2 bytes; because `lp_has_patch_pad` also accepts an existing `FF 25`, a proc can
 be hot-reloaded any number of times.
 
-### Strategy B — in-place overwrite (`lp_patch_overwrite`)
+### Strategy B — in-place overwrite
 
 The fallback when there is no pad (e.g. a hand-built or non-`-livepatch` entry
 that still needs redirecting). It writes the 14-byte abs jump **directly over the
 entry's first 14 bytes**:
 
-1. Compute the gap to the *next* symbol via `lp_next_symbol_after` (a scan of the
-   PDB symbol addresses). If fewer than `PATCH_LEN` (14) bytes are available,
-   **refuse** — overwriting would spill into the following procedure.
-2. `VirtualProtect` 14 bytes to `PAGE_EXECUTE_READWRITE`, write the abs jump,
-   restore protection, flush the icache.
+- *prepare* (`plan.atomic = false`): compute the gap to the *next* symbol via
+  `lp_next_symbol_after` (a scan of the PDB symbol addresses). If fewer than
+  `PATCH_LEN` (14) bytes are available, **refuse** (`ok = false`) — overwriting
+  would spill into the following procedure. Otherwise `VirtualProtect` 14 bytes to
+  `PAGE_EXECUTE_READWRITE`.
+- *commit*: write the abs jump, flush the icache. *restore*: put protection back.
 
 This path is **not atomic** — it stomps up to 14 bytes, so it is unsafe if any
 thread's instruction pointer is inside those bytes. Its correctness relies
-entirely on Step 5: all other threads are suspended and confirmed (via
+entirely on the suspension: all other threads are suspended and confirmed (via
 `lp_ip_conflicts`) not to have their `RIP` inside `[entry-16, entry+14)` before
 any write happens. The atomic path benefits from the same suspension but doesn't
 strictly need it; the overwrite path does.
 
-### Where the callers of `patch_jump` sit
+### The pre-flight — why a reload is all-or-nothing
 
 In `apply_many`, patching is the final mutating step and happens **while threads
-are suspended and after `committed = true`**:
+are suspended**. The mutations are split by a `committed` flag: everything up to
+`committed = true` rolls back cleanly (the `!committed` defer unmaps the blocks,
+frees the arenas and drops the `.pdata` registrations), and everything after is
+guaranteed not to fail.
+
+The bridge between the two is a **pre-flight**: after suspending threads, the
+loader first makes *every* page it is about to write writable — each patch target
+(`lp_patch_prepare`), each `@(rodata)`/`#load` refresh copy and the type-table
+slice header (`lp_make_writable`) — but writes nothing. Only if *all* of those
+succeed does it set `committed = true` and run the commit phase, which is pure
+memory writes (`lp_patch_commit`, `lp_write_region`, the new-proc trampolines) that
+cannot fail, followed by restoring the intended protections. If any page can't be
+made writable, it restores the protections it did change, resumes threads, and
+aborts — with the running code completely untouched. There is therefore no
+"live but incomplete" state: a reload either applies its whole patch set or none of
+it.
 
 ```
-suspend threads  ->  verify no IP conflict  ->  (refresh globals, swap type table)
-                 ->  for each target: patch_jump(original, fresh)
+suspend threads  ->  verify no IP conflict
+                 ->  PRE-FLIGHT: prepare every patch + refresh + type-table swap
+                     (make writable, write nothing) — any failure: restore, resume, abort
+                 ->  committed = true
+                 ->  COMMIT: write every redirect / refresh / type-table header (cannot fail)
+                 ->  restore protections  ->  point new-proc trampolines
                  ->  resume threads  ->  retire freeable old generations
 ```
 

@@ -15,6 +15,12 @@ PAGE :: 0x1000
 
 LP_TIMING :: #config(LP_TIMING, false)
 
+// Bring each reload block into the process as a real SEC_IMAGE section (so a
+// debugger attached from the start is notified of the reload) instead of
+// VirtualAlloc + hand-copy. See section.odin. Set -define:LP_SECTION_MAP=false to
+// force the old VirtualAlloc path.
+LP_SECTION_MAP :: #config(LP_SECTION_MAP, true)
+
 @(private) _lp_busy: b32
 @(private) _lp_build_busy: b32
 
@@ -32,11 +38,27 @@ Obj :: struct {
 	offsets:       []int,
 	block:         rawptr,
 	total:         int,
+	dbg_off:       int, // offset within the block of the synthetic debug-dir section
 	text_base:     rawptr,
 	text_size:     int,
 	near_arena:    Near_Arena,
 	resolved:      []rawptr,
 	pdata_regs:    [dynamic]win.PRUNTIME_FUNCTION,
+
+	// Debug-module state. When `mapped`, `block` is a SEC_IMAGE view (freed via
+	// NtUnmapViewOfSection) and the lp_%p.dll/.pdb + PE header + PDB were emitted in
+	// lp_map_object before mapping; otherwise `block` is a VirtualAlloc block (freed
+	// via VirtualFree) and those artifacts are emitted later in lp_debug_register.
+	mapped:        bool,
+	size_of_image: u32,
+	dbg_nfuncs:    int,
+	guid:          [16]u8,
+	age:           u32,
+	img_path:      string, // "" until the module's files are written
+	pdb_path:      string,
+	base_name:     string, // e.g. "lp_0x7ff768000000.dll"
+	ldr:           ^Lp_Ldr_Entry, // spliced PEB entry (nil until registered)
+	sym_loaded:    bool,   // in-process SymLoadModuleExW succeeded
 }
 
 @(private)
@@ -75,7 +97,10 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 
 	o.section_bases = make([]rawptr, o.n_sections + 1, context.temp_allocator)
 	o.offsets = make([]int, o.n_sections + 1, context.temp_allocator)
-	total := 0
+	// Reserve the first page for a synthetic PE header (see debug.odin), so the
+	// block parses as an image at base `o.block` for an attached debugger. All
+	// relocations are block-relative, so this shift is transparent to them.
+	total := PAGE
 	for i in 0 ..< o.n_sections {
 		sh := section_header(data, o.sec_off, i)
 		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
@@ -88,13 +113,43 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 		total += size
 	}
 	total = mem.align_forward_int(total, PAGE)
+	// Reserve one more page for a synthetic read-only section that holds the PE
+	// debug directory + RSDS record (debug.odin). It must live in a real section
+	// so section-based RVA readers (dbghelp/DIA) can find it.
+	o.dbg_off = total
+	total += PAGE
 	o.total = total
 
-	o.block = alloc_near_exe(total)
-	if o.block == nil {
-		fmt.eprintln("[livepatch] could not reserve memory within 2GB of the exe for", path)
-		return
+	// Preferred path: build the image on disk and map it as a SEC_IMAGE section, so
+	// the kernel fires a live LOAD_DLL event for an attached debugger. Falls back to
+	// VirtualAlloc when disabled, when the object has no debuggable code, or when no
+	// near-exe base is free — in which case the debug module (if any) is emitted the
+	// old way in lp_debug_register.
+	established := false
+	when LP_SECTION_MAP {
+		established = lp_establish_section(&o)
 	}
+	if !established {
+		o.block = alloc_near_exe(total)
+		if o.block == nil {
+			fmt.eprintln("[livepatch] could not reserve memory within 2GB of the exe for", path)
+			return
+		}
+		o.mapped = false
+		for i in 0 ..< o.n_sections {
+			if o.offsets[i + 1] < 0 {
+				continue
+			}
+			sh := section_header(data, o.sec_off, i)
+			if int(sh.size_of_raw_data) > 0 && int(sh.pointer_to_raw_data) != 0 {
+				base := rawptr(uintptr(o.block) + uintptr(o.offsets[i + 1]))
+				intrinsics.mem_copy(base, raw_data(data[int(sh.pointer_to_raw_data):]), int(sh.size_of_raw_data))
+			}
+		}
+	}
+
+	// Common to both paths: section base pointers + .text (bytes are already in the
+	// block — copied above for VirtualAlloc, mapped from the file for a section view).
 	for i in 0 ..< o.n_sections {
 		if o.offsets[i + 1] < 0 {
 			continue
@@ -102,9 +157,6 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 		sh := section_header(data, o.sec_off, i)
 		base := rawptr(uintptr(o.block) + uintptr(o.offsets[i + 1]))
 		o.section_bases[i + 1] = base
-		if int(sh.size_of_raw_data) > 0 && int(sh.pointer_to_raw_data) != 0 {
-			intrinsics.mem_copy(base, raw_data(data[int(sh.pointer_to_raw_data):]), int(sh.size_of_raw_data))
-		}
 		if section_name(sh) == ".text" {
 			o.text_base = base
 			o.text_size = int(sh.size_of_raw_data)
@@ -118,6 +170,118 @@ lp_map_object :: proc(path: string) -> (o: Obj, ok: bool) {
 	o.resolved = make([]rawptr, o.n_syms, context.temp_allocator)
 	o.pdata_regs = make([dynamic]win.PRUNTIME_FUNCTION, context.temp_allocator)
 	return o, true
+}
+
+// Builds this object's debug image (PE header + section bytes) on disk and maps it
+// as a SEC_IMAGE section at a free near-exe base, so the kernel notifies an attached
+// debugger of the reload. Emits the lp_%p.dll and lp_%p.pdb; the in-process DbgHelp
+// load and PEB splice happen later (post-commit) in lp_debug_register. Returns false
+// (→ VirtualAlloc fallback) when the object has no debuggable code or no base is free.
+@(private)
+lp_establish_section :: proc(o: ^Obj) -> bool {
+	// Local scratch for funcs/PDB/image buffer; persistent bits are heap-owned on o.
+	scratch: runtime.Arena
+	_ = runtime.arena_init(&scratch, 0, runtime.heap_allocator())
+	defer runtime.arena_destroy(&scratch)
+	alloc := runtime.arena_allocator(&scratch)
+
+	funcs, files := lp_extract_funcs(o, alloc)
+	if len(funcs) == 0 {
+		return false // nothing debuggable here → plain VirtualAlloc block, no module
+	}
+	when #config(LP_DBG_MIN, false) {
+		if len(funcs) > 1 { funcs = funcs[:1] }
+		if len(files) > 1 { files = files[:1] }
+	}
+
+	// Base-independent identity, so a base-conflict retry need not re-emit the PDB.
+	age := _lp_dbg_age
+	_lp_dbg_age += 1
+	_lp_dbg_serial += 1
+	guid: [16]u8
+	sid := _lp_dbg_serial
+	for k in 0 ..< 8 { guid[k] = u8(sid >> uint(k*8)) }
+	guid[8] = u8(age); guid[9] = u8(age >> 8)
+	guid[10] = 0x4c; guid[11] = 0x50 // 'LP'
+
+	pdb_bytes := lp_emit_pdb(guid, age, funcs, files, lp_sections_for_pdb(o, alloc))
+	dir := filepath_dir_of_exe(alloc)
+	exe_base := uintptr(win.GetModuleHandleW(nil))
+
+	// Heads-up before the map: mapping the section fires a live LOAD_DLL that makes an
+	// attached debugger stop once. Printed here (pre-map) so it is the last console line
+	// visible at the stop; once per reload even if several modules map.
+	if !_lp_dbg_warned && lp_debugger_present() {
+		fmt.println("[livepatch] debugger attached — it may stop when the patched module loads; press Continue to reach the new code.")
+		_lp_dbg_warned = true
+	}
+
+	skip: uintptr = 0
+	for _ in 0 ..< 16 {
+		B := lp_find_free_near(exe_base, o.total, skip)
+		if B == 0 { break }
+		skip = B // a retry searches strictly beyond this candidate
+
+		base_name := fmt.aprintf("lp_%p.dll", rawptr(B), allocator = alloc)
+		pdb_name  := fmt.aprintf("lp_%p.pdb", rawptr(B), allocator = alloc)
+		img_path  := fmt.aprintf("%s\\%s", dir, base_name, allocator = alloc)
+		pdb_path  := fmt.aprintf("%s\\%s", dir, pdb_name, allocator = alloc)
+
+		// Assemble the whole image (section bytes + synthetic header) at base B.
+		buf := make([]u8, o.total, alloc)
+		for i in 0 ..< o.n_sections {
+			if o.offsets[i+1] < 0 { continue }
+			sh := section_header(o.data, o.sec_off, i)
+			if int(sh.size_of_raw_data) > 0 && int(sh.pointer_to_raw_data) != 0 {
+				intrinsics.mem_copy(&buf[o.offsets[i+1]], raw_data(o.data[int(sh.pointer_to_raw_data):]), int(sh.size_of_raw_data))
+			}
+		}
+		soi := lp_write_pe_header(o, raw_data(buf), B, guid, age, pdb_path, base_name)
+
+		if !os2_write(img_path, buf) { continue }
+		if !os2_write(pdb_path, pdb_bytes) { os.remove(img_path); continue }
+
+		base, ok := lp_section_map(img_path, B)
+		if !ok {
+			os.remove(img_path); os.remove(pdb_path)
+			continue
+		}
+
+		o.block         = base
+		o.mapped        = true
+		o.size_of_image = soi
+		o.guid          = guid
+		o.age           = age
+		o.dbg_nfuncs    = len(funcs)
+		o.base_name     = strings.clone(base_name, runtime.heap_allocator())
+		o.img_path      = strings.clone(img_path, runtime.heap_allocator())
+		o.pdb_path      = strings.clone(pdb_path, runtime.heap_allocator())
+		lp_make_sections_writable(o)
+		return true
+	}
+	return false
+}
+
+// A SEC_IMAGE view maps code RX and read-only data RO; make every kept section
+// writable so relocation, external resolution and patching can write in place. The
+// writes fault in private copy-on-write pages; the intended protections are restored
+// after patching (see the per-section VirtualProtect at the end of apply_many).
+@(private)
+lp_make_sections_writable :: proc(o: ^Obj) {
+	for i in 0 ..< o.n_sections {
+		if o.offsets[i+1] < 0 { continue }
+		sh := section_header(o.data, o.sec_off, i)
+		size := max(int(sh.virtual_size), int(sh.size_of_raw_data))
+		if size <= 0 { continue }
+		base := rawptr(uintptr(o.block) + uintptr(o.offsets[i+1]))
+		psize := win.SIZE_T(mem.align_forward_int(size, PAGE))
+		prot: win.DWORD = win.PAGE_READWRITE
+		if (u32(sh.characteristics) & IMAGE_SCN_MEM_EXECUTE) != 0 {
+			prot = win.PAGE_EXECUTE_READWRITE
+		}
+		old: win.DWORD
+		win.VirtualProtect(base, psize, prot, &old)
+	}
 }
 
 // Builds the merged symbol tables across all objects: `all_defs` maps every
@@ -421,6 +585,8 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	context.temp_allocator = runtime.arena_allocator(&scratch)
 	defer runtime.arena_destroy(&scratch)
 
+	_lp_dbg_warned = false // one debugger heads-up per reload (see lp_establish_section)
+
 	if len(obj_paths) == 0 {
 		fmt.eprintln("[livepatch] apply_many: no objects given")
 		return false
@@ -447,7 +613,16 @@ apply_many :: proc(obj_paths: []string) -> bool {
 				win.RtlDeleteFunctionTable(p)
 			}
 			if o.block != nil {
-				win.VirtualFree(o.block, 0, win.MEM_RELEASE)
+				// Pre-commit, no PEB splice / SymLoad has happened yet (those run in
+				// lp_debug_register, post-commit); a section block's live LOAD_DLL fired
+				// at map time, so unmapping it delivers the matching UNLOAD_DLL.
+				if o.mapped {
+					lp_section_unmap(o.block)
+					if o.img_path != "" { os.remove(o.img_path) }
+					if o.pdb_path != "" { os.remove(o.pdb_path) }
+				} else {
+					win.VirtualFree(o.block, 0, win.MEM_RELEASE)
+				}
 			}
 			if o.near_arena.block != nil {
 				win.VirtualFree(o.near_arena.block, 0, win.MEM_RELEASE)
@@ -664,9 +839,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	gen_owned := make([dynamic]uintptr, 0, owner_bound, runtime.heap_allocator())
 	reserve(&_lp_owner, len(_lp_owner) + owner_bound)
 	freeable := make([]bool, len(_lp_generations), context.temp_allocator)
-	refresh_ok := make([]bool, len(refresh_targets), context.temp_allocator)
-	patch_ok := make([]bool, len(targets), context.temp_allocator)
-	patch_atomic := make([]bool, len(targets), context.temp_allocator)
 
 	MAX_ATTEMPTS :: 100
 	handles: [dynamic]win.HANDLE
@@ -687,45 +859,84 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	lp_scan_freeable(handles, freeable)
 	lp_phase("freegen", &mark)
 
+	// Pre-flight: flip every destination page writable BEFORE writing a single byte.
+	// Threads are suspended and nothing is written yet, so if any VirtualProtect fails we
+	// restore whatever we changed, resume, and abort with the running code untouched. Once
+	// every region is writable the commit below is pure memory writes that cannot fail, so
+	// the reload is all-or-nothing: no thread ever observes a partially applied patch set.
+	plans := make([dynamic]Patch_Plan, 0, len(targets), context.temp_allocator)
+	refresh_preps := make([dynamic]Wr_Prep, 0, len(refresh_targets), context.temp_allocator)
+	tt_prep: Wr_Prep
+	preflight_ok := true
+
+	for t in targets {
+		plan, ok := lp_patch_prepare(t.original, t.fresh)
+		if !ok {
+			preflight_ok = false
+			break
+		}
+		append(&plans, plan)
+	}
+	if preflight_ok {
+		for r in refresh_targets {
+			w, ok := lp_make_writable(r.exe, r.obj, r.size)
+			if !ok {
+				fmt.eprintfln("[livepatch] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
+				preflight_ok = false
+				break
+			}
+			append(&refresh_preps, w)
+		}
+	}
+	if preflight_ok && swap_type_table {
+		SLICE_HDR :: size_of(rawptr) + size_of(int)
+		w, ok := lp_make_writable(tt_ref, fresh_ti_hdr, SLICE_HDR)
+		if !ok {
+			fmt.eprintln("[livepatch] could not make runtime.type_table writable to refresh reflection")
+			preflight_ok = false
+		} else {
+			tt_prep = w
+		}
+	}
+
+	if !preflight_ok {
+		for p in plans { lp_patch_restore(p) }
+		for w in refresh_preps { lp_restore_writable(w) }
+		lp_restore_writable(tt_prep)
+		lp_resume(handles)
+		fmt.eprintln("[livepatch] aborting reload: could not make a patch target writable; nothing patched")
+		return false
+	}
+	lp_phase("preflight", &mark)
+
+	// Commit: every page is writable, so nothing from here can fail.
 	committed = true
 
-	for r, i in refresh_targets {
-		old: win.DWORD
-		if win.VirtualProtect(r.exe, win.SIZE_T(r.size), win.PAGE_READWRITE, &old) {
-			intrinsics.mem_copy(r.exe, r.obj, r.size)
-			restored: win.DWORD
-			win.VirtualProtect(r.exe, win.SIZE_T(r.size), old, &restored)
-			_lp_owner[uintptr(r.exe)] = gen_serial
-			append(&gen_owned, uintptr(r.exe))
-			refresh_ok[i] = true
-		}
+	for w in refresh_preps {
+		lp_write_region(w)
+		_lp_owner[uintptr(w.dst)] = gen_serial
+		append(&gen_owned, uintptr(w.dst))
 	}
-
 	did_swap := false
-	if swap_type_table {
-		SLICE_HDR :: size_of(rawptr) + size_of(int)
-		old: win.DWORD
-		if win.VirtualProtect(tt_ref, win.SIZE_T(SLICE_HDR), win.PAGE_READWRITE, &old) {
-			intrinsics.mem_copy(tt_ref, fresh_ti_hdr, SLICE_HDR)
-			restored: win.DWORD
-			win.VirtualProtect(tt_ref, win.SIZE_T(SLICE_HDR), old, &restored)
-			_lp_owner[uintptr(tt_ref)] = gen_serial
-			append(&gen_owned, uintptr(tt_ref))
-			did_swap = true
-		}
+	if tt_prep.ok {
+		lp_write_region(tt_prep)
+		_lp_owner[uintptr(tt_prep.dst)] = gen_serial
+		append(&gen_owned, uintptr(tt_prep.dst))
+		did_swap = true
 	}
+	patch_atomic := make([]bool, len(plans), context.temp_allocator)
+	for p, i in plans {
+		patch_atomic[i] = lp_patch_commit(p)
+		_lp_owner[uintptr(p.original)] = gen_serial
+		append(&gen_owned, uintptr(p.original))
+	}
+	patched := len(plans)
 
-	patched := 0
-	for t, i in targets {
-		ok, atomic := patch_jump(t.original, t.fresh)
-		if ok {
-			patch_ok[i] = true
-			patch_atomic[i] = atomic
-			patched += 1
-			_lp_owner[uintptr(t.original)] = gen_serial
-			append(&gen_owned, uintptr(t.original))
-		}
-	}
+	// Restore the intended page protections now that every write is done.
+	for w in refresh_preps { lp_restore_writable(w) }
+	lp_restore_writable(tt_prep)
+	for p in plans { lp_patch_restore(p) }
+
 	// Point each new procedure's stable trampoline at this reload's body. The
 	// trampoline arena is permanently writable+executable, and every other thread
 	// is suspended, so overwriting all 14 bytes is safe (the stub is a single
@@ -740,28 +951,14 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	lp_resume(handles)
 	lp_free_marked(freeable)
 
-	refreshed := 0
-	for r, i in refresh_targets {
-		if refresh_ok[i] {
-			refreshed += 1
-		} else {
-			fmt.eprintfln("[livepatch] could not make @(rodata)/#load copy writable to refresh it (%d bytes @ %p)", r.size, r.exe)
-		}
+	if len(refresh_preps) > 0 {
+		fmt.printfln("[livepatch] refreshed %d @(rodata)/#load global(s)", len(refresh_preps))
 	}
-	if refreshed > 0 {
-		fmt.printfln("[livepatch] refreshed %d @(rodata)/#load global(s)", refreshed)
-	}
-	if swap_type_table {
-		if did_swap {
-			fmt.println("[livepatch] refreshed reflection type_table (edited/new types now visible)")
-		} else {
-			fmt.eprintln("[livepatch] could not make runtime.type_table writable to refresh reflection")
-		}
+	if did_swap {
+		fmt.println("[livepatch] refreshed reflection type_table (edited/new types now visible)")
 	}
 	for t, i in targets {
-		if patch_ok[i] {
-			fmt.printfln("[livepatch] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, patch_atomic[i] ? "atomic" : "overwrite")
-		}
+		fmt.printfln("[livepatch] patched %s: %p -> %p (%s)", t.name, t.original, t.fresh, patch_atomic[i] ? "atomic" : "overwrite")
 	}
 	for t in new_targets {
 		fmt.printfln("[livepatch] linked new %s: trampoline %p -> %p", t.name, t.tramp, t.fresh)
@@ -789,6 +986,17 @@ apply_many :: proc(obj_paths: []string) -> bool {
 			win.VirtualProtect(base, psize, prot, &old)
 		}
 	}
+	// Make each mapped block a debugger-visible module (best-effort).
+	when #config(LP_DBGREG, true) {
+		for &o in objs {
+			lp_debug_register(&o)
+		}
+	}
+	// Reached only on the committed path (an abort returns earlier); prints only when the
+	// heads-up did, so the user knows the Continue landed them on patched code.
+	if _lp_dbg_warned {
+		fmt.println("[livepatch] reload live — patched code is now source-debuggable.")
+	}
 	lp_phase("patch", &mark)
 
 	if did_swap {
@@ -808,11 +1016,19 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		gen.serial = gen_serial
 		gen.owned  = gen_owned
 		gen.blocks = make([dynamic]rawptr, runtime.heap_allocator())
+		gen.objs   = make([dynamic]Lp_Obj_Res, runtime.heap_allocator())
 		gen.pdata  = make([dynamic]win.PRUNTIME_FUNCTION, runtime.heap_allocator())
 		gen.ranges = make([dynamic]Lp_Range, runtime.heap_allocator())
 		for &o in objs {
 			if o.block != nil {
-				append(&gen.blocks, o.block)
+				append(&gen.objs, Lp_Obj_Res{
+					block    = o.block,
+					mapped   = o.mapped,
+					ldr      = o.ldr,
+					sym_base = o.sym_loaded ? u64(uintptr(o.block)) : 0,
+					img_path = o.img_path,
+					pdb_path = o.pdb_path,
+				})
 				append(&gen.ranges, Lp_Range{uintptr(o.block), uintptr(o.block) + uintptr(o.total)})
 			}
 			if o.near_arena.block != nil {
@@ -829,19 +1045,13 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		append(&_lp_generations, gen)
 	}
 
-	// Something went live, so state migration has to run even if some entries did
-	// not take -- the app is executing the new code either way.
-	if patched > 0 || did_swap || refreshed > 0 {
+	// Something went live, so state migration has to run: the app is executing the new
+	// code either way. The pre-flight guarantees the patch set applied in full (or the
+	// reload aborted before committing a byte), so there is no partial-patch case here.
+	if patched > 0 || did_swap || len(refresh_preps) > 0 {
 		lp_call_patch_hooks(post_tbl, changed, lp_resolve_post_hook, &all_defs)
 	}
 
-	if patched != len(targets) {
-		fmt.eprintfln("[livepatch] %d of %d procedure(s) could not be patched; the reload is live but incomplete", len(targets) - patched, len(targets))
-		return false
-	}
-
-	// Only on a complete patch: a proc that did not take is still running its old
-	// body, so its hash must stay stale for the next reload to retry it.
 	for k, v in obj_hashes {
 		_lp_cur[k] = v
 	}

@@ -8,8 +8,6 @@ import win "core:sys/windows"
 PATCH_LEN :: 14
 PAD_LEN   :: 16
 
-LP_DEBUG_PAD :: #config(LP_DEBUG_PAD, false)
-
 // Returns the byte length of the NOP instruction at p, or 0 if it is not a NOP.
 @(private)
 lp_nop_len :: proc(p: [^]u8, max: int) -> int {
@@ -85,64 +83,117 @@ lp_write_abs_jump :: proc(dst: [^]u8, target: rawptr) {
 	(^u64)(&dst[6])^ = u64(uintptr(target))
 }
 
-// Redirects original to target, preferring the atomic pad jump and falling back to an overwrite.
+// A prepared patch: the destination page has been made writable and the redirect
+// strategy chosen, but no bytes are written yet, so it can still be abandoned (via
+// lp_patch_restore) with the running code untouched. Committing it is pure memory
+// writes and cannot fail. This split lets apply_many pre-flight every patch so the
+// write phase is all-or-nothing — no thread ever sees a partially applied reload.
 @(private)
-patch_jump :: proc(original: rawptr, target: rawptr) -> (ok: bool, atomic: bool) {
-	if lp_patch_atomic(original, target) {
-		return true, true
-	}
-	return lp_patch_overwrite(original, target), false
+Patch_Plan :: struct {
+	original, target: rawptr,
+	atomic:           bool,   // true: pad jump + 2-byte publish; false: full entry overwrite
+	prot_base:        rawptr, // the region made writable (pad base, or the entry itself)
+	prot_len:         win.SIZE_T,
+	old_prot:         win.DWORD,
 }
 
+// Chooses how `original` will be redirected to `target` and makes the bytes the commit
+// will write to writable, WITHOUT writing anything. Returns ok=false (having changed no
+// protection) when the entry has no usable pad and too little room to overwrite, or the
+// page cannot be made writable — so the caller can abort before any patch is applied.
 @(private)
-// Installs the jump into the patch pad, then atomically flips the entry to a 2-byte self-jump into it.
-lp_patch_atomic :: proc(original: rawptr, target: rawptr) -> bool {
-	if uintptr(original) < PAD_LEN {
-		return false
+lp_patch_prepare :: proc(original, target: rawptr) -> (plan: Patch_Plan, ok: bool) {
+	plan.original = original
+	plan.target   = target
+	if uintptr(original) >= PAD_LEN && lp_has_patch_pad(original) {
+		plan.atomic    = true
+		plan.prot_base = rawptr(uintptr(original) - PAD_LEN)
+		plan.prot_len  = win.SIZE_T(PAD_LEN + 2)
+	} else {
+		if gap := lp_next_symbol_after(uintptr(original)) - uintptr(original); gap < PATCH_LEN {
+			fmt.eprintfln("[livepatch] refusing overwrite patch: only %d bytes to next symbol (need %d)", gap, PATCH_LEN)
+			return {}, false
+		}
+		plan.atomic    = false
+		plan.prot_base = original
+		plan.prot_len  = win.SIZE_T(PATCH_LEN)
 	}
-	pad := rawptr(uintptr(original) - PAD_LEN)
-	pb := ([^]u8)(pad)
-	when LP_DEBUG_PAD {
-		eb := ([^]u8)(original)
-		fmt.eprintfln("[livepatch] pad@%p: % x | entry: %02x %02x", pad,
-			pb[0:PAD_LEN], eb[0], eb[1])
-	}
-	if !lp_has_patch_pad(original) {
-		return false
-	}
-
-	region_len := win.SIZE_T(PAD_LEN + 2)
-	old: win.DWORD
-	if !win.VirtualProtect(pad, region_len, win.PAGE_EXECUTE_READWRITE, &old) {
-		return false
-	}
-
-	lp_write_abs_jump(pb, target)
-	win.FlushInstructionCache(win.GetCurrentProcess(), pad, win.SIZE_T(PATCH_LEN))
-
-	intrinsics.atomic_store((^u16)(original), u16(0xEEEB))
-	win.FlushInstructionCache(win.GetCurrentProcess(), original, 2)
-
-	restored: win.DWORD
-	win.VirtualProtect(pad, region_len, old, &restored)
-	return true
-}
-
-// Overwrites an entry point in place with an absolute jump to target (when there is no usable pad).
-@(private)
-lp_patch_overwrite :: proc(original: rawptr, target: rawptr) -> bool {
-	if gap := lp_next_symbol_after(uintptr(original)) - uintptr(original); gap < PATCH_LEN {
-		fmt.eprintfln("[livepatch] refusing overwrite patch: only %d bytes to next symbol (need %d)", gap, PATCH_LEN)
-		return false
-	}
-	old_protect: win.DWORD
-	if !win.VirtualProtect(original, win.SIZE_T(PATCH_LEN), win.PAGE_EXECUTE_READWRITE, &old_protect) {
+	if !win.VirtualProtect(plan.prot_base, plan.prot_len, win.PAGE_EXECUTE_READWRITE, &plan.old_prot) {
 		fmt.eprintln("[livepatch] VirtualProtect failed")
-		return false
+		return {}, false
 	}
-	lp_write_abs_jump(([^]u8)(original), target)
+	return plan, true
+}
+
+// Writes the redirect into the already-writable region and flushes the icache. Pure
+// memory writes — cannot fail. Returns whether the safe 2-byte atomic publish was used
+// (vs a full 14-byte entry overwrite). The atomic path installs the 14-byte absolute
+// jump into the pad, then atomically flips the entry's first 2 bytes to a self-jump back
+// into the pad, so a concurrently-resumed thread sees either the old entry or the
+// complete redirect, never a half-written instruction.
+@(private)
+lp_patch_commit :: proc(plan: Patch_Plan) -> (atomic: bool) {
+	if plan.atomic {
+		lp_write_abs_jump(([^]u8)(plan.prot_base), plan.target) // prot_base == original - PAD_LEN
+		win.FlushInstructionCache(win.GetCurrentProcess(), plan.prot_base, win.SIZE_T(PATCH_LEN))
+		intrinsics.atomic_store((^u16)(plan.original), u16(0xEEEB))
+		win.FlushInstructionCache(win.GetCurrentProcess(), plan.original, 2)
+		return true
+	}
+	lp_write_abs_jump(([^]u8)(plan.original), plan.target)
+	win.FlushInstructionCache(win.GetCurrentProcess(), plan.original, win.SIZE_T(PATCH_LEN))
+	return false
+}
+
+// Restores a prepared region's original page protection, after committing or when the
+// pre-flight is abandoned.
+@(private)
+lp_patch_restore :: proc(plan: Patch_Plan) {
+	if plan.prot_base == nil {
+		return
+	}
 	restored: win.DWORD
-	win.VirtualProtect(original, win.SIZE_T(PATCH_LEN), old_protect, &restored)
-	win.FlushInstructionCache(win.GetCurrentProcess(), original, win.SIZE_T(PATCH_LEN))
-	return true
+	win.VirtualProtect(plan.prot_base, plan.prot_len, plan.old_prot, &restored)
+}
+
+// A data region a reload overwrites in place (an @(rodata)/#load refresh copy, or the
+// runtime type_table slice header): its destination page has been made writable and is
+// ready for an unfailing memcpy. Same pre-flight/commit split as Patch_Plan.
+@(private)
+Wr_Prep :: struct {
+	dst, src: rawptr,
+	size:     int,
+	old:      win.DWORD,
+	ok:       bool,
+}
+
+// Makes [dst, dst+size) writable (read/write, non-executable) without copying anything.
+// Returns ok=false (having changed no protection) if the page cannot be made writable.
+@(private)
+lp_make_writable :: proc(dst, src: rawptr, size: int) -> (Wr_Prep, bool) {
+	w := Wr_Prep{dst = dst, src = src, size = size}
+	if size <= 0 {
+		return {}, false
+	}
+	if !win.VirtualProtect(dst, win.SIZE_T(size), win.PAGE_READWRITE, &w.old) {
+		return {}, false
+	}
+	w.ok = true
+	return w, true
+}
+
+// Copies the region's bytes into its already-writable destination. Cannot fail.
+@(private)
+lp_write_region :: proc(w: Wr_Prep) {
+	intrinsics.mem_copy(w.dst, w.src, w.size)
+}
+
+// Restores a data region's original page protection (no-op if it was never prepared).
+@(private)
+lp_restore_writable :: proc(w: Wr_Prep) {
+	if !w.ok {
+		return
+	}
+	restored: win.DWORD
+	win.VirtualProtect(w.dst, win.SIZE_T(w.size), w.old, &restored)
 }

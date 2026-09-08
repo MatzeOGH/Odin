@@ -3,6 +3,7 @@ package livepatch
 
 import "base:runtime"
 import "core:fmt"
+import "core:os"
 import win "core:sys/windows"
 
 foreign import lp_ntdll "system:ntdll.lib"
@@ -21,11 +22,23 @@ Lp_Range :: struct {
 	lo, hi: uintptr,
 }
 
+// One reload object's disposable resources: its code/data block plus any debugger
+// registration made for it. Freed together at generation retirement.
+Lp_Obj_Res :: struct {
+	block:    rawptr,        // the code/data block
+	mapped:   bool,          // true: NtUnmapViewOfSection; false: VirtualFree
+	ldr:      ^Lp_Ldr_Entry, // spliced PEB entry to remove (nil if none)
+	sym_base: u64,           // SymUnloadModule64 base (0 if not loaded)
+	img_path: string,        // emitted lp_%p.dll to delete ("" if none)
+	pdb_path: string,        // emitted lp_%p.pdb to delete ("" if none)
+}
+
 // One applied reload's resources, retained until no thread is executing in its
 // code so it can be freed safely.
 Lp_Generation :: struct {
 	serial: int,
-	blocks: [dynamic]rawptr,
+	blocks: [dynamic]rawptr,     // plain VirtualAlloc blocks (near-arenas)
+	objs:   [dynamic]Lp_Obj_Res, // object blocks + their debugger registration
 	pdata:  [dynamic]win.PRUNTIME_FUNCTION,
 	ranges: [dynamic]Lp_Range,
 	owned:  [dynamic]uintptr,
@@ -133,10 +146,26 @@ lp_free_marked :: proc(freeable: []bool) {
 			for p in gen.pdata {
 				win.RtlDeleteFunctionTable(p)
 			}
+			for r in gen.objs {
+				// Retire the debugger registration first (while the block is still
+				// mapped/valid), then release the block, then delete the on-disk files.
+				if r.sym_base != 0 {
+					SymUnloadModule64(win.GetCurrentProcess(), win.DWORD64(r.sym_base))
+				}
+				lp_peb_unsplice(r.ldr)
+				if r.mapped {
+					lp_section_unmap(r.block)
+				} else {
+					win.VirtualFree(r.block, 0, win.MEM_RELEASE)
+				}
+				if r.img_path != "" { os.remove(r.img_path); delete(r.img_path, runtime.heap_allocator()) }
+				if r.pdb_path != "" { os.remove(r.pdb_path); delete(r.pdb_path, runtime.heap_allocator()) }
+			}
 			for b in gen.blocks {
 				win.VirtualFree(b, 0, win.MEM_RELEASE)
 			}
 			delete(gen.blocks)
+			delete(gen.objs)
 			delete(gen.pdata)
 			delete(gen.ranges)
 			delete(gen.owned)
