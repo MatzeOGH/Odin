@@ -224,8 +224,17 @@ lp_establish_section :: proc(o: ^Obj) -> bool {
 		if B == 0 { break }
 		skip = B // a retry searches strictly beyond this candidate
 
-		base_name := fmt.aprintf("lp_%p.dll", rawptr(B), allocator = alloc)
-		pdb_name  := fmt.aprintf("lp_%p.pdb", rawptr(B), allocator = alloc)
+		// Include the monotonic serial so the module and PDB filenames are UNIQUE per
+		// reload, never reused. Eager retirement frees the previous block, so the next
+		// reload's lp_find_free_near reclaims the same near-exe base — which would make a
+		// base-derived name (lp_<base>.dll) reappear every other reload. A debugger caches
+		// a PDB by its path+GUID; a reappearing filename serves the stale cached PDB (old
+		// GUID) so its symbols no longer match the freshly mapped image and the breakpoint
+		// fails on the repeats ("works every other patch"). A serial-stamped name is seen
+		// once, so the debugger always loads the current PDB fresh. Base is kept in the
+		// name for readability (it still matches the "module at %p" log).
+		base_name := fmt.aprintf("lp_%p_g%d.dll", rawptr(B), sid, allocator = alloc)
+		pdb_name  := fmt.aprintf("lp_%p_g%d.pdb", rawptr(B), sid, allocator = alloc)
 		img_path  := fmt.aprintf("%s\\%s", dir, base_name, allocator = alloc)
 		pdb_path  := fmt.aprintf("%s\\%s", dir, pdb_name, allocator = alloc)
 

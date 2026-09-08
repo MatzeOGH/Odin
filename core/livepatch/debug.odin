@@ -411,9 +411,11 @@ lp_debug_register :: proc(o: ^Obj) {
 	_lp_dbg_age += 1
 
 	dir := filepath_dir_of_exe(alloc)
-	base_name := fmt.aprintf("lp_%p.dll", o.block, allocator = alloc)
+	// Serial-stamped (via `age`, monotonic here) so the filename is unique per reload even
+	// when a VirtualAlloc block reuses a freed address — see the note in lp_establish_section.
+	base_name := fmt.aprintf("lp_%p_g%d.dll", o.block, age, allocator = alloc)
 	img_path  := fmt.aprintf("%s\\%s", dir, base_name, allocator = alloc)
-	pdb_name  := fmt.aprintf("lp_%p.pdb", o.block, allocator = alloc)
+	pdb_name  := fmt.aprintf("lp_%p_g%d.pdb", o.block, age, allocator = alloc)
 	pdb_path  := fmt.aprintf("%s\\%s", dir, pdb_name, allocator = alloc)
 
 	// 1. PE header into the reserved first page.
