@@ -530,9 +530,12 @@ Status as of this branch. See `README.md` for how to run it and how it works.
       the global `-o` (see the "Optimized builds" item), so the base and reload hashes match.
       Verified: a one-proc edit patches
       exactly that proc; a no-op reload prints "no changed procedures"; `mt_test` still
-      200/200. **Soundness note:** a change to a string literal's *content* at the same length
-      is not detected (the content lives in a separate constant global, not in the referencing
-      proc's IR); length changes and all code changes are detected.
+      200/200. **String-literal content is detected:** although a literal's bytes live in a
+      separate constant global (not in the referencing proc's IR), the content hash folds each
+      referenced `csbs$/csba$` constant in *by content* (`lb_livepatch_const_ir_hash` →
+      `@const:<hash>`), so a same-length `"v1"`→`"v2"` edit changes the proc's hash and is patched.
+      Residual: a constant interned in a *different* module resolves to `0` (the lookup is
+      own-module only), but per-module interning makes that unreachable in practice.
 - [x] **Optimized builds** (`-o:speed`/`-o:size`) — supported. Under `-livepatch` the per-module
       optimization split is now **fixed regardless of the global `-o` flag**: builtin collections
       (`base`/`core`/`vendor`, never hot-patched) compile optimized at `-o:2`, while everything the
