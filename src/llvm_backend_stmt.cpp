@@ -2605,6 +2605,30 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			}
 		}
 
+		// tech_design.md section 9: a preserved @(static) reaches this normal path
+		// (lb_livepatch_handle_static_variable returned false). The loader resolves a
+		// reload's reference to it by its link name in the exe's PDB, but LLVM only emits
+		// a PDB symbol for a global that carries debug info. Without this the exe static
+		// is absent from the PDB, lp_resolve_pdb misses, and the reference falls through
+		// to the reload object's own fresh (zeroed) copy -- the static reads 0/nil after a
+		// patch. Emit the CodeView global record with the mangled link name so it resolves.
+		if (livepatch && m->debug_builder) {
+			AstFile *file = e->file ? e->file : thread_unsafe_get_ast_file_from_id(e->token.pos.file_id);
+			LLVMMetadataRef llvm_file = lb_get_llvm_metadata(m, file);
+			LLVMBool local_to_unit = LLVMGetLinkage(global) == LLVMInternalLinkage;
+			LLVMMetadataRef llvm_expr = LLVMDIBuilderCreateExpression(m->debug_builder, nullptr, 0);
+			LLVMMetadataRef md = LLVMDIBuilderCreateGlobalVariableExpression(
+				m->debug_builder, llvm_file,
+				cast(char const *)mangled_name.text, mangled_name.len,
+				cast(char const *)mangled_name.text, mangled_name.len, // linkage name -> PDB symbol
+				llvm_file, e->token.pos.line,
+				lb_debug_type(m, e->type),
+				local_to_unit, llvm_expr, nullptr,
+				cast(u32)(8*type_align_of(e->type)));
+			lb_set_llvm_metadata(m, global, md);
+			LLVMGlobalSetMetadata(global, 0, md);
+		}
+
 		lbValue global_val = {global, alloc_type_pointer(e->type)};
 		lb_add_entity(p->module, e, global_val);
 		lb_add_member(p->module, mangled_name, global_val);
