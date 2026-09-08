@@ -26,21 +26,45 @@ foreign lp_dbg {
 }
 
 // ---- minimal PEB loader structures (x64) ----
+// Field offsets must match ntdll's real LDR_DATA_TABLE_ENTRY: the in-process loader
+// walks this entry (we splice it into InLoadOrderModuleList) and reads DdagNode at
+// +0x98 on every new-thread init. A null DdagNode there faults; see lp_peb_splice.
 @(private) Lp_Ldr_Entry :: struct {
-	InLoadOrderLinks:           win.LIST_ENTRY,
-	InMemoryOrderLinks:         win.LIST_ENTRY,
-	InInitializationOrderLinks: win.LIST_ENTRY,
-	DllBase:                    rawptr,
-	EntryPoint:                 rawptr,
-	SizeOfImage:                u32,
-	_pad0:                      u32,
-	FullDllName:                win.UNICODE_STRING,
-	BaseDllName:                win.UNICODE_STRING,
-	Flags:                      u32,
-	_pad1:                      u32,
-	LoadCount:                  u16,
-	TlsIndex:                   u16,
-	_rest:                      [80]u8,
+	InLoadOrderLinks:            win.LIST_ENTRY,     // 0x00
+	InMemoryOrderLinks:          win.LIST_ENTRY,     // 0x10
+	InInitializationOrderLinks:  win.LIST_ENTRY,     // 0x20
+	DllBase:                     rawptr,             // 0x30
+	EntryPoint:                  rawptr,             // 0x38  (left nil)
+	SizeOfImage:                 u32,                // 0x40
+	_pad0:                       u32,
+	FullDllName:                 win.UNICODE_STRING, // 0x48
+	BaseDllName:                 win.UNICODE_STRING, // 0x58
+	Flags:                       u32,                // 0x68
+	ObsoleteLoadCount:           u16,                // 0x6C
+	TlsIndex:                    u16,                // 0x6E
+	HashLinks:                   win.LIST_ENTRY,     // 0x70
+	TimeDateStamp:               u32,                // 0x80
+	_pad1:                       u32,
+	EntryPointActivationContext: rawptr,             // 0x88
+	Lock:                        rawptr,             // 0x90
+	DdagNode:                    ^Lp_Ddag_Node,      // 0x98  <-- must be non-null
+	_rest:                       [0x40]u8,           // remaining tail the loader may touch
+	_ddag_storage:              Lp_Ddag_Node,       // backing store for DdagNode (any offset)
+}
+
+// Minimal LDR_DDAG_NODE (x64). Only State (+0x38) is read on the crashing path, but
+// the leading fields keep it at their true offsets so the whole node is self-consistent.
+@(private) Lp_Ddag_Node :: struct {
+	Modules:                 win.LIST_ENTRY, // 0x00
+	ServiceTagList:          rawptr,         // 0x10
+	LoadCount:               u32,            // 0x18
+	LoadWhileUnloadingCount: u32,            // 0x1C
+	LowestLink:              u32,            // 0x20
+	_pad:                    u32,
+	Dependencies:            rawptr,         // 0x28  (_LDRP_CSLIST.Tail)
+	IncomingDependencies:    rawptr,         // 0x30  (_LDRP_CSLIST.Tail)
+	State:                   i32,            // 0x38  <-- read by LdrpInitializeThread
+	_tail:                   [0x20]u8,       // slack past State
 }
 
 @(private)
@@ -496,7 +520,16 @@ lp_peb_splice :: proc(base: rawptr, size: u32, full, base_name: string) -> ^Lp_L
 	e.SizeOfImage = size
 	e.FullDllName = lp_make_ustr(full)
 	e.BaseDllName = lp_make_ustr(base_name)
-	e.LoadCount = 0xFFFF
+	e.ObsoleteLoadCount = 0xFFFF // pinned
+	// Give the entry a valid DdagNode so ntdll's per-thread loader walk
+	// (LdrpInitializeThread, which runs when a debugger spawns its break-in thread)
+	// doesn't dereference a null pointer. State < LdrModulesReadyToRun(9) makes that
+	// walk's `cmp State,9; jl skip` take the skip branch, so our synthetic module is
+	// passed over before the loader ever touches EntryPoint / TLS. A debugger reads
+	// DllBase+names and loads the PDB regardless of this internal field.
+	e.DdagNode = &e._ddag_storage
+	e._ddag_storage.State = 7    // LdrModulesReadyToLoad — a benign "not ready-to-run" state
+	e.Flags |= 0x00040000        // LDRP_DONT_CALL_FOR_THREADS — belt-and-suspenders
 	_ = in_init
 	lp_list_insert_tail(in_load, &e.InLoadOrderLinks)
 	lp_list_insert_tail(in_mem,  &e.InMemoryOrderLinks)
