@@ -866,9 +866,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	}
 	lp_phase("suspend", &mark)
 
-	lp_scan_freeable(handles, freeable)
-	lp_phase("freegen", &mark)
-
 	// Pre-flight: flip every destination page writable BEFORE writing a single byte.
 	// Threads are suspended and nothing is written yet, so if any VirtualProtect fails we
 	// restore whatever we changed, resume, and abort with the running code untouched. Once
@@ -958,6 +955,20 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		_lp_owner[uintptr(t.tramp)] = gen_serial
 		append(&gen_owned, uintptr(t.tramp))
 	}
+
+	// Scan for retire-able generations AFTER _lp_owner reflects this reload's writes,
+	// while threads are still suspended. Scanning earlier (before the owner map is
+	// updated) left the immediately-previous generation looking "referenced" by its own
+	// now-superseded addresses, so it wasn't retired until the NEXT reload — a one-reload
+	// lag that kept the previous patch's debug module mapped and spliced alongside the
+	// current one. A debugger then saw two modules claiming the same source line and kept
+	// its breakpoint bound to the older (dead) one instead of the just-loaded patch. With
+	// the scan here, gen N-1 retires during reload N (its lp_<addr>.dll unmaps → the
+	// debugger drops the stale binding and rebinds to the live module), leaving only the
+	// newest patch module loaded and PEB-spliced.
+	lp_scan_freeable(handles, freeable)
+	lp_phase("freegen", &mark)
+
 	lp_resume(handles)
 	lp_free_marked(freeable)
 

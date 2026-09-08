@@ -659,20 +659,29 @@ of addresses it `owned` (entries it patched, globals it refreshed, the type-tabl
 ref). `_lp_owner[addr]` is overwritten to the newest serial that wrote `addr`.
 
 Memory is **not** freed when a generation is superseded — a thread may still be
-running inside its code, or have a return address into it. Instead, on each
-*subsequent* reload (threads suspended), `lp_scan_freeable` retires an old
-generation only when both hold:
+running inside its code, or have a return address into it. Instead, each reload
+(threads suspended) runs `lp_scan_freeable`, which retires an old generation only
+when both hold:
 
 - **Unreferenced** — every address it owns now maps to a *newer* serial in
   `_lp_owner` (something replaced all of its patches / refreshes), and
 - **Untouched** — a full stack walk of every suspended thread finds no return
   address inside its code ranges.
 
-So the steady state is: a handful of live generations at most — the current one
-plus any older ones whose code some thread is still executing or still on a call
-stack. A generation that patched a proc *no later reload has touched again* stays
-referenced forever and is never freed, which is correct: its body is still the
-live implementation of that proc. The count is observable via
+The scan runs **after** this reload's `_lp_owner` writes, still while threads are
+suspended — so a generation this reload just superseded is retired *now*, in the
+same reload, not one reload later. (Scanning before the owner map was updated left
+the immediately-previous generation looking referenced by its own now-stale
+addresses, so it lingered an extra reload. That lag kept the previous patch's
+debug module mapped and PEB-spliced next to the current one; a debugger then saw
+two modules claiming the same source line and kept a breakpoint bound to the
+older, dead copy. See §"Debugging".)
+
+So the steady state is: usually just the current generation — plus any older one
+whose code a thread is still executing or still has on a call stack (the
+multithreaded case). A generation that patched a proc *no later reload has touched
+again* stays referenced forever and is never freed, which is correct: its body is
+still the live implementation of that proc. The count is observable via
 `live_generations()`, and each collapse prints `freed N stale reload
 generation(s); M still in use`.
 
