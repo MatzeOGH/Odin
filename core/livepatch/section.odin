@@ -48,6 +48,18 @@ foreign lp_nt {
 @(private)
 lp_nt_success :: proc "contextless" (st: win.NTSTATUS) -> bool { return i32(st) >= 0 }
 
+// A persistent, monotonically advancing probe offset. Seeds each search so consecutive
+// module maps land on FRESH bases instead of reclaiming a just-freed one. Eager
+// generation retirement frees the previous block, so a search that always restarts from
+// the closest slot hands the same one or two bases back every reload. A debugger keys
+// breakpoint/module state by a module's LOAD ADDRESS, so reusing a base for a new module
+// (even under a unique filename) lets the stale state at that address win and the
+// breakpoint binds the wrong, dead code — the "works every other patch" symptom, the
+// bases having alternated. Marching the offset forward, wrapping only after a full sweep
+// of the ±window (by which point a reused base's old module was freed hundreds of reloads
+// ago and no debugger still tracks it), keeps every live module at a distinct address.
+@(private) _lp_probe_off: uintptr
+
 // Finds a 64KB-aligned base near `near` where `size` bytes are free, so a SEC_IMAGE
 // view can be mapped there. Mirrors alloc_near_prot's ±1.5GB probe (inside x64 REL32
 // reach) but only queries — it must NOT commit, since a committed range blocks the map.
@@ -63,12 +75,16 @@ lp_find_free_near :: proc(near: uintptr, size: int, skip_below: uintptr = 0) -> 
 		region_end := uintptr(mbi.BaseAddress) + uintptr(mbi.RegionSize)
 		return addr + size <= region_end
 	}
-	for off := step; off <= limit; off += step {
+	if _lp_probe_off < step || _lp_probe_off > limit { _lp_probe_off = step }
+	off := _lp_probe_off
+	for _ in 0 ..< int(limit / step) {
+		if off > limit { off = step } // wrap after a full sweep
 		if near > off {
 			cand := near - off
-			if cand > skip_below && is_free(cand, sz) { return cand }
+			if cand > skip_below && is_free(cand, sz) { _lp_probe_off = off + step; return cand }
 		}
-		if near + off > skip_below && is_free(near + off, sz) { return near + off }
+		if near + off > skip_below && is_free(near + off, sz) { _lp_probe_off = off + step; return near + off }
+		off += step
 	}
 	return 0
 }
