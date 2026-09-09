@@ -976,6 +976,15 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	// debugger drops the stale binding and rebinds to the live module), leaving only the
 	// newest patch module loaded and PEB-spliced.
 	lp_scan_freeable(handles, freeable)
+	// Retire the debugger-visible presence of every generation this reload superseded,
+	// even one whose memory can't be freed yet because a thread is still inside it (e.g.
+	// the reload was driven from within a patched proc, pinning its own generation). A
+	// superseded generation is never called again, so leaving its module spliced only
+	// lets its stale lp_%p.dll keep claiming the patched source lines — which is what
+	// makes an attached debugger accumulate modules and keep a breakpoint bound to the
+	// dead copy after the first patch. Memory is still reclaimed by lp_free_marked once
+	// no thread touches it.
+	lp_retire_superseded_debug()
 	lp_phase("freegen", &mark)
 
 	lp_resume(handles)

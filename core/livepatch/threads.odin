@@ -42,6 +42,7 @@ Lp_Generation :: struct {
 	pdata:  [dynamic]win.PRUNTIME_FUNCTION,
 	ranges: [dynamic]Lp_Range,
 	owned:  [dynamic]uintptr,
+	dbg_retired: bool,           // debugger visibility (PEB splice + DbgHelp) already dropped
 }
 @(private) _lp_generations: [dynamic]Lp_Generation
 @(private) _lp_serial: int
@@ -130,6 +131,49 @@ lp_scan_freeable :: proc(handles: [dynamic]win.HANDLE, freeable: []bool) {
 			in_use = lp_thread_touches(h, gen.ranges)
 		}
 		freeable[i] = !in_use
+	}
+}
+
+// Drops the debugger-visible presence of every generation this reload superseded —
+// i.e. one whose every owned entry now maps to a newer serial in `_lp_owner` — without
+// touching its memory. A superseded generation's body may still be executing (a thread
+// parked in it, or the reload driven from inside it), so its block cannot be unmapped
+// yet; but nothing new will ever call it again, so it must stop being advertised as a
+// module. Left advertised, its stale `lp_%p.dll` keeps claiming the patched source
+// lines: an attached debugger that discovers modules through the PEB loader list (e.g.
+// RAD Debugger) accumulates one entry per reload and keeps a source breakpoint bound to
+// the oldest, dead copy, so breakpoints stop hitting after the first patch. Unsplicing
+// the PEB entry and unloading the in-process DbgHelp module here leaves the mapped code
+// running for any in-flight thread while removing it from every module enumeration; the
+// memory itself is reclaimed later by lp_free_marked once no thread is still inside it.
+// Runs while other threads are suspended, so the loader-list edit is unobserved.
+@(private)
+lp_retire_superseded_debug :: proc() {
+	for &gen in _lp_generations {
+		if gen.dbg_retired {
+			continue
+		}
+		superseded := true
+		for e in gen.owned {
+			if _lp_owner[e] == gen.serial {
+				superseded = false
+				break
+			}
+		}
+		if !superseded {
+			continue
+		}
+		for &r in gen.objs {
+			if r.sym_base != 0 {
+				SymUnloadModule64(win.GetCurrentProcess(), win.DWORD64(r.sym_base))
+				r.sym_base = 0
+			}
+			if r.ldr != nil {
+				lp_peb_unsplice(r.ldr)
+				r.ldr = nil
+			}
+		}
+		gen.dbg_retired = true
 	}
 }
 
