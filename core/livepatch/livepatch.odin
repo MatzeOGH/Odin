@@ -859,6 +859,16 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	reserve(&_lp_owner, len(_lp_owner) + owner_bound)
 	freeable := make([]bool, len(_lp_generations), context.temp_allocator)
 
+	// Allocate every commit-phase buffer up front, BEFORE suspending. Once the other threads
+	// are suspended the halt window must contain nothing but memory writes: an arena/heap
+	// growth there could block on a lock a suspended thread holds (H2). All caps are known
+	// now, so the preflight's appends below never reallocate.
+	plans := make([dynamic]Patch_Plan, 0, len(targets), context.temp_allocator)
+	refresh_preps := make([dynamic]Wr_Prep, 0, len(refresh_targets), context.temp_allocator)
+	patch_atomic := make([]bool, len(targets), context.temp_allocator)
+	tt_prep: Wr_Prep
+	preflight_ok := true
+
 	MAX_ATTEMPTS :: 100
 	handles: [dynamic]win.HANDLE
 	for attempt := 0; ; attempt += 1 {
@@ -880,11 +890,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	// restore whatever we changed, resume, and abort with the running code untouched. Once
 	// every region is writable the commit below is pure memory writes that cannot fail, so
 	// the reload is all-or-nothing: no thread ever observes a partially applied patch set.
-	plans := make([dynamic]Patch_Plan, 0, len(targets), context.temp_allocator)
-	refresh_preps := make([dynamic]Wr_Prep, 0, len(refresh_targets), context.temp_allocator)
-	tt_prep: Wr_Prep
-	preflight_ok := true
-
 	for t in targets {
 		plan, ok := lp_patch_prepare(t.original, t.fresh)
 		if !ok {
@@ -940,7 +945,6 @@ apply_many :: proc(obj_paths: []string) -> bool {
 		append(&gen_owned, uintptr(tt_prep.dst))
 		did_swap = true
 	}
-	patch_atomic := make([]bool, len(plans), context.temp_allocator)
 	for p, i in plans {
 		patch_atomic[i] = lp_patch_commit(p)
 		_lp_owner[uintptr(p.original)] = gen_serial
@@ -988,6 +992,11 @@ apply_many :: proc(obj_paths: []string) -> bool {
 	lp_phase("freegen", &mark)
 
 	lp_resume(handles)
+	// Off the halt window now: release the debugger resources of the generations
+	// lp_retire_superseded_debug just unlinked — SymUnloadModule64 and the node's heap free
+	// take locks a suspended thread could hold (H2), so they run here rather than under
+	// suspension. Then reclaim any fully-unreferenced blocks.
+	lp_free_retired_debug()
 	lp_free_marked(freeable)
 
 	if len(refresh_preps) > 0 {

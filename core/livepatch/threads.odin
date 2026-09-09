@@ -11,6 +11,12 @@ foreign import lp_kernel32 "system:kernel32.lib"
 @(default_calling_convention="system")
 foreign lp_ntdll {
 	NtGetNextThread :: proc(ProcessHandle, ThreadHandle: win.HANDLE, DesiredAccess: win.ACCESS_MASK, HandleAttributes, Flags: win.ULONG, NewThreadHandle: ^win.HANDLE) -> win.NTSTATUS ---
+	// The loader lock guards ntdll's PEB module lists. Taken around the post-resume PEB
+	// splice (debug.odin) so a concurrent LoadLibrary/FreeLibrary/thread-start does not race
+	// the list edit. MUST NOT be taken inside the thread-suspend window: a suspended thread
+	// may hold it, which would deadlock.
+	LdrLockLoaderLock   :: proc(Flags: win.ULONG, Disposition: ^win.ULONG, Cookie: ^uintptr) -> win.NTSTATUS ---
+	LdrUnlockLoaderLock :: proc(Flags: win.ULONG, Cookie: uintptr) -> win.NTSTATUS ---
 }
 @(default_calling_convention="system")
 foreign lp_kernel32 {
@@ -163,17 +169,41 @@ lp_retire_superseded_debug :: proc() {
 		if !superseded {
 			continue
 		}
+		// Under suspension do only the loader-list pointer edit (no lock, no allocation). The
+		// heavy releases — SymUnloadModule64 (DbgHelp lock) and the node's heap free — are
+		// deferred to lp_free_retired_debug, run after lp_resume: those locks may be held by a
+		// suspended thread, so calling them here would deadlock (H2). r.ldr/r.sym_base stay set
+		// so that post-resume pass can find and release them.
+		for &r in gen.objs {
+			if r.ldr != nil {
+				lp_peb_unlink(r.ldr)
+			}
+		}
+		gen.dbg_retired = true
+	}
+}
+
+// Releases the debugger resources of every already-retired generation: the in-process
+// DbgHelp module (SymUnloadModule64) and the PEB entry's heap memory (lp_peb_free). Both take
+// locks a suspended thread might hold, so this runs AFTER lp_resume — the PEB entries were
+// already unlinked (pointer writes) under suspension by lp_retire_superseded_debug. Idempotent
+// across reloads: once released, r.sym_base/r.ldr are nil and the generation is skipped.
+@(private)
+lp_free_retired_debug :: proc() {
+	for &gen in _lp_generations {
+		if !gen.dbg_retired {
+			continue
+		}
 		for &r in gen.objs {
 			if r.sym_base != 0 {
 				SymUnloadModule64(win.GetCurrentProcess(), win.DWORD64(r.sym_base))
 				r.sym_base = 0
 			}
 			if r.ldr != nil {
-				lp_peb_unsplice(r.ldr)
+				lp_peb_free(r.ldr)
 				r.ldr = nil
 			}
 		}
-		gen.dbg_retired = true
 	}
 }
 
@@ -191,12 +221,10 @@ lp_free_marked :: proc(freeable: []bool) {
 				win.RtlDeleteFunctionTable(p)
 			}
 			for r in gen.objs {
-				// Retire the debugger registration first (while the block is still
-				// mapped/valid), then release the block, then delete the on-disk files.
-				if r.sym_base != 0 {
-					SymUnloadModule64(win.GetCurrentProcess(), win.DWORD64(r.sym_base))
-				}
-				lp_peb_unsplice(r.ldr)
+				// Debug resources (PEB entry + in-process DbgHelp module) were already
+				// released by lp_free_retired_debug when this generation was retired — a
+				// freeable generation is always an already-retired one — so here we only
+				// reclaim the block and delete its on-disk files.
 				if r.mapped {
 					lp_section_unmap(r.block)
 				} else {
@@ -226,34 +254,59 @@ lp_free_marked :: proc(freeable: []bool) {
 }
 
 // Suspends every thread except the caller's, returning their handles.
+//
+// Enumeration and suspension use SEPARATE handles on purpose. NtGetNextThread advances its
+// cursor only through a handle it opened with the requested access, so asking for
+// suspend/context rights there makes it FAIL on the first thread that denies them and end the
+// walk early — silently leaving every later thread running during the patch (H3). Instead we
+// enumerate with only THREAD_QUERY_LIMITED_INFORMATION (broadly grantable, so the cursor never
+// stalls) and open a distinct suspendable handle by thread id. A thread that still cannot be
+// opened/suspended is counted and reported, never silently dropped.
 @(private)
 lp_suspend_other_threads :: proc() -> [dynamic]win.HANDLE {
 	handles := make([dynamic]win.HANDLE, context.temp_allocator)
 	me_tid := win.GetCurrentThreadId()
 	proc_h := win.GetCurrentProcess()
-	// QUERY_LIMITED_INFORMATION is needed so GetThreadId works to skip our own thread.
-	ACCESS :: win.ACCESS_MASK(win.THREAD_SUSPEND_RESUME | win.THREAD_GET_CONTEXT | win.THREAD_SET_CONTEXT | win.THREAD_QUERY_LIMITED_INFORMATION)
+	ENUM_ACCESS :: win.ACCESS_MASK(win.THREAD_QUERY_LIMITED_INFORMATION)
+	OPEN_ACCESS :: win.DWORD(win.THREAD_SUSPEND_RESUME | win.THREAD_GET_CONTEXT | win.THREAD_SET_CONTEXT | win.THREAD_QUERY_LIMITED_INFORMATION)
 
+	missed := 0
 	cursor: win.HANDLE = nil
-	cursor_keep := false
 	for {
 		next: win.HANDLE
-		st := NtGetNextThread(proc_h, cursor, ACCESS, 0, 0, &next)
-		if cursor != nil && !cursor_keep {
-			win.CloseHandle(cursor)
+		st := NtGetNextThread(proc_h, cursor, ENUM_ACCESS, 0, 0, &next)
+		if cursor != nil {
+			win.CloseHandle(cursor) // the enumeration handle is only a cursor; never stored
 		}
 		if st != 0 { // STATUS_SUCCESS == 0; NO_MORE_ENTRIES (or any error) ends iteration
 			break
 		}
-		keep := false
-		if tid := GetThreadId(next); tid != 0 && tid != me_tid {
-			if win.SuspendThread(next) != ~win.DWORD(0) {
-				append(&handles, next)
-				keep = true
-			}
-		}
 		cursor = next
-		cursor_keep = keep
+		tid := GetThreadId(next)
+		if tid == 0 || tid == me_tid {
+			continue
+		}
+		// Open a distinct handle with the rights the patch actually needs (suspend + get/set
+		// context, used later by lp_ip_conflicts / lp_scan_freeable). Re-opening by id has a
+		// vanishing window where the id could be recycled, but a wrong-thread suspend is still
+		// resumed, so the worst case is a needless extra suspend, never a missed real thread.
+		th := win.OpenThread(OPEN_ACCESS, win.FALSE, tid)
+		if th == nil {
+			missed += 1
+			continue
+		}
+		if win.SuspendThread(th) != ~win.DWORD(0) {
+			append(&handles, th)
+		} else {
+			missed += 1
+			win.CloseHandle(th)
+		}
+	}
+	if missed > 0 {
+		// Loud, not fatal: this is essentially unreachable for a process's own threads, but if
+		// it happens the un-suspended threads are NOT IP-checked, so patching a procedure one of
+		// them is executing could run a half-written redirect. Surfaced rather than hidden.
+		fmt.eprintfln("[livepatch] WARNING: %d thread(s) could not be suspended and run during the patch; a call into a patched entry at that instant is unsafe", missed)
 	}
 	return handles
 }

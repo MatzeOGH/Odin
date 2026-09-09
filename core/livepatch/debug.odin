@@ -534,8 +534,22 @@ lp_peb_splice :: proc(base: rawptr, size: u32, full, base_name: string) -> ^Lp_L
 	e._ddag_storage.State = 7    // LdrModulesReadyToLoad — a benign "not ready-to-run" state
 	e.Flags |= 0x00040000        // LDRP_DONT_CALL_FOR_THREADS — belt-and-suspenders
 	_ = in_init
+	// These are ntdll's own loader lists — it mutates them under the loader lock on every
+	// LoadLibrary/FreeLibrary, thread start, and exception dispatch. This splice runs
+	// post-resume (lp_debug_register's DbgHelp load + file I/O can't sit in the patch
+	// halt window), so other threads are live; take the real loader lock for the edit, or
+	// a concurrent loader operation races these unsynchronized pointer stores and tears the
+	// chain (a process-wide crash/hang, not a bad patch). The lock is deliberately taken
+	// HERE and not under thread suspension: a suspended thread could hold it → deadlock, so
+	// the patch's halt-the-world cannot cover this list edit; the loader lock is what does.
+	cookie: uintptr
+	disp:   win.ULONG
+	locked := LdrLockLoaderLock(0, &disp, &cookie) == 0
 	lp_list_insert_tail(in_load, &e.InLoadOrderLinks)
 	lp_list_insert_tail(in_mem,  &e.InMemoryOrderLinks)
+	if locked {
+		LdrUnlockLoaderLock(0, cookie)
+	}
 
 	when #config(LP_DBG_SELFTEST, false) {
 		// Walk InLoadOrderModuleList to confirm integrity + our entry is present.
@@ -552,13 +566,23 @@ lp_peb_splice :: proc(base: rawptr, size: u32, full, base_name: string) -> ^Lp_L
 	return e
 }
 
-// Removes a previously spliced PEB loader entry and frees it. Runs at generation
-// retirement, when no thread executes in the block, so the list edit is unobserved.
+// Unlinks a spliced PEB loader entry from ntdll's lists — pure pointer writes, no lock and
+// no allocation. Runs at generation retirement while other threads are suspended, so the list
+// edit is unobserved (the loader lock is deliberately NOT taken: a suspended thread could hold
+// it → deadlock). The node's memory is released separately, off the halt window, by lp_peb_free.
 @(private)
-lp_peb_unsplice :: proc(e: ^Lp_Ldr_Entry) {
+lp_peb_unlink :: proc(e: ^Lp_Ldr_Entry) {
 	if e == nil { return }
 	lp_list_remove(&e.InLoadOrderLinks)
 	lp_list_remove(&e.InMemoryOrderLinks)
+}
+
+// Frees an already-unlinked PEB loader entry and its name buffers. This hits the heap
+// allocator (a lock a suspended thread may hold), so it MUST run outside the thread-suspend
+// window — call lp_peb_unlink under suspension first, then this after lp_resume.
+@(private)
+lp_peb_free :: proc(e: ^Lp_Ldr_Entry) {
+	if e == nil { return }
 	if e.FullDllName.Buffer != nil { free(rawptr(e.FullDllName.Buffer), runtime.heap_allocator()) }
 	if e.BaseDllName.Buffer != nil { free(rawptr(e.BaseDllName.Buffer), runtime.heap_allocator()) }
 	free(e, runtime.heap_allocator())
