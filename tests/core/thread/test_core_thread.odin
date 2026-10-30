@@ -3,6 +3,7 @@ package test_core_thread
 import "core:testing"
 import "core:thread"
 import "base:intrinsics"
+import "base:runtime"
 
 @(test)
 poly_data_test :: proc(_t: ^testing.T) {
@@ -49,6 +50,39 @@ poly_data_test :: proc(_t: ^testing.T) {
 	defer free(t4)
 
 	thread.join_multiple(t1, t2, t3, t4)
+}
+
+@(test)
+test_pool_resets_temp_allocator_between_tasks :: proc(t: ^testing.T) {
+	TASKS :: 10
+	@static max_leftover: uint
+	intrinsics.atomic_store(&max_leftover, 0)
+
+	task :: proc(task: thread.Task) {
+		// detect leftover temp allocations
+		leftover := runtime.global_default_temp_allocator_data.arena.total_used
+		for {
+			cur := intrinsics.atomic_load(&max_leftover)
+			if leftover <= cur || intrinsics.atomic_compare_exchange_strong(&max_leftover, cur, leftover) == cur {
+				break
+			}
+		}
+		_ = make([]byte, 1000, context.temp_allocator)
+	}
+
+	pool: thread.Pool
+	thread.pool_init(&pool, context.allocator, 1)
+	defer thread.pool_destroy(&pool)
+	thread.pool_start(&pool)
+	for i in 0..<TASKS {
+		thread.pool_add_task(&pool, context.allocator, task, nil, i)
+	}
+	for thread.pool_num_done(&pool) < TASKS {
+		thread.yield()
+	}
+	thread.pool_finish(&pool)
+
+	testing.expect_value(t, intrinsics.atomic_load(&max_leftover), 0)
 }
 
 @(test)

@@ -7,6 +7,7 @@ package thread
 */
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:sync"
 import "core:mem"
 import "core:container/queue"
@@ -373,6 +374,7 @@ pool_pop_done :: proc(pool: ^Pool) -> (task: Task, got_task: bool) {
 @(synchronizes=.Release)
 pool_do_work :: proc(pool: ^Pool, task: Task) {
 	{
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		context.allocator = task.allocator
 		task.procedure(task)
 	}
